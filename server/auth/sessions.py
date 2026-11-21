@@ -6,7 +6,7 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.db.models import Session, User
@@ -73,3 +73,17 @@ async def revoke_session(db: AsyncSession, token: str) -> None:
     if session is not None and session.revoked_at is None:
         session.revoked_at = _utcnow()
         await db.commit()
+
+
+async def revoke_other_sessions(db: AsyncSession, user_id: int, *, keep_token: str) -> None:
+    """退出该用户除当前会话外的其他登录设备（改密后调用）。"""
+    await db.execute(
+        update(Session)
+        .where(
+            Session.user_id == user_id,
+            Session.token_hash != _hash(keep_token),
+            Session.revoked_at.is_(None),
+        )
+        .values(revoked_at=_utcnow())
+    )
+    await db.commit()

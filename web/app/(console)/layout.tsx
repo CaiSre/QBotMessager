@@ -10,6 +10,7 @@ import {
   ScrollTextIcon,
   Settings2Icon,
   ShieldCheckIcon,
+  UserRoundIcon,
   UsersIcon,
 } from "lucide-react";
 
@@ -26,6 +27,7 @@ const NAV = [
   { href: "/logs", label: "推送日志", icon: ScrollTextIcon },
   { href: "/env", label: "环境配置", icon: Settings2Icon },
   { href: "/security", label: "安全设置", icon: ShieldCheckIcon },
+  { href: "/account", label: "个人中心", icon: UserRoundIcon },
 ];
 
 const ADMIN_NAV = [{ href: "/users", label: "用户管理", icon: UsersIcon }];
@@ -82,7 +84,7 @@ export default function ConsoleLayout({ children }: { children: ReactNode }) {
   }
 
   return (
-    <MeProvider value={me}>
+    <MeProvider me={me} refresh={load}>
       <div className="flex min-h-screen flex-col lg:flex-row">
         <aside className="flex shrink-0 flex-col gap-4 border-b bg-sidebar px-4 py-4 text-sidebar-foreground lg:w-60 lg:border-r lg:border-b-0 lg:px-3 lg:py-6">
           <div className="px-2">

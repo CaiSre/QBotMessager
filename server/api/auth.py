@@ -17,9 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.auth import oauth as oauth_flow
 from server.auth import passkey as passkey_flow
-from server.auth.deps import current_user
+from server.auth.deps import current_user, get_session_token
 from server.auth.passwords import burn_password, hash_password, verify_password
-from server.auth.sessions import create_session, revoke_session
+from server.auth.sessions import create_session, revoke_other_sessions, revoke_session
 from server.config import Settings
 from server.db.crypto import decrypt_secret
 from server.db.models import (
@@ -77,6 +77,28 @@ class PasskeyFinishIn(BaseModel):
     credential: dict
 
 
+class NameIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("用户名不能为空")
+        return value
+
+
+class EmailChangeIn(_EmailModel):
+    # 账号已有密码时必须校验；仅 OAuth 创建的账号没有密码可验
+    current_password: str = Field(default="", max_length=256)
+
+
+class PasswordChangeIn(BaseModel):
+    current_password: str = Field(default="", max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -132,6 +154,7 @@ def _user_payload(user: User) -> dict:
         "name": user.name,
         "role": user.role,
         "status": user.status,
+        "has_password": user.password_hash is not None,
     }
 
 
@@ -176,6 +199,66 @@ async def me(user: User = Depends(current_user), db: AsyncSession = Depends(get_
     ).scalar_one()
     payload["passkey_count"] = int(passkeys)
     return payload
+
+
+# ---------------------------------------------------------------------- 个人资料
+
+
+@router.patch("/me/name")
+async def update_name(
+    data: NameIn,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    user.name = data.name
+    await db.commit()
+    return _user_payload(user)
+
+
+@router.patch("/me/email")
+async def update_email(
+    data: EmailChangeIn,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    # 没有邮件验证通道，改邮箱以当前密码作为身份确认
+    if user.password_hash is not None and not verify_password(
+        data.current_password, user.password_hash
+    ):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前密码错误")
+    if data.email == user.email:
+        return _user_payload(user)
+    exists = (
+        await db.execute(
+            select(User.id).where(User.email == data.email, User.id != user.id)
+        )
+    ).scalar_one_or_none()
+    if exists is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该邮箱已被使用")
+    user.email = data.email
+    await db.commit()
+    return _user_payload(user)
+
+
+@router.patch("/me/password")
+async def update_password(
+    data: PasswordChangeIn,
+    token: str = Depends(get_session_token),
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    if user.password_hash is not None:
+        if not verify_password(data.current_password, user.password_hash):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前密码错误")
+        if verify_password(data.new_password, user.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="新密码不能与当前密码相同"
+            )
+    # 仅 OAuth 创建的账号 password_hash 为空，可直接设置密码
+    user.password_hash = hash_password(data.new_password)
+    await db.commit()
+    await revoke_other_sessions(db, user.id, keep_token=token)
+    return {"ok": True}
 
 
 @router.post("/login")

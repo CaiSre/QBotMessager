@@ -20,6 +20,7 @@ export interface Me {
   role: Role;
   status: AccountStatus;
   passkey_count: number;
+  has_password: boolean;
 }
 
 export interface OAuthProviderBrief {
