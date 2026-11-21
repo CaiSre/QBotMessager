@@ -58,6 +58,7 @@ interface OAuthForm {
   idField: string;
   nameField: string;
   enabled: boolean;
+  emailVerified: boolean;
   useGithubPreset: boolean;
 }
 
@@ -74,6 +75,7 @@ const EMPTY_OAUTH: OAuthForm = {
   idField: "id",
   nameField: "name",
   enabled: true,
+  emailVerified: false,
   useGithubPreset: false,
 };
 
@@ -152,6 +154,7 @@ export default function SecurityPage() {
       idField: provider.id_field,
       nameField: provider.name_field,
       enabled: provider.enabled,
+      emailVerified: provider.email_verified,
       useGithubPreset: false,
     });
     setOauthErrors({});
@@ -188,6 +191,7 @@ export default function SecurityPage() {
         id_field: oauthForm.idField.trim() || "id",
         name_field: oauthForm.nameField.trim() || "name",
         enabled: oauthForm.enabled,
+        email_verified: oauthForm.emailVerified,
       };
       if (oauthForm.clientSecret.trim()) body.client_secret = oauthForm.clientSecret.trim();
       if (editingProvider) {
@@ -281,6 +285,7 @@ export default function SecurityPage() {
                       <TableHead>显示名称</TableHead>
                       <TableHead>Client ID</TableHead>
                       <TableHead>回调地址</TableHead>
+                      <TableHead>邮箱可信</TableHead>
                       <TableHead>状态</TableHead>
                       <TableHead>操作</TableHead>
                     </TableRow>
@@ -309,6 +314,15 @@ export default function SecurityPage() {
                               value={`${origin}/api/auth/oauth/${provider.key}/callback`}
                             />
                           </div>
+                        </TableCell>
+                        <TableCell>
+                          {provider.email_verified ? (
+                            <Badge className="bg-emerald-600/10 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-400">
+                              可信
+                            </Badge>
+                          ) : (
+                            <Badge variant="outline">不可信</Badge>
+                          )}
                         </TableCell>
                         <TableCell>
                           {provider.enabled ? (
@@ -595,6 +609,18 @@ export default function SecurityPage() {
                   }
                 />
                 <Label htmlFor="oauth-enabled">在登录页展示</Label>
+              </div>
+              <div className="flex items-start gap-2">
+                <Switch
+                  checked={oauthForm.emailVerified}
+                  id="oauth-email-verified"
+                  onCheckedChange={(value) =>
+                    setOauthForm((prev) => ({ ...prev, emailVerified: value }))
+                  }
+                />
+                <Label className="leading-snug" htmlFor="oauth-email-verified">
+                  信任该提供方的邮箱（开启后，允许用同邮箱自动关联本地账号；仅在提供方确实验证过邮箱归属时开启）
+                </Label>
               </div>
               <div className="flex justify-end gap-2">
                 <Button type="button" variant="outline" onClick={() => setOauthOpen(false)}>

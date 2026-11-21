@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
@@ -49,6 +49,11 @@ def _aware(value: datetime | None) -> datetime | None:
 
 def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
+
+
+def _local_midnight_utc(day: date, tz) -> datetime:
+    """本地时区某一天零点的 UTC 时刻。"""
+    return datetime(day.year, day.month, day.day, tzinfo=tz).astimezone(timezone.utc)
 
 
 def generate_token() -> str:
@@ -549,24 +554,32 @@ async def patch_env_config(
 ) -> dict:
     settings: Settings = request.app.state.settings
     row = await _get_owned_env(db, user, config_id)
+    # 只有前端明确给了新值才动密文；否则保留原密文，
+    # 否则「只改描述」这类请求会把已保存的密钥清空。
+    new_value = data.value if data.value is not None else None
+    turning_secret = data.is_secret is not None and data.is_secret != row.is_secret
     if data.is_secret is not None:
         row.is_secret = data.is_secret
-        if data.is_secret:
-            plain = data.value if data.value is not None else (row.value or "")
-            row.value = None
-            row.value_enc = encrypt_secret(plain, settings.app_secret_key)
-        else:
-            if row.value_enc is not None:
-                try:
-                    row.value = decrypt_secret(row.value_enc, settings.app_secret_key)
-                except Exception:  # noqa: BLE001
-                    row.value = None
-                row.value_enc = None
-    elif data.value is not None:
+    if turning_secret and row.is_secret:
+        # 转成密文存储：优先用新值，否则沿用原来的明文
+        plain = new_value if new_value is not None else (row.value or "")
+        row.value = None
+        row.value_enc = encrypt_secret(plain, settings.app_secret_key)
+    elif turning_secret:
+        # 转成明文存储：把密文解回原文；给了新值则以新值为准
+        plain = new_value
+        if plain is None and row.value_enc is not None:
+            try:
+                plain = decrypt_secret(row.value_enc, settings.app_secret_key)
+            except Exception:  # noqa: BLE001
+                plain = None
+        row.value = plain
+        row.value_enc = None
+    elif new_value is not None:
         if row.is_secret:
-            row.value_enc = encrypt_secret(data.value, settings.app_secret_key)
+            row.value_enc = encrypt_secret(new_value, settings.app_secret_key)
         else:
-            row.value = data.value
+            row.value = new_value
     if data.description is not None:
         row.description = data.description
     row.updated_by = user.id
@@ -799,6 +812,7 @@ async def list_oauth_providers(
             "id_field": row.id_field,
             "name_field": row.name_field,
             "enabled": row.enabled,
+            "email_verified": row.email_verified,
         }
         for row in rows
     ]
@@ -817,6 +831,8 @@ class OAuthIn(BaseModel):
     id_field: str = "id"
     name_field: str = "name"
     enabled: bool = True
+    # 提供方是否已验证邮箱所有权；不可信时不会自动关联同邮箱的本地账号
+    email_verified: bool = False
     use_github_preset: bool = False
 
 
@@ -832,6 +848,7 @@ class OAuthPatch(BaseModel):
     id_field: str | None = None
     name_field: str | None = None
     enabled: bool | None = None
+    email_verified: bool | None = None
 
 
 def _require_https(url: str) -> None:
@@ -848,10 +865,16 @@ async def create_oauth_provider(
 ) -> dict:
     settings: Settings = request.app.state.settings
     payload = data.model_dump()
+    explicit = data.model_dump(exclude_unset=True)
     if data.use_github_preset and data.key == "github":
         for key, value in GITHUB_PRESET.items():
-            if key not in ("key", "display_name") and not payload.get(key):
+            if key in ("key", "display_name", "email_verified"):
+                continue
+            if not payload.get(key):
                 payload[key] = value
+        # GitHub 只返回已验证邮箱，预设直接信任；用户显式关闭时保留关闭
+        if "email_verified" not in explicit:
+            payload["email_verified"] = True
     for field in ("authorization_url", "token_url", "userinfo_url"):
         if not payload[field]:
             raise HTTPException(status_code=400, detail=f"{field} 不能为空")
@@ -876,6 +899,7 @@ async def create_oauth_provider(
         id_field=payload["id_field"],
         name_field=payload["name_field"],
         enabled=data.enabled,
+        email_verified=payload["email_verified"],
     )
     db.add(row)
     await record_audit(
@@ -1004,16 +1028,27 @@ async def patch_settings(
 
 @router.get("/stats")
 async def get_stats(
-    user: User = Depends(current_user), db: AsyncSession = Depends(get_session)
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
 ) -> dict:
+    settings: Settings = request.app.state.settings
     now = _now()
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # 「今天」按业务时区（默认本机时区）切分，而不是按 UTC 零点
+    tz = settings.tz
+    today = now.astimezone(tz).date()
+    start = _local_midnight_utc(today, tz)
+    end = _local_midnight_utc(today + timedelta(days=1), tz)
     scope_conditions = [] if is_super_admin(user) else [PushLog.owner_user_id == user.id]
     total_today = (
         await db.execute(
             select(func.count())
             .select_from(PushLog)
-            .where(*scope_conditions, PushLog.created_at >= start)
+            .where(
+                *scope_conditions,
+                PushLog.created_at >= start,
+                PushLog.created_at < end,
+            )
         )
     ).scalar_one()
     success_today = (
@@ -1023,6 +1058,7 @@ async def get_stats(
             .where(
                 *scope_conditions,
                 PushLog.created_at >= start,
+                PushLog.created_at < end,
                 PushLog.status == "success",
             )
         )
@@ -1042,15 +1078,20 @@ async def get_stats(
     by_platform = (
         await db.execute(
             select(PushLog.platform, func.count())
-            .where(*scope_conditions, PushLog.created_at >= start)
+            .where(
+                *scope_conditions,
+                PushLog.created_at >= start,
+                PushLog.created_at < end,
+            )
             .group_by(PushLog.platform)
         )
     ).all()
 
     days: list[dict] = []
     for offset in range(6, -1, -1):
-        day_start = start - timedelta(days=offset)
-        day_end = day_start + timedelta(days=1)
+        day = today - timedelta(days=offset)
+        day_start = _local_midnight_utc(day, tz)
+        day_end = _local_midnight_utc(day + timedelta(days=1), tz)
         count = (
             await db.execute(
                 select(func.count())
@@ -1062,7 +1103,7 @@ async def get_stats(
                 )
             )
         ).scalar_one()
-        days.append({"date": day_start.date().isoformat(), "count": int(count)})
+        days.append({"date": day.isoformat(), "count": int(count)})
 
     return {
         "scope": "all" if is_super_admin(user) else "mine",

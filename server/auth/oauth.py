@@ -24,6 +24,8 @@ GITHUB_PRESET = {
     "email_field": "email",
     "id_field": "id",
     "name_field": "login",
+    # GitHub 的 userinfo 只返回已验证邮箱，因此允许自动关联已有本地账号
+    "email_verified": True,
 }
 
 GITHUB_EMAILS_URL = "https://api.github.com/user/emails"
@@ -35,6 +37,7 @@ class OAuthProfile:
     login: str
     email: str | None
     name: str | None
+    email_verified: bool = False
 
 
 def new_state() -> str:
@@ -54,13 +57,23 @@ def build_authorize_url(provider: OAuthProvider, *, redirect_uri: str, state: st
 
 
 async def exchange_code(
-    client: httpx.AsyncClient, provider: OAuthProvider, *, code: str, redirect_uri: str
+    client: httpx.AsyncClient,
+    provider: OAuthProvider,
+    *,
+    code: str,
+    redirect_uri: str,
+    client_secret: str,
 ) -> dict:
+    """用授权码换取 token。
+
+    client_secret 由调用方解密后显式传入：provider 上的同名字段是库内密文，
+    写回 ORM 实体会把明文提交进数据库。
+    """
     resp = await client.post(
         provider.token_url,
         data={
             "client_id": provider.client_id,
-            "client_secret": provider.client_secret,
+            "client_secret": client_secret,
             "code": code,
             "redirect_uri": redirect_uri,
             "grant_type": "authorization_code",
@@ -98,6 +111,7 @@ async def fetch_profile(
         raise ValueError(f"userinfo 缺少字段 {provider.id_field}")
 
     email = data.get(provider.email_field)
+    email_verified = bool(data.get("email_verified") or data.get("verified"))
     if not email and provider.key == "github":
         # GitHub 的 email 可能是私有的，需要单独拉取主邮箱
         try:
@@ -117,6 +131,7 @@ async def fetch_profile(
                 )
                 if primary:
                     email = primary.get("email")
+                    email_verified = bool(primary.get("verified"))
         except (httpx.HTTPError, ValueError):
             email = None
 
@@ -125,4 +140,5 @@ async def fetch_profile(
         login=str(data.get("login") or data.get(provider.name_field) or raw_id),
         email=email,
         name=data.get(provider.name_field) or data.get("name"),
+        email_verified=email_verified,
     )

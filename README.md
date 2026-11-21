@@ -6,7 +6,7 @@
   <a href="https://nextjs.org/"><img alt="Next.js" src="https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white"></a>
   <a href="https://www.mysql.com/"><img alt="MySQL" src="https://img.shields.io/badge/MySQL-8.4-4479A1?logo=mysql&logoColor=white"></a>
   <a href="https://docs.docker.com/compose/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white"></a>
-  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-45%20passed-brightgreen"></a>
+  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-70%20passed-brightgreen"></a>
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img alt="License: AGPL v3" src="https://img.shields.io/badge/License-AGPL_v3-blue"></a>
 </p>
 
@@ -159,8 +159,11 @@ docker compose up -d --build
 | `MYSQL_PASSWORD` / `MYSQL_ROOT_PASSWORD` | MySQL 业务账号与 root 密码（compose 必填） | 无 |
 | `APP_SECRET_KEY` | Fernet 主密钥，用于加密库内敏感字段 | 空（降级明文并告警） |
 | `PUBLIC_BASE_URL` | 对外访问地址，用于生成 Webhook URL 与 OAuth 回调 | 空（按请求头推导） |
-| `COOKIE_SECURE` | 会话 Cookie 是否仅限 HTTPS | `false` |
+| `COOKIE_SECURE` | 会话 Cookie 是否仅限 HTTPS；`PUBLIC_BASE_URL` 为 https 时自动开启 | `false` |
 | `SESSION_TTL_HOURS` | 会话有效期（小时） | `72` |
+| `WEBHOOK_ALLOW_QUERY_TOKEN` | 是否允许用 `?token=` 传 Webhook 凭据（会落入访问日志） | `false` |
+| `LOGIN_MAX_FAILURES` / `LOGIN_IP_MAX_FAILURES` / `LOGIN_WINDOW_SECONDS` | 登录失败限速：同一 (IP, 账号) / 同一 IP 的失败次数上限与统计窗口 | `5` / `30` / `900` |
+| `TIMEZONE` | 统计口径使用的时区；留空取容器 `TZ`，再退回本机时区 | 空 |
 | `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` | 初始超级管理员；账号已存在时不改动 | 空 |
 | `REGISTER_ENABLED` | 是否允许凭邀请码注册（可被后台设置覆盖） | `false` |
 | `QQ_APPID` / `QQ_APP_SECRET` / `OPENID` | 首启导入的机器人凭据与默认推送目标 | 空 |
@@ -183,7 +186,7 @@ docker compose up -d --build
 
 ### 发送 Webhook
 
-按对应平台的原始格式 POST，鉴权支持三种方式（优先级从高到低）：`X-Webhook-Token` 请求头、`Authorization: Bearer <token>` 请求头、`?token=` 查询参数：
+按对应平台的原始格式 POST，鉴权支持两种方式（优先级从高到低）：`X-Webhook-Token` 请求头、`Authorization: Bearer <token>` 请求头。查询参数 `?token=` 默认关闭（凭据会落进访问日志），需要时把 `WEBHOOK_ALLOW_QUERY_TOKEN` 设为 `true` 开启：
 
 ```bash
 curl -X POST http://localhost:3000/webhook/dingtalk \
@@ -205,6 +208,7 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 
 - 注册需邀请码，注册用户固定为 `user`；邀请码由超级管理员签发，可限定邮箱、次数与有效期。
 - 系统至少保留一个启用的超级管理员，且不能修改自己的角色或账号状态。
+- OAuth2 提供方默认「邮箱不可信」：只有提供方确认验证过邮箱归属（或接口返回了已验证标记）时，才会用同邮箱自动关联已有本地账号；否则要求用户改用密码登录，避免冒名接管。GitHub 预设默认信任。
 
 ## 接口一览
 
@@ -276,9 +280,11 @@ uv run pytest
 
 - 生产环境务必设置 `APP_SECRET_KEY`，密钥丢失将无法解密已入库的敏感字段。
 - 使用 HTTPS 并将 `COOKIE_SECURE` 设为 `true`；`PUBLIC_BASE_URL` 填写真实对外地址，保证 OAuth 回调与 Webhook 地址正确。
+- 只有在提供方确实验证过邮箱归属时才开启 OAuth2 提供方的「信任邮箱」，否则同邮箱的本地账号可能被冒名登录接管。
 - 不要将 MySQL 端口暴露到公网（compose 未映射 3306）。
 - Webhook token 具有推送权限，泄露后请在「机器人 → 通道」中立即轮换。
 - 邀请码按需签发并限定邮箱与有效期，注册入口用完即关。
+- 登录失败限速按 (来源地址, 账号) 计数：后端只经本机反代访问、拿不到真实客户端地址时，来源维度不可用，退化为按账号计数，可用 `LOGIN_MAX_FAILURES` / `LOGIN_WINDOW_SECONDS` 调整。
 
 ## 已知限制
 

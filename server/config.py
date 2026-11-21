@@ -6,9 +6,15 @@
 from __future__ import annotations
 
 import ast
+import logging
+import os
+from datetime import datetime, tzinfo
 from functools import lru_cache
+from zoneinfo import ZoneInfo
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 def load_openids(raw: str | None) -> list[str]:
@@ -78,9 +84,38 @@ class Settings(BaseSettings):
     # 请求体上限
     max_body_bytes: int = 65536
 
+    # 入站鉴权：是否允许用 ?token= 传凭据（会落入访问日志，默认关闭）
+    webhook_allow_query_token: bool = False
+
+    # 登录失败限速：同一 (IP, 账号) 与同一 IP 各自的失败次数上限与统计窗口
+    login_max_failures: int = 5
+    login_ip_max_failures: int = 30
+    login_window_seconds: int = 900
+
+    # 业务统计使用的时区：留空则取容器 TZ，再退回本机时区
+    timezone: str = ""
+
     @property
     def openids(self) -> list[str]:
         return load_openids(self.openid)
+
+    @property
+    def secure_cookies(self) -> bool:
+        """会话类 Cookie 是否带 Secure：显式开启，或对外地址是 https 时自动开启。"""
+        if self.cookie_secure:
+            return True
+        return self.public_base_url.lower().startswith("https://")
+
+    @property
+    def tz(self) -> tzinfo:
+        """业务统计使用的时区。"""
+        name = self.timezone.strip() or os.environ.get("TZ", "").strip()
+        if name:
+            try:
+                return ZoneInfo(name)
+            except Exception:  # noqa: BLE001 - 时区名非法或本机缺时区库时退回本机时区
+                logger.warning("时区 %s 不可用（名称非法或本机缺少时区库），改用本机时区", name)
+        return datetime.now().astimezone().tzinfo
 
 
 @lru_cache(maxsize=1)

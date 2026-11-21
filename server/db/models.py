@@ -263,6 +263,9 @@ class OAuthProvider(TimestampMixin, Base):
     id_field: Mapped[str] = mapped_column(String(64), default="id", nullable=False)
     name_field: Mapped[str] = mapped_column(String(64), default="name", nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # 该提供方的邮箱是否可信（提供方已验证过邮箱所有权）；
+    # 不可信时不会自动关联同邮箱的本地账号，避免冒名登录接管
+    email_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
 class SystemSetting(TimestampMixin, Base):

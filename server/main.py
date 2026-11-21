@@ -20,7 +20,7 @@ from server.config import get_settings
 from server.db.bootstrap import bootstrap
 from server.db.session import dispose_engine, init_engine, session_scope
 from server.services.qq import QqClient
-from server.services.throttle import RateLimiter
+from server.services.throttle import AttemptLimiter, LimiterRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +46,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.qq_client = QqClient(
         httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0))
     )
-    app.state.limiter = RateLimiter(
+    # QQ 频控按机器人 AppID 计算，多用户共用一条全局配额会互相拖慢，故按机器人分配
+    app.state.limiters = LimiterRegistry(
         qps=settings.qq_qps,
         qpm=settings.qq_qpm,
         min_interval=settings.qq_min_interval,
+    )
+    app.state.login_limiter = AttemptLimiter(
+        pair_limit=settings.login_max_failures,
+        ip_limit=settings.login_ip_max_failures,
+        window_seconds=settings.login_window_seconds,
     )
 
     try:

@@ -36,24 +36,40 @@ def _json(platform: str, status_code: int, **kwargs) -> JSONResponse:
     return JSONResponse(ack(platform, **kwargs), status_code=status_code)
 
 
+async def _read_body(request: Request, limit: int) -> bytes | None:
+    """按上限读取请求体，超限返回 None。
+
+    先看 Content-Length 直接拒绝，再流式读取并累计长度，避免把超大请求体整个收进内存。
+    """
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        return None
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @router.post("/webhook/{platform}")
 async def receive_webhook(platform: str, request: Request) -> JSONResponse:
     if platform not in PLATFORMS:
         return _json(platform, 404, errcode=404, errmsg=f"未知平台：{platform}")
 
     settings = request.app.state.settings
-    raw = await request.body()
-    if len(raw) > settings.max_body_bytes:
+    raw = await _read_body(request, settings.max_body_bytes)
+    if raw is None:
         return _json(platform, 413, errcode=413, errmsg="请求体过大")
 
     scheme, _, credentials = request.headers.get("Authorization", "").partition(" ")
     bearer = credentials.strip() if scheme.lower() == "bearer" else ""
-    token = (
-        request.headers.get("X-Webhook-Token")
-        or bearer
-        or request.query_params.get("token")
-        or ""
-    )
+    token = request.headers.get("X-Webhook-Token") or bearer or ""
+    if not token and settings.webhook_allow_query_token:
+        # 查询参数会落进访问日志，默认不开放
+        token = request.query_params.get("token") or ""
     if not token:
         return _json(platform, 401, errcode=401, errmsg="缺少 webhook token")
 
@@ -107,7 +123,8 @@ async def receive_webhook(platform: str, request: Request) -> JSONResponse:
         )
 
         client: QqClient = request.app.state.qq_client
-        limiter = request.app.state.limiter
+        # 频控按机器人 AppID 计算，每个机器人各用一份窗口
+        limiter = request.app.state.limiters.get(f"bot:{bot.id}")
         request_id = uuid.uuid4().hex
         results = await _push_all(
             db,

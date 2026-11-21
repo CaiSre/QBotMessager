@@ -12,13 +12,13 @@ import httpx2 as httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.auth import oauth as oauth_flow
 from server.auth import passkey as passkey_flow
 from server.auth.deps import current_user
-from server.auth.passwords import hash_password, verify_password
+from server.auth.passwords import burn_password, hash_password, verify_password
 from server.auth.sessions import create_session, revoke_session
 from server.config import Settings
 from server.db.crypto import decrypt_secret
@@ -33,6 +33,7 @@ from server.db.models import (
     WebAuthnCredential,
 )
 from server.db.session import get_session
+from server.services.throttle import AttemptLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ def _set_session_cookie(response: Response, settings: Settings, token: str) -> N
         max_age=settings.session_ttl_hours * 3600,
         httponly=True,
         samesite="lax",
-        secure=settings.cookie_secure,
+        secure=settings.secure_cookies,
         path="/",
     )
 
@@ -185,19 +186,38 @@ async def login(
     db: AsyncSession = Depends(get_session),
 ) -> dict:
     settings: Settings = request.app.state.settings
+    limiter: AttemptLimiter = request.app.state.login_limiter
+    ip = request.client.host if request.client else None
+    account = data.email.lower()
+
+    wait = await limiter.remaining_wait(ip, account)
+    if wait > 0:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"尝试过于频繁，请 {wait} 秒后再试",
+            headers={"Retry-After": str(wait)},
+        )
+
     user = (
-        await db.execute(select(User).where(User.email == data.email.lower()))
+        await db.execute(select(User).where(User.email == account))
     ).scalar_one_or_none()
-    if user is None or not verify_password(data.password, user.password_hash):
+    if user is None:
+        # 账号不存在时也走一次等价 PBKDF2，避免用响应时间枚举已注册邮箱
+        burn_password(data.password)
+        await limiter.record_failure(ip, account)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="邮箱或密码错误")
+    if not verify_password(data.password, user.password_hash):
+        await limiter.record_failure(ip, account)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="邮箱或密码错误")
     if user.status != STATUS_ACTIVE:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="账号已停用")
 
+    await limiter.reset(ip, account)
     token = await create_session(
         db,
         user,
         ttl_hours=settings.session_ttl_hours,
-        ip=request.client.host if request.client else None,
+        ip=ip,
         user_agent=request.headers.get("user-agent"),
     )
     _set_session_cookie(response, settings, token)
@@ -237,8 +257,6 @@ async def register(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="邀请码已作废")
     if expires_at is not None and expires_at <= _now():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="邀请码已过期")
-    if invite.used_count >= invite.max_uses:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="邀请码已用尽")
     email = data.email.lower()
     if invite.email and invite.email.lower() != email:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="邀请码不适用于该邮箱")
@@ -249,6 +267,26 @@ async def register(
     if exists is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该邮箱已注册")
 
+    # 原子占用名额：条件 UPDATE 保证并发注册也不会突破 max_uses
+    consumed = await db.execute(
+        update(InviteCode)
+        .where(
+            InviteCode.id == invite.id,
+            InviteCode.revoked_at.is_(None),
+            InviteCode.used_count < InviteCode.max_uses,
+            or_(
+                InviteCode.expires_at.is_(None),
+                InviteCode.expires_at > _now(),
+            ),
+        )
+        .values(used_count=InviteCode.used_count + 1)
+        # 不让 ORM 在 Python 侧重算条件（库里读回的 naive 时间与会话时间无法直接比较）
+        .execution_options(synchronize_session=False)
+    )
+    if consumed.rowcount != 1:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="邀请码已用尽")
+    await db.refresh(invite)
+
     user = User(
         email=email,
         name=data.name or email.split("@")[0],
@@ -256,7 +294,6 @@ async def register(
         role=ROLE_USER,
         status=STATUS_ACTIVE,
     )
-    invite.used_count += 1
     db.add(user)
     await db.flush()
 
@@ -292,18 +329,32 @@ async def oauth_start(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="提供方不存在或未启用")
 
     try:
-        client_secret_id = decrypt_secret(provider.client_secret, settings.app_secret_key)
+        # 只做一次可解密性校验：解密结果不写回 ORM 实体，否则随后的提交会把明文写进库
+        decrypt_secret(provider.client_secret, settings.app_secret_key)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail="提供方密钥无法解密") from exc
-    provider.client_secret = client_secret_id
 
     state = oauth_flow.new_state()
     redirect_uri = f"{_origin(request, settings)}/api/auth/oauth/{provider.key}/callback"
     url = oauth_flow.build_authorize_url(provider, redirect_uri=redirect_uri, state=state)
     response = RedirectResponse(url, status_code=status.HTTP_302_FOUND)
-    response.set_cookie(OAUTH_STATE_COOKIE, state, max_age=600, httponly=True, samesite="lax", path="/")
     response.set_cookie(
-        OAUTH_PROVIDER_COOKIE, provider.key, max_age=600, httponly=True, samesite="lax", path="/"
+        OAUTH_STATE_COOKIE,
+        state,
+        max_age=600,
+        httponly=True,
+        samesite="lax",
+        secure=settings.secure_cookies,
+        path="/",
+    )
+    response.set_cookie(
+        OAUTH_PROVIDER_COOKIE,
+        provider.key,
+        max_age=600,
+        httponly=True,
+        samesite="lax",
+        secure=settings.secure_cookies,
+        path="/",
     )
     return response
 
@@ -339,7 +390,8 @@ async def oauth_callback(
     if provider is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="提供方不存在或未启用")
     try:
-        provider.client_secret = decrypt_secret(provider.client_secret, settings.app_secret_key)
+        # 解密结果放在局部变量里：写回 provider 会让随后的提交把明文密钥写进库
+        client_secret = decrypt_secret(provider.client_secret, settings.app_secret_key)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail="提供方密钥无法解密") from exc
 
@@ -347,7 +399,11 @@ async def oauth_callback(
     client: httpx.AsyncClient = request.app.state.httpx
     try:
         token_data = await oauth_flow.exchange_code(
-            client, provider, code=code, redirect_uri=redirect_uri
+            client,
+            provider,
+            code=code,
+            redirect_uri=redirect_uri,
+            client_secret=client_secret,
         )
         profile = await oauth_flow.fetch_profile(
             client, provider, access_token=token_data["access_token"]
@@ -372,7 +428,14 @@ async def oauth_callback(
             user = (
                 await db.execute(select(User).where(User.email == profile.email.lower()))
             ).scalar_one_or_none()
-        if user is None:
+        if user is not None:
+            # 已有本地账号：只有提供方邮箱可信时才自动关联，否则会被冒名登录接管账号
+            if not (provider.email_verified or profile.email_verified):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="该邮箱已存在本地账号，但提供方未验证邮箱，无法自动关联；请改用密码登录",
+                )
+        else:
             if not await registration_enabled(db, settings):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -472,7 +535,7 @@ async def passkey_register_begin(
         max_age=300,
         httponly=True,
         samesite="lax",
-        secure=settings.cookie_secure,
+        secure=settings.secure_cookies,
         path="/",
     )
     response.set_cookie(
@@ -481,7 +544,7 @@ async def passkey_register_begin(
         max_age=300,
         httponly=True,
         samesite="lax",
-        secure=settings.cookie_secure,
+        secure=settings.secure_cookies,
         path="/",
     )
     return response
@@ -571,7 +634,7 @@ async def passkey_login_begin(request: Request) -> Response:
         max_age=300,
         httponly=True,
         samesite="lax",
-        secure=settings.cookie_secure,
+        secure=settings.secure_cookies,
         path="/",
     )
     return response

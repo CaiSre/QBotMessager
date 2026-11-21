@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+import pytest
+
 from tests.conftest import StubQqClient, create_bot, create_channel
 
 
@@ -180,6 +182,37 @@ def test_authorization_bearer_token_accepted(
         headers={"Authorization": f"Basic {channel['webhook_token']}"},
     )
     assert wrong_scheme.status_code == 401
+
+
+def test_query_token_rejected_by_default(
+    admin: TestClient, qq: StubQqClient
+) -> None:
+    bot_id = create_bot(admin, openids=["u-query"])
+    channel = create_channel(admin, bot_id, "dingtalk")
+
+    response = admin.post(
+        f"/webhook/dingtalk?token={channel['webhook_token']}",
+        json={"msgtype": "text", "text": {"content": "query"}},
+    )
+    assert response.status_code == 401, response.text
+    assert qq.calls == []
+
+
+def test_query_token_allowed_when_enabled(
+    admin: TestClient, qq: StubQqClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.main import app
+
+    bot_id = create_bot(admin, openids=["u-query"])
+    channel = create_channel(admin, bot_id, "dingtalk")
+
+    monkeypatch.setattr(app.state.settings, "webhook_allow_query_token", True)
+    response = admin.post(
+        f"/webhook/dingtalk?token={channel['webhook_token']}",
+        json={"msgtype": "text", "text": {"content": "query"}},
+    )
+    assert response.status_code == 200, response.text
+    assert len(qq.calls) == 1
 
 
 def test_missing_target_returns_400(admin: TestClient, qq: StubQqClient) -> None:

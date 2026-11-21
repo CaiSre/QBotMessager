@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
+
+import pytest
 
 from server.auth.passwords import hash_password
 from tests.conftest import ADMIN_EMAIL, ADMIN_PASSWORD, create_bot
@@ -156,3 +160,85 @@ def test_super_admin_cannot_change_own_role_or_status(admin: TestClient) -> None
     disabled = admin.patch(f"/api/admin/users/{me['id']}", json={"status": "disabled"})
     assert disabled.status_code == 400
     assert "不能修改自己的账号状态" in disabled.json()["detail"]
+
+
+def test_login_failures_are_rate_limited(client: TestClient) -> None:
+    for _ in range(5):
+        bad = client.post(
+            "/api/auth/login",
+            json={"email": "nobody@example.com", "password": "wrong-pass"},
+        )
+        assert bad.status_code == 401, bad.text
+
+    blocked = client.post(
+        "/api/auth/login",
+        json={"email": "nobody@example.com", "password": "wrong-pass"},
+    )
+    assert blocked.status_code == 429, blocked.text
+    assert int(blocked.headers["Retry-After"]) > 0
+
+
+def test_successful_login_clears_account_counter(client: TestClient) -> None:
+    for _ in range(4):
+        bad = client.post(
+            "/api/auth/login",
+            json={"email": ADMIN_EMAIL, "password": "wrong-pass"},
+        )
+        assert bad.status_code == 401, bad.text
+
+    ok = client.post(
+        "/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+    )
+    assert ok.status_code == 200, ok.text
+
+    # 计数已清空，又能再错 5 次
+    for _ in range(5):
+        bad = client.post(
+            "/api/auth/login",
+            json={"email": ADMIN_EMAIL, "password": "wrong-pass"},
+        )
+        assert bad.status_code == 401, bad.text
+
+
+def test_session_cookie_is_secure_on_https(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.main import app
+
+    assert "Secure" not in client.post(
+        "/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+    ).headers["set-cookie"]
+
+    monkeypatch.setattr(app.state.settings, "public_base_url", "https://example.com")
+    response = client.post(
+        "/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+    )
+    assert response.status_code == 200, response.text
+    assert "Secure" in response.headers["set-cookie"]
+
+
+def test_invite_max_uses_never_exceeded(admin: TestClient, db_path) -> None:
+    admin.patch("/api/admin/settings", json={"register_enabled": True})
+    code = admin.post("/api/admin/invites", json={"max_uses": 1}).json()["code"]
+
+    barrier = threading.Barrier(4)
+
+    def register(index: int):
+        barrier.wait()
+        return _register(admin, code, f"racer{index}@example.com")
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        responses = list(pool.map(register, range(4)))
+
+    codes = sorted(response.status_code for response in responses)
+    assert codes == [200, 400, 400, 400], codes
+
+    with sqlite3.connect(db_path) as con:
+        used = con.execute(
+            "SELECT used_count FROM invite_codes WHERE code = ?", (code,)
+        ).fetchone()[0]
+        users = con.execute(
+            "SELECT COUNT(*) FROM users WHERE email LIKE 'racer%@example.com'"
+        ).fetchone()[0]
+    assert used == 1
+    assert users == 1

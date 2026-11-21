@@ -130,6 +130,7 @@ export interface OAuthProvider {
   id_field: string;
   name_field: string;
   enabled: boolean;
+  email_verified: boolean;
 }
 
 export interface SecuritySettings {
