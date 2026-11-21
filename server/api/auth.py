@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.auth import oauth as oauth_flow
@@ -58,6 +59,7 @@ from server.services.mail import (
     send_mail,
 )
 from server.services.throttle import AttemptLimiter
+from server.services.users import name_taken, unique_name
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +89,18 @@ class _EmailModel(BaseModel):
         return value
 
 
-class LoginIn(_EmailModel):
+class LoginIn(BaseModel):
+    # 登录标识：用户名或邮箱
+    account: str = Field(min_length=1, max_length=255)
     password: str = Field(min_length=1, max_length=256)
+
+    @field_validator("account")
+    @classmethod
+    def _strip_identifier(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("请填写用户名或邮箱")
+        return value
 
 
 class RegisterIn(_EmailModel):
@@ -307,8 +319,16 @@ async def update_name(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_session),
 ) -> dict:
+    if await name_taken(db, data.name, exclude_user_id=user.id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该用户名已被使用")
     user.name = data.name
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="该用户名已被使用"
+        ) from exc
     return _user_payload(user)
 
 
@@ -479,9 +499,10 @@ async def login(
     settings: Settings = request.app.state.settings
     limiter: AttemptLimiter = request.app.state.login_limiter
     ip = request.client.host if request.client else None
-    account = data.email.lower()
+    account = data.account.strip()
+    account_key = account.lower()
 
-    wait = await limiter.remaining_wait(ip, account)
+    wait = await limiter.remaining_wait(ip, account_key)
     if wait > 0:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -489,21 +510,28 @@ async def login(
             headers={"Retry-After": str(wait)},
         )
 
-    user = (
-        await db.execute(select(User).where(User.email == account))
-    ).scalar_one_or_none()
+    # 含 @ 的按邮箱查，否则按用户名查（用户名理论上可重复，取最早注册的账号）
+    if "@" in account:
+        query = select(User).where(User.email == account_key)
+    else:
+        query = select(User).where(func.lower(User.name) == account_key).order_by(User.id)
+    user = (await db.execute(query)).scalars().first()
     if user is None:
-        # 账号不存在时也走一次等价 PBKDF2，避免用响应时间枚举已注册邮箱
+        # 账号不存在时也走一次等价 PBKDF2，避免用响应时间枚举已注册账号
         burn_password(data.password)
-        await limiter.record_failure(ip, account)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="邮箱或密码错误")
+        await limiter.record_failure(ip, account_key)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误"
+        )
     if not verify_password(data.password, user.password_hash):
-        await limiter.record_failure(ip, account)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="邮箱或密码错误")
+        await limiter.record_failure(ip, account_key)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误"
+        )
     if user.status != STATUS_ACTIVE:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="账号已停用")
 
-    await limiter.reset(ip, account)
+    await limiter.reset(ip, account_key)
     token = await create_session(
         db,
         user,
@@ -558,6 +586,10 @@ async def register(
     if exists is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该邮箱已注册")
 
+    name = data.name.strip()
+    if name and await name_taken(db, name):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该用户名已被使用")
+
     if mail_configured(settings):
         if not data.email_code:
             raise HTTPException(
@@ -592,13 +624,25 @@ async def register(
 
     user = User(
         email=email,
-        name=data.name or email.split("@")[0],
+        name=name or await unique_name(db, email.split("@")[0]),
         password_hash=hash_password(data.password),
         role=ROLE_USER,
         status=STATUS_ACTIVE,
     )
     db.add(user)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # 并发注册时应用层查重可能同时通过，由数据库唯一索引兜底
+        await db.rollback()
+        detail = (
+            "该用户名已被使用"
+            if "name" in str(exc.orig).lower()
+            else "该邮箱已注册"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=detail
+        ) from exc
 
     token = await create_session(
         db,
@@ -751,7 +795,12 @@ async def oauth_callback(
                 )
             user = User(
                 email=profile.email.lower(),
-                name=profile.name or profile.login,
+                name=await unique_name(
+                    db,
+                    profile.name
+                    or profile.login
+                    or profile.email.split("@")[0],
+                ),
                 password_hash=None,
                 role=ROLE_USER,
                 status=STATUS_ACTIVE,

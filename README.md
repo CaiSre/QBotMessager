@@ -6,7 +6,7 @@
   <a href="https://nextjs.org/"><img alt="Next.js" src="https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white"></a>
   <a href="https://www.mysql.com/"><img alt="MySQL" src="https://img.shields.io/badge/MySQL-8.4-4479A1?logo=mysql&logoColor=white"></a>
   <a href="https://docs.docker.com/compose/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white"></a>
-  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-96%20passed-brightgreen"></a>
+  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-102%20passed-brightgreen"></a>
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img alt="License: AGPL v3" src="https://img.shields.io/badge/License-AGPL_v3-blue"></a>
 </p>
 
@@ -41,7 +41,7 @@
 - **QQ 推送**：支持 `msg_type=0` 纯文本与 `msg_type=2` Markdown，支持用户与群目标、账号级频控、401 自动刷新、5xx 与超频退避重试。
 - **多用户隔离**：每个用户独立管理自己的机器人、通道与推送日志，数据按 `owner_user_id` 隔离。
 - **超级管理员**：可见并管理全部用户的资源；用户账号、邀请码、注册开关与 OAuth2 提供方仅超管可操作。
-- **多种登录方式**：邮箱密码、OAuth2 授权码、通行密钥（WebAuthn），服务端会话 Cookie。
+- **多种登录方式**：用户名或邮箱密码、OAuth2 授权码、通行密钥（WebAuthn），服务端会话 Cookie。
 - **邮箱验证码**：配置 SMTP 后，注册、找回密码与 OAuth 账号首次设置密码需邮箱验证码；验证码邮件与站点风格一致。
 - **推送审计**：记录平台、来源类型、目标、状态、错误码、耗时与请求 ID，支持分页与筛选。
 - **敏感数据加密**：QQ AppSecret、OAuth Client Secret 以 Fernet 密文入库。
@@ -225,6 +225,7 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 | `user` | 仅管理本人创建的机器人、通道与推送日志 |
 
 - 注册需邀请码，注册用户固定为 `user`；邀请码由超级管理员签发，可限定邮箱、次数与有效期。
+- 用户名全局唯一（忽略大小写），可用于登录；未填写时按邮箱前缀自动生成，冲突时追加 `-2`、`-3` 等后缀。数据库对 `lower(name)` 建唯一索引兜底，迁移时会自动清理历史重名。
 - 系统至少保留一个启用的超级管理员，且不能修改自己的角色或账号状态。
 - OAuth2 提供方默认「邮箱不可信」：只有提供方确认验证过邮箱归属（或接口返回了已验证标记）时，才会用同邮箱自动关联已有本地账号；否则要求用户改用密码登录，避免冒名接管。GitHub 预设默认信任。
 
@@ -236,7 +237,7 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 | 数据面 | `POST /webhook/{platform}` | `dingtalk` / `wecom` / `feishu` |
 | | `POST /webhook/github/{token}` | GitHub Webhook，校验 `X-Hub-Signature-256` |
 | 认证 | `GET /api/auth/providers` | 注册开关、可用登录方式与邮件验证码开关（公开） |
-| | `POST /api/auth/login`、`/logout`、`/register` | 邮箱密码登录、退出、邀请码注册（配置 SMTP 后需邮箱验证码） |
+| | `POST /api/auth/login`、`/logout`、`/register` | 用户名或邮箱密码登录、退出、邀请码注册（配置 SMTP 后需邮箱验证码） |
 | | `POST /api/auth/email-code`、`/password/reset` | 发送注册/找回密码验证码、用验证码重置密码 |
 | | `GET /api/auth/me` | 当前用户信息 |
 | | `GET /api/auth/oauth/{key}/start`、`/callback` | OAuth2 授权码流程 |

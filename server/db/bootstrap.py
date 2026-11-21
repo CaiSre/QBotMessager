@@ -21,6 +21,7 @@ from server.db.models import (
     Channel,
     User,
 )
+from server.services.users import unique_name
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,9 @@ async def bootstrap(session: AsyncSession, settings: Settings) -> dict:
         if admin is None:
             admin = User(
                 email=settings.bootstrap_admin_email,
-                name=settings.bootstrap_admin_email.split("@")[0],
+                name=await unique_name(
+                    session, settings.bootstrap_admin_email.split("@")[0]
+                ),
                 password_hash=hash_password(settings.bootstrap_admin_password),
                 role=ROLE_SUPER_ADMIN,
             )

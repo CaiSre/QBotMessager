@@ -198,14 +198,14 @@ def test_reset_password_with_code(admin: TestClient, db_path, outbox: Outbox) ->
     assert (
         admin.post(
             "/api/auth/login",
-            json={"email": "forget@example.com", "password": "old-password-1"},
+            json={"account": "forget@example.com", "password": "old-password-1"},
         ).status_code
         == 401
     )
     assert (
         admin.post(
             "/api/auth/login",
-            json={"email": "forget@example.com", "password": "new-password-1"},
+            json={"account": "forget@example.com", "password": "new-password-1"},
         ).status_code
         == 200
     )
@@ -247,7 +247,7 @@ def test_oauth_account_set_password_requires_code(
     assert (
         admin.post(
             "/api/auth/login",
-            json={"email": ADMIN_EMAIL, "password": "oauth-password-1"},
+            json={"account": ADMIN_EMAIL, "password": "oauth-password-1"},
         ).status_code
         == 200
     )

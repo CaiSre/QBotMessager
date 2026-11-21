@@ -54,7 +54,7 @@ def _insert_session(db_path, user_id: int, token: str) -> None:
 
 def _login(client: TestClient, email: str, password: str):
     client.post("/api/auth/logout")
-    return client.post("/api/auth/login", json={"email": email, "password": password})
+    return client.post("/api/auth/login", json={"account": email, "password": password})
 
 
 def test_update_name(admin: TestClient) -> None:
@@ -65,6 +65,22 @@ def test_update_name(admin: TestClient) -> None:
 
     blank = admin.patch("/api/auth/me/name", json={"name": "   "})
     assert blank.status_code == 422
+
+
+def test_update_name_conflict(admin: TestClient, db_path) -> None:
+    _insert_user(db_path, "other@example.com", hash_password("other-pass-1"), "taken")
+
+    # 唯一性忽略大小写
+    for candidate in ("taken", "TAKEN", " taken "):
+        response = admin.patch("/api/auth/me/name", json={"name": candidate})
+        assert response.status_code == 409, response.text
+        assert "已被使用" in response.json()["detail"]
+    assert admin.get("/api/auth/me").json()["name"] == "admin"
+
+    # 改为自身当前用户名（大小写不同）不受限
+    own = admin.patch("/api/auth/me/name", json={"name": "ADMIN"})
+    assert own.status_code == 200, own.text
+    assert own.json()["name"] == "ADMIN"
 
 
 def test_update_email_requires_current_password(admin: TestClient) -> None:

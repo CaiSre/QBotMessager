@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Select, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.auth.deps import current_user, is_super_admin, require_super_admin
@@ -34,6 +35,7 @@ from server.db.models import (
 from server.db.session import get_session
 from server.services.audit import record_audit
 from server.services.runtime_settings import SPECS, RuntimeSettings
+from server.services.users import name_taken
 
 router = APIRouter(prefix="/api/admin")
 
@@ -569,7 +571,10 @@ async def patch_user(
     if data.status is not None:
         target.status = data.status
     if data.name is not None:
-        target.name = data.name
+        new_name = data.name.strip()
+        if new_name and await name_taken(db, new_name, exclude_user_id=target.id):
+            raise HTTPException(status_code=409, detail="该用户名已被使用")
+        target.name = new_name
     await record_audit(
         db,
         actor=user,
@@ -579,7 +584,11 @@ async def patch_user(
         detail={"role": data.role, "status": data.status},
         ip=_client_ip(request),
     )
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="该用户名已被使用") from exc
     return {"id": target.id}
 
 

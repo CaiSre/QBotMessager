@@ -365,7 +365,7 @@ export default function UsersPage() {
             <FieldGroup className="gap-4">
               <p className="text-sm font-medium">{editing?.email}</p>
               <Field>
-                <FieldLabel htmlFor="user-name">昵称</FieldLabel>
+                <FieldLabel htmlFor="user-name">用户名</FieldLabel>
                 <Input
                   id="user-name"
                   value={editName}

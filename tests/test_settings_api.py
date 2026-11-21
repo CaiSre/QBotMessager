@@ -84,11 +84,11 @@ def test_login_limiter_applies_immediately(admin: TestClient) -> None:
 
     admin.post("/api/auth/logout")
     first = admin.post(
-        "/api/auth/login", json={"email": ADMIN_EMAIL, "password": "wrong-pass"}
+        "/api/auth/login", json={"account": ADMIN_EMAIL, "password": "wrong-pass"}
     )
     assert first.status_code == 401
     second = admin.post(
-        "/api/auth/login", json={"email": ADMIN_EMAIL, "password": "wrong-pass"}
+        "/api/auth/login", json={"account": ADMIN_EMAIL, "password": "wrong-pass"}
     )
     assert second.status_code == 429
 

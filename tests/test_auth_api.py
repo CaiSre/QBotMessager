@@ -18,16 +18,18 @@ USER_PASSWORD = "MemberPass2026"
 T2_PASSWORD = "Tenant2Pass2026"
 
 
-def _register(client: TestClient, code: str, email: str) -> object:
-    return client.post(
-        "/api/auth/register",
-        json={"email": email, "invite_code": code, "password": USER_PASSWORD},
-    )
+def _register(
+    client: TestClient, code: str, email: str, name: str | None = None
+) -> object:
+    body = {"email": email, "invite_code": code, "password": USER_PASSWORD}
+    if name is not None:
+        body["name"] = name
+    return client.post("/api/auth/register", json=body)
 
 
 def _login(client: TestClient, email: str, password: str) -> None:
     client.post("/api/auth/logout")
-    response = client.post("/api/auth/login", json={"email": email, "password": password})
+    response = client.post("/api/auth/login", json={"account": email, "password": password})
     assert response.status_code == 200, response.text
 
 
@@ -51,12 +53,12 @@ def test_requires_login(client: TestClient) -> None:
 
 def test_login_and_logout(client: TestClient) -> None:
     bad = client.post(
-        "/api/auth/login", json={"email": ADMIN_EMAIL, "password": "wrong-pass"}
+        "/api/auth/login", json={"account": ADMIN_EMAIL, "password": "wrong-pass"}
     )
     assert bad.status_code == 401
 
     response = client.post(
-        "/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+        "/api/auth/login", json={"account": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
     )
     assert response.status_code == 200
     assert "sid" in response.cookies or "sid" in client.cookies
@@ -68,6 +70,20 @@ def test_login_and_logout(client: TestClient) -> None:
 
     assert client.post("/api/auth/logout").status_code == 200
     assert client.get("/api/auth/me").status_code == 401
+
+
+def test_login_with_username(client: TestClient) -> None:
+    # 引导管理员的用户名取邮箱前缀
+    response = client.post(
+        "/api/auth/login", json={"account": "admin", "password": ADMIN_PASSWORD}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["name"] == "admin"
+
+    wrong = client.post(
+        "/api/auth/login", json={"account": "admin", "password": "wrong-pass"}
+    )
+    assert wrong.status_code == 401
 
 
 def test_register_disabled_by_default(client: TestClient) -> None:
@@ -115,6 +131,55 @@ def test_invite_register_and_user_scope(admin: TestClient) -> None:
     reused = _register(admin, code, "other@example.com")
     assert reused.status_code == 400
     assert "用尽" in reused.json()["detail"]
+
+
+def test_register_rejects_duplicate_username(admin: TestClient, db_path) -> None:
+    admin.patch("/api/admin/settings", json={"register_enabled": True})
+    code = admin.post("/api/admin/invites", json={"max_uses": 2}).json()["code"]
+
+    first = _register(admin, code, "first@example.com", name="Unique")
+    assert first.status_code == 200, first.text
+
+    # 大小写不敏感，且失败时不消耗邀请码
+    second = _register(admin, code, "second@example.com", name="unique")
+    assert second.status_code == 409, second.text
+    assert "已被使用" in second.json()["detail"]
+    with sqlite3.connect(db_path) as con:
+        used = con.execute(
+            "SELECT used_count FROM invite_codes WHERE code = ?", (code,)
+        ).fetchone()[0]
+    assert used == 1
+
+
+def test_register_generates_unique_default_username(
+    admin: TestClient, db_path
+) -> None:
+    admin.patch("/api/admin/settings", json={"register_enabled": True})
+    code = admin.post("/api/admin/invites", json={"max_uses": 1}).json()["code"]
+    # 已有用户名 dup，新注册未填用户名时以邮箱前缀为基准追加后缀
+    _insert_user(db_path, "dup@other.test", USER_PASSWORD)
+
+    created = _register(admin, code, "dup@example.com")
+    assert created.status_code == 200, created.text
+    assert created.json()["name"] == "dup-2"
+
+
+def test_admin_update_username_unique(admin: TestClient, db_path) -> None:
+    target_id = _insert_user(db_path, "target@example.com", T2_PASSWORD)
+
+    dup = admin.patch(f"/api/admin/users/{target_id}", json={"name": "ADMIN"})
+    assert dup.status_code == 409, dup.text
+    assert "已被使用" in dup.json()["detail"]
+
+    ok = admin.patch(f"/api/admin/users/{target_id}", json={"name": "renamed"})
+    assert ok.status_code == 200, ok.text
+
+
+def test_database_enforces_unique_username(db_path) -> None:
+    # 绕过接口直接写入：唯一索引在数据库层同样忽略大小写
+    _insert_user(db_path, "db-a@example.com", USER_PASSWORD)
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_user(db_path, "DB-A@example.com", USER_PASSWORD)
 
 
 def test_expired_invite_rejected(admin: TestClient, db_path) -> None:
@@ -166,13 +231,13 @@ def test_login_failures_are_rate_limited(client: TestClient) -> None:
     for _ in range(5):
         bad = client.post(
             "/api/auth/login",
-            json={"email": "nobody@example.com", "password": "wrong-pass"},
+            json={"account": "nobody@example.com", "password": "wrong-pass"},
         )
         assert bad.status_code == 401, bad.text
 
     blocked = client.post(
         "/api/auth/login",
-        json={"email": "nobody@example.com", "password": "wrong-pass"},
+        json={"account": "nobody@example.com", "password": "wrong-pass"},
     )
     assert blocked.status_code == 429, blocked.text
     assert int(blocked.headers["Retry-After"]) > 0
@@ -182,12 +247,12 @@ def test_successful_login_clears_account_counter(client: TestClient) -> None:
     for _ in range(4):
         bad = client.post(
             "/api/auth/login",
-            json={"email": ADMIN_EMAIL, "password": "wrong-pass"},
+            json={"account": ADMIN_EMAIL, "password": "wrong-pass"},
         )
         assert bad.status_code == 401, bad.text
 
     ok = client.post(
-        "/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+        "/api/auth/login", json={"account": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
     )
     assert ok.status_code == 200, ok.text
 
@@ -195,7 +260,7 @@ def test_successful_login_clears_account_counter(client: TestClient) -> None:
     for _ in range(5):
         bad = client.post(
             "/api/auth/login",
-            json={"email": ADMIN_EMAIL, "password": "wrong-pass"},
+            json={"account": ADMIN_EMAIL, "password": "wrong-pass"},
         )
         assert bad.status_code == 401, bad.text
 
@@ -206,12 +271,12 @@ def test_session_cookie_is_secure_on_https(
     from server.main import app
 
     assert "Secure" not in client.post(
-        "/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+        "/api/auth/login", json={"account": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
     ).headers["set-cookie"]
 
     monkeypatch.setattr(app.state.settings, "public_base_url", "https://example.com")
     response = client.post(
-        "/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+        "/api/auth/login", json={"account": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
     )
     assert response.status_code == 200, response.text
     assert "Secure" in response.headers["set-cookie"]

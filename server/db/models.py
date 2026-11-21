@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import Mapped, mapped_column
@@ -52,6 +53,11 @@ class User(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(16), default=STATUS_ACTIVE, nullable=False)
     last_login_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        # 表达式索引：用户名忽略大小写唯一（SQLite 与 MySQL 8.0.13+ 均支持）
+        Index("uq_users_name_lower", func.lower(name), unique=True),
     )
 
 

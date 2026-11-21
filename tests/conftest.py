@@ -113,7 +113,7 @@ def client(qq: StubQqClient) -> TestClient:
 @pytest.fixture()
 def admin(client: TestClient) -> TestClient:
     response = client.post(
-        "/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+        "/api/auth/login", json={"account": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
     )
     assert response.status_code == 200, response.text
     return client

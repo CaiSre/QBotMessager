@@ -102,7 +102,7 @@ export default function AccountPage() {
       setEmail(updated.email);
       setEmailPassword("");
       await refreshMe();
-      setNotice("邮箱已更新，之后请使用新邮箱登录");
+      setNotice("邮箱已更新，之后请使用新邮箱或用户名登录");
     } catch (err) {
       setError(messageOf(err));
     } finally {
@@ -147,7 +147,9 @@ export default function AccountPage() {
       setPasswordCode("");
       await refreshMe();
       setNotice(
-        me.has_password ? "密码已修改，其他设备已退出登录" : "密码已设置，现在可以使用邮箱登录",
+        me.has_password
+          ? "密码已修改，其他设备已退出登录"
+          : "密码已设置，现在可以使用用户名或邮箱登录",
       );
     } catch (err) {
       setError(messageOf(err));
@@ -160,7 +162,7 @@ export default function AccountPage() {
     <div className="max-w-4xl">
       <PageHeader
         title="个人中心"
-        description="管理账号的显示名称、登录邮箱与密码"
+        description="管理账号的用户名、登录邮箱与密码"
       />
       <ErrorAlert message={error} />
       <SuccessAlert message={notice} />
@@ -186,7 +188,7 @@ export default function AccountPage() {
         <Card>
           <CardHeader>
             <CardTitle>用户名</CardTitle>
-            <CardDescription>显示在侧边栏与控制台中的名称。</CardDescription>
+            <CardDescription>用于登录，也显示在侧边栏与控制台。</CardDescription>
           </CardHeader>
           <CardContent>
             <form noValidate onSubmit={saveName}>
@@ -219,7 +221,7 @@ export default function AccountPage() {
         <Card>
           <CardHeader>
             <CardTitle>登录邮箱</CardTitle>
-            <CardDescription>修改后请使用新邮箱与密码登录。</CardDescription>
+            <CardDescription>修改后请使用新邮箱或用户名登录。</CardDescription>
           </CardHeader>
           <CardContent>
             <form noValidate onSubmit={saveEmail}>
@@ -321,7 +323,7 @@ export default function AccountPage() {
                 </>
               ) : (
                 <FieldDescription>
-                  该账号尚未设置密码，设置后即可使用邮箱与密码登录。
+                  该账号尚未设置密码，设置后即可使用用户名或邮箱登录。
                 </FieldDescription>
               )}
               <div className="grid gap-4 sm:grid-cols-2">

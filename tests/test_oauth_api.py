@@ -195,6 +195,6 @@ def test_admin_password_still_works(admin: TestClient) -> None:
     # 未验证邮箱的提供方不得影响密码登录
     response = admin.post(
         "/api/auth/login",
-        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        json={"account": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
     )
     assert response.status_code == 200, response.text

@@ -166,7 +166,7 @@ export default function RegisterPage() {
                   </>
                 ) : null}
                 <Field>
-                  <FieldLabel htmlFor="name">昵称</FieldLabel>
+                  <FieldLabel htmlFor="name">用户名</FieldLabel>
                   <Input
                     id="name"
                     value={name}
