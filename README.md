@@ -1,30 +1,34 @@
-# QBotMessager
+<h1 align="center">QBotMessager</h1>
 
-[![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Next.js](https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white)](https://nextjs.org/)
-[![MySQL](https://img.shields.io/badge/MySQL-8.4-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com/)
-[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/compose/)
-[![Tests](https://img.shields.io/badge/tests-45%20passed-brightgreen)](#测试)
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue)](https://www.gnu.org/licenses/agpl-3.0)
+<p align="center">
+  <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white"></a>
+  <a href="https://fastapi.tiangolo.com/"><img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi&logoColor=white"></a>
+  <a href="https://nextjs.org/"><img alt="Next.js" src="https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white"></a>
+  <a href="https://www.mysql.com/"><img alt="MySQL" src="https://img.shields.io/badge/MySQL-8.4-4479A1?logo=mysql&logoColor=white"></a>
+  <a href="https://docs.docker.com/compose/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white"></a>
+  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-45%20passed-brightgreen"></a>
+  <a href="https://www.gnu.org/licenses/agpl-3.0"><img alt="License: AGPL v3" src="https://img.shields.io/badge/License-AGPL_v3-blue"></a>
+</p>
 
-> 接收钉钉、企业微信、飞书的 Webhook，统一转换为 QQ 机器人消息并推送；内置多用户控制台，按用户隔离机器人配置与推送日志。
+<p align="center">面向钉钉、企业微信与飞书的统一消息接入层：全异步链路即时完成转换与推送，Access Token 常驻缓存、失效即刷，显著降低端到端延迟；账号级频控与退避重试保障高峰下的稳定吞吐，多用户控制台按归属隔离机器人、通道与推送日志，敏感凭据以 Fernet 加密入库。</p>
 
 ## 目录
 
-- [功能特性](#功能特性)
-- [技术栈](#技术栈)
-- [系统架构](#系统架构)
-- [快速开始](#快速开始)
-- [配置说明](#配置说明)
-- [使用指南](#使用指南)
-- [接口一览](#接口一览)
-- [本地开发](#本地开发)
-- [目录结构](#目录结构)
-- [安全建议](#安全建议)
-- [已知限制](#已知限制)
-- [社区支持](#社区支持)
-- [许可证](#许可证)
+<p align="center">
+  <a href="#功能特性">功能特性</a> ·
+  <a href="#技术栈">技术栈</a> ·
+  <a href="#系统架构">系统架构</a> ·
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#配置说明">配置说明</a> ·
+  <a href="#使用指南">使用指南</a> ·
+  <a href="#接口一览">接口一览</a> ·
+  <a href="#本地开发">本地开发</a> ·
+  <a href="#目录结构">目录结构</a> ·
+  <a href="#安全建议">安全建议</a> ·
+  <a href="#已知限制">已知限制</a> ·
+  <a href="#社区支持">社区支持</a> ·
+  <a href="#许可证">许可证</a>
+</p>
 
 ## 功能特性
 
