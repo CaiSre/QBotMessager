@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.config import Settings
+from server.db.crypto import DecryptError, decrypt_secret, encrypt_secret
 from server.db.models import SystemSetting
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ Kind = Literal["bool", "int", "float", "string", "select"]
 GROUP_SITE = "站点与访问"
 GROUP_ACCOUNT = "注册与会话"
 GROUP_LOGIN = "登录保护"
+GROUP_MAIL = "邮件服务"
 GROUP_QQ = "QQ 推送"
 
 
@@ -42,6 +44,8 @@ class SettingSpec:
     maximum: float | None = None
     options: tuple[str, ...] = ()
     max_length: int = 512
+    # 敏感项：库里以 Fernet 密文保存，接口与页面只回显是否已设置
+    secret: bool = False
 
 
 CATALOG: tuple[SettingSpec, ...] = (
@@ -165,6 +169,102 @@ CATALOG: tuple[SettingSpec, ...] = (
         maximum=86_400,
     ),
     SettingSpec(
+        "smtp_host",
+        "SMTP 服务器",
+        GROUP_MAIL,
+        "string",
+        "",
+        "邮件服务器地址，例如 smtp.example.com；留空则停用邮件验证码",
+        max_length=255,
+    ),
+    SettingSpec(
+        "smtp_port",
+        "SMTP 端口",
+        GROUP_MAIL,
+        "int",
+        587,
+        "常用端口：587（STARTTLS）、465（SSL）、25（不加密）",
+        minimum=1,
+        maximum=65535,
+    ),
+    SettingSpec(
+        "smtp_security",
+        "连接方式",
+        GROUP_MAIL,
+        "select",
+        "starttls",
+        "starttls 为 STARTTLS 升级，ssl 为直接 TLS，none 为明文（不推荐）",
+        options=("starttls", "ssl", "none"),
+    ),
+    SettingSpec(
+        "smtp_username",
+        "SMTP 用户名",
+        GROUP_MAIL,
+        "string",
+        "",
+        "登录邮件服务器的账号；留空则不登录",
+        max_length=255,
+    ),
+    SettingSpec(
+        "smtp_password",
+        "SMTP 密码",
+        GROUP_MAIL,
+        "string",
+        "",
+        "登录邮件服务器的密码或授权码；加密入库，留空保持不变",
+        max_length=512,
+        secret=True,
+    ),
+    SettingSpec(
+        "smtp_from",
+        "发件人地址",
+        GROUP_MAIL,
+        "string",
+        "",
+        "验证码邮件的发件人；留空时使用 SMTP 用户名",
+        max_length=255,
+    ),
+    SettingSpec(
+        "smtp_timeout",
+        "SMTP 超时",
+        GROUP_MAIL,
+        "int",
+        15,
+        "连接与发送的超时秒数",
+        minimum=1,
+        maximum=120,
+    ),
+    SettingSpec(
+        "email_code_ttl_minutes",
+        "验证码有效期",
+        GROUP_MAIL,
+        "int",
+        10,
+        "邮箱验证码的有效分钟数",
+        minimum=1,
+        maximum=60,
+    ),
+    SettingSpec(
+        "email_code_resend_seconds",
+        "重发间隔",
+        GROUP_MAIL,
+        "int",
+        60,
+        "同一邮箱同一用途两次发码的最短间隔（秒）",
+        minimum=30,
+        maximum=600,
+    ),
+    SettingSpec(
+        "email_code_hourly_limit",
+        "每小时发码上限",
+        GROUP_MAIL,
+        "int",
+        5,
+        "同一邮箱同一用途每小时最多发送次数",
+        minimum=1,
+        maximum=50,
+    ),
+    SettingSpec(
         "qq_host",
         "QQ API 域名",
         GROUP_QQ,
@@ -275,7 +375,9 @@ def _coerce(spec: SettingSpec, raw: Any) -> Any:
     return value
 
 
-def _serialize(spec: SettingSpec, value: Any) -> str:
+def _serialize(spec: SettingSpec, value: Any, secret_key: str) -> str:
+    if spec.secret:
+        return encrypt_secret(str(value), secret_key)
     if spec.kind == "bool":
         return "true" if value else "false"
     return str(value)
@@ -315,6 +417,14 @@ class RuntimeSettings:
         return str(self.public_base_url or "").lower().startswith("https://")
 
     @property
+    def smtp_configured(self) -> bool:
+        """填了服务器地址与发件人后才启用邮件验证码。"""
+        return bool(
+            str(self.smtp_host or "").strip()
+            and str(self.smtp_from or self.smtp_username or "").strip()
+        )
+
+    @property
     def tz(self) -> tzinfo:
         name = str(self.timezone or "").strip() or os.environ.get("TZ", "").strip()
         if name:
@@ -337,8 +447,15 @@ class RuntimeSettings:
         seeded = False
         for spec in CATALOG:
             if spec.key in rows:
+                raw = rows[spec.key]
+                if spec.secret:
+                    try:
+                        raw = decrypt_secret(raw, self._base.app_secret_key)
+                    except DecryptError as exc:
+                        logger.warning("系统设置 %s 解密失败：%s", spec.key, exc)
+                        raw = ""
                 try:
-                    self._values[spec.key] = _coerce(spec, rows[spec.key])
+                    self._values[spec.key] = _coerce(spec, raw)
                     self._sources[spec.key] = "database"
                 except ValueError as exc:
                     logger.warning("系统设置 %s 的值非法，改用默认值：%s", spec.key, exc)
@@ -354,7 +471,12 @@ class RuntimeSettings:
                 continue
             self._values[spec.key] = value
             self._sources[spec.key] = "environment"
-            db.add(SystemSetting(key=spec.key, value=_serialize(spec, value)))
+            db.add(
+                SystemSetting(
+                    key=spec.key,
+                    value=_serialize(spec, value, self._base.app_secret_key),
+                )
+            )
             seeded = True
         if seeded:
             await db.commit()
@@ -364,13 +486,21 @@ class RuntimeSettings:
         unknown = sorted(set(changes) - set(SPECS))
         if unknown:
             raise ValueError(f"未知设置项：{', '.join(unknown)}")
-        return {key: _coerce(SPECS[key], value) for key, value in changes.items()}
+        values: dict[str, Any] = {}
+        for key, raw in changes.items():
+            spec = SPECS[key]
+            value = _coerce(spec, raw)
+            # 敏感项留空表示保持原值，避免页面回显导致误清空
+            if spec.secret and value == "":
+                continue
+            values[key] = value
+        return values
 
     async def persist(self, db: AsyncSession, values: dict[str, Any]) -> None:
         """写入待提交事务，由调用方统一提交。"""
         for key, value in values.items():
             row = await db.get(SystemSetting, key)
-            text = _serialize(SPECS[key], value)
+            text = _serialize(SPECS[key], value, self._base.app_secret_key)
             if row is None:
                 db.add(SystemSetting(key=key, value=text))
             else:
@@ -393,12 +523,14 @@ class RuntimeSettings:
                     "label": spec.label,
                     "description": spec.description,
                     "kind": spec.kind,
-                    "value": self._values[spec.key],
+                    "value": "" if spec.secret else self._values[spec.key],
                     "default": spec.default,
                     "minimum": spec.minimum,
                     "maximum": spec.maximum,
                     "options": list(spec.options),
                     "source": self._sources[spec.key],
+                    "secret": spec.secret,
+                    "has_value": bool(self._values[spec.key]) if spec.secret else None,
                 }
             )
         return [{"name": name, "items": items} for name, items in groups.items()]

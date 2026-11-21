@@ -6,7 +6,7 @@
   <a href="https://nextjs.org/"><img alt="Next.js" src="https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white"></a>
   <a href="https://www.mysql.com/"><img alt="MySQL" src="https://img.shields.io/badge/MySQL-8.4-4479A1?logo=mysql&logoColor=white"></a>
   <a href="https://docs.docker.com/compose/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white"></a>
-  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-76%20passed-brightgreen"></a>
+  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-82%20passed-brightgreen"></a>
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img alt="License: AGPL v3" src="https://img.shields.io/badge/License-AGPL_v3-blue"></a>
 </p>
 
@@ -41,6 +41,7 @@
 - **多用户隔离**：每个用户独立管理自己的机器人、通道与推送日志，数据按 `owner_user_id` 隔离。
 - **超级管理员**：可见并管理全部用户的资源；用户账号、邀请码、注册开关与 OAuth2 提供方仅超管可操作。
 - **多种登录方式**：邮箱密码、OAuth2 授权码、通行密钥（WebAuthn），服务端会话 Cookie。
+- **邮箱验证码**：配置 SMTP 后，注册、找回密码与 OAuth 账号首次设置密码需邮箱验证码；验证码邮件与站点风格一致。
 - **推送审计**：记录平台、来源类型、目标、状态、错误码、耗时与请求 ID，支持分页与筛选。
 - **敏感数据加密**：QQ AppSecret、OAuth Client Secret 以 Fernet 密文入库。
 
@@ -151,6 +152,7 @@ docker compose up -d --build
 1. 创建超级管理员账号；
 2. 若配置了 `QQ_APPID` / `QQ_APP_SECRET`，导入默认机器人、默认推送目标与钉钉 / 企业微信 / 飞书三条通道；
 3. 默认关闭注册入口，需要时在「安全设置」中开启，并在「用户管理」中生成邀请码。
+4. 如需邮箱验证码（注册验证、找回密码），先在「系统设置 → 邮件服务」填写 SMTP 服务器与发件人；未配置时注册仍只校验邀请码。
 
 ## 配置说明
 
@@ -182,6 +184,9 @@ docker compose up -d --build
 | Cookie 仅限 HTTPS（`COOKIE_SECURE`） | 对外地址为 https 时自动开启 | `false` |
 | 通行密钥 RP ID / 名称（`RP_ID` / `RP_NAME`） | WebAuthn 依赖方标识与展示名 | 空 / 项目名 |
 | 登录失败限速（`LOGIN_MAX_FAILURES` / `LOGIN_IP_MAX_FAILURES` / `LOGIN_WINDOW_SECONDS`） | 同一 (IP, 账号) / 同一 IP 的失败上限与统计窗口 | `5` / `30` / `900` |
+| SMTP 服务器（`SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURITY`） | 验证码邮件服务器；连接方式可选 STARTTLS / SSL / 明文 | 空 / `587` / `starttls` |
+| SMTP 账号（`SMTP_USERNAME` / `SMTP_PASSWORD` / `SMTP_FROM`） | 登录凭据与发件人；密码以 Fernet 密文入库，留空保持不变 | 空 |
+| 验证码策略（`EMAIL_CODE_TTL_MINUTES` / `EMAIL_CODE_RESEND_SECONDS` / `EMAIL_CODE_HOURLY_LIMIT`） | 有效期、重发间隔与同一邮箱每小时上限 | `10` / `60` / `5` |
 | QQ API 域名（`QQ_HOST`） | 机器人未单独配置时使用的默认地址 | `https://api.bot.qq.com` |
 | QQ 频控（`QQ_QPS` / `QQ_QPM` / `QQ_MIN_INTERVAL`） | 账号级频控，保存后重建限速器 | `5` / `30` / `0.21` |
 | 内容长度上限（`MARKDOWN_MAX_LEN` / `TEXT_MAX_LEN`） | 下发内容长度上限 | `4000` / `2000` |
@@ -226,8 +231,9 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 |---|---|---|
 | 健康检查 | `GET /healthz`、`GET /readyz` | 存活与就绪探针（含数据库连通性） |
 | 数据面 | `POST /webhook/{platform}` | `dingtalk` / `wecom` / `feishu` |
-| 认证 | `GET /api/auth/providers` | 注册开关与可用登录方式（公开） |
-| | `POST /api/auth/login`、`/logout`、`/register` | 邮箱密码登录、退出、邀请码注册 |
+| 认证 | `GET /api/auth/providers` | 注册开关、可用登录方式与邮件验证码开关（公开） |
+| | `POST /api/auth/login`、`/logout`、`/register` | 邮箱密码登录、退出、邀请码注册（配置 SMTP 后需邮箱验证码） |
+| | `POST /api/auth/email-code`、`/password/reset` | 发送注册/找回密码验证码、用验证码重置密码 |
 | | `GET /api/auth/me` | 当前用户信息 |
 | | `GET /api/auth/oauth/{key}/start`、`/callback` | OAuth2 授权码流程 |
 | | `GET /api/auth/passkey`、`POST /api/auth/passkey/*` | 通行密钥注册与登录 |
@@ -263,7 +269,7 @@ npm run dev
 uv run pytest
 ```
 
-测试使用临时 SQLite，覆盖适配器、渲染、频控、QQ 客户端、鉴权、用户隔离、Webhook 数据面、推送日志与系统设置。
+测试使用临时 SQLite，覆盖适配器、渲染、频控、QQ 客户端、鉴权、用户隔离、Webhook 数据面、推送日志、系统设置与邮箱验证码。
 
 ## 目录结构
 

@@ -206,6 +206,23 @@ class PushLog(TimestampMixin, Base):
     request_id: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
+class EmailVerificationCode(TimestampMixin, Base):
+    """邮箱验证码：只保存哈希，按用途与邮箱匹配，一次性消费。"""
+
+    __tablename__ = "email_verification_codes"
+
+    id: Mapped[int] = mapped_column(_AUTO_PK, primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    code_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
 class AdminAuditLog(TimestampMixin, Base):
     """后台写操作审计。"""
 

@@ -32,6 +32,7 @@ export interface AuthMeta {
   registration_enabled: boolean;
   password_enabled: boolean;
   passkey_enabled: boolean;
+  email_code_enabled: boolean;
   rp_id: string;
   oauth_providers: OAuthProviderBrief[];
 }
@@ -142,6 +143,8 @@ export interface SettingItem {
   maximum: number | null;
   options: string[];
   source: "default" | "environment" | "database";
+  secret: boolean;
+  has_value: boolean | null;
 }
 
 export interface SettingGroup {

@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 
+import { EmailCodeField, useEmailCode } from "@/components/email-code-field";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -21,8 +22,9 @@ import {
 import { Input } from "@/components/ui/input";
 import { ErrorAlert, PageHeader, SuccessAlert } from "@/components/ui";
 import { api, messageOf } from "@/lib/api";
+import { useApi } from "@/lib/hooks";
 import { useMe, useRefreshMe } from "@/lib/me";
-import { ROLE_LABELS } from "@/lib/types";
+import { ROLE_LABELS, type AuthMeta } from "@/lib/types";
 import { isEmail } from "@/lib/validation";
 
 type Busy = "name" | "email" | "password" | null;
@@ -30,6 +32,10 @@ type Busy = "name" | "email" | "password" | null;
 export default function AccountPage() {
   const me = useMe();
   const refreshMe = useRefreshMe();
+  const meta = useApi<AuthMeta>("/api/auth/providers");
+  const emailCodeSender = useEmailCode();
+  const needsEmailCode =
+    !me.has_password && (meta.data?.email_code_enabled ?? false);
 
   const [busy, setBusy] = useState<Busy>(null);
   const [error, setError] = useState<string | null>(null);
@@ -45,6 +51,7 @@ export default function AccountPage() {
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordCode, setPasswordCode] = useState("");
   const [passwordError, setPasswordError] = useState<string | null>(null);
 
   const initial = (me.name || me.email).slice(0, 1).toUpperCase();
@@ -117,6 +124,10 @@ export default function AccountPage() {
       setPasswordError("两次输入的新密码不一致");
       return;
     }
+    if (needsEmailCode && !passwordCode.trim()) {
+      setPasswordError("请输入邮箱验证码");
+      return;
+    }
     setPasswordError(null);
     setError(null);
     setNotice(null);
@@ -127,11 +138,13 @@ export default function AccountPage() {
         body: {
           current_password: currentPassword,
           new_password: newPassword,
+          email_code: passwordCode.trim(),
         },
       });
       setCurrentPassword("");
       setNewPassword("");
       setConfirmPassword("");
+      setPasswordCode("");
       await refreshMe();
       setNotice(
         me.has_password ? "密码已修改，其他设备已退出登录" : "密码已设置，现在可以使用邮箱登录",
@@ -281,6 +294,31 @@ export default function AccountPage() {
                     }}
                   />
                 </Field>
+              ) : needsEmailCode ? (
+                <>
+                  <EmailCodeField
+                    cooldown={emailCodeSender.cooldown}
+                    error={emailCodeSender.error}
+                    id="account-password-code"
+                    sending={emailCodeSender.sending}
+                    value={passwordCode}
+                    onChange={(value) => {
+                      setPasswordCode(value);
+                      if (passwordError) setPasswordError(null);
+                    }}
+                    onSend={() =>
+                      void emailCodeSender.send("/api/auth/me/password-code")
+                    }
+                  />
+                  {emailCodeSender.notice ? (
+                    <p className="-mt-2 text-xs text-muted-foreground">
+                      {emailCodeSender.notice}
+                    </p>
+                  ) : null}
+                  <FieldDescription>
+                    该账号尚未设置密码，请先验证邮箱后再设置。
+                  </FieldDescription>
+                </>
               ) : (
                 <FieldDescription>
                   该账号尚未设置密码，设置后即可使用邮箱与密码登录。

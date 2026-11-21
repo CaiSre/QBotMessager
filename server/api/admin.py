@@ -32,7 +32,7 @@ from server.db.models import (
 )
 from server.db.session import get_session
 from server.services.audit import record_audit
-from server.services.runtime_settings import RuntimeSettings
+from server.services.runtime_settings import SPECS, RuntimeSettings
 
 router = APIRouter(prefix="/api/admin")
 
@@ -853,7 +853,12 @@ async def patch_settings(
         actor=user,
         action="settings.update",
         target_type="system_setting",
-        detail={"values": {key: str(value) for key, value in values.items()}},
+        detail={
+            "values": {
+                key: "******" if SPECS[key].secret else str(value)
+                for key, value in values.items()
+            }
+        },
         ip=_client_ip(request),
     )
     await db.commit()

@@ -7,6 +7,7 @@ import { useState } from "react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { EmailCodeField, useEmailCode } from "@/components/email-code-field";
 import { Field, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { api, messageOf } from "@/lib/api";
@@ -21,6 +22,8 @@ export default function RegisterPage() {
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
+  const [emailCode, setEmailCode] = useState("");
+  const [codeError, setCodeError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<{
     inviteCode?: string;
@@ -28,6 +31,8 @@ export default function RegisterPage() {
     password?: string;
   }>({});
   const [busy, setBusy] = useState(false);
+  const emailCodeSender = useEmailCode();
+  const emailCodeEnabled = meta.data?.email_code_enabled ?? false;
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -38,7 +43,9 @@ export default function RegisterPage() {
     if (!password) next.password = "请填写密码";
     else if (password.length < 8) next.password = "密码至少 8 位";
     setFieldErrors(next);
-    if (next.inviteCode || next.email || next.password) return;
+    const missingCode = emailCodeEnabled && !emailCode.trim();
+    setCodeError(missingCode ? "请填写邮箱验证码" : null);
+    if (next.inviteCode || next.email || next.password || missingCode) return;
     setBusy(true);
     setError(null);
     try {
@@ -49,6 +56,7 @@ export default function RegisterPage() {
           email: email.trim(),
           name: name.trim(),
           password,
+          email_code: emailCode.trim(),
         },
       });
       router.replace("/dashboard");
@@ -124,6 +132,39 @@ export default function RegisterPage() {
                   />
                   <FieldError>{fieldErrors.email}</FieldError>
                 </Field>
+                {emailCodeEnabled ? (
+                  <>
+                    <EmailCodeField
+                      cooldown={emailCodeSender.cooldown}
+                      error={codeError ?? emailCodeSender.error}
+                      id="register-email-code"
+                      sending={emailCodeSender.sending}
+                      value={emailCode}
+                      onChange={(value) => {
+                        setEmailCode(value);
+                        if (codeError) setCodeError(null);
+                      }}
+                      onSend={() => {
+                        if (!email.trim() || !isEmail(email)) {
+                          setFieldErrors((prev) => ({
+                            ...prev,
+                            email: "请先填写正确的邮箱",
+                          }));
+                          return;
+                        }
+                        void emailCodeSender.send("/api/auth/email-code", {
+                          email: email.trim(),
+                          purpose: "register",
+                        });
+                      }}
+                    />
+                    {emailCodeSender.notice ? (
+                      <p className="text-xs text-muted-foreground">
+                        {emailCodeSender.notice}
+                      </p>
+                    ) : null}
+                  </>
+                ) : null}
                 <Field>
                   <FieldLabel htmlFor="name">昵称</FieldLabel>
                   <Input

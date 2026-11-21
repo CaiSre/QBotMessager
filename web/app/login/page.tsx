@@ -102,7 +102,15 @@ export default function LoginPage() {
                   <FieldError>{fieldErrors.email}</FieldError>
                 </Field>
                 <Field data-invalid={Boolean(fieldErrors.password)}>
-                  <FieldLabel htmlFor="password">密码</FieldLabel>
+                  <div className="flex items-center justify-between">
+                    <FieldLabel htmlFor="password">密码</FieldLabel>
+                    <Link
+                      className="text-xs text-muted-foreground hover:text-foreground hover:underline"
+                      href="/forgot-password"
+                    >
+                      忘记密码？
+                    </Link>
+                  </div>
                   <Input
                     aria-invalid={Boolean(fieldErrors.password) || undefined}
                     autoComplete="current-password"

@@ -66,9 +66,20 @@ export default function SettingsPage() {
     setError(null);
     setNotice(null);
     try {
+      const secretKeys = new Set(
+        settings.data?.groups.flatMap((group) =>
+          group.items.filter((item) => item.secret).map((item) => item.key),
+        ) ?? [],
+      );
+      const body: Draft = {};
+      for (const [key, value] of Object.entries(draft)) {
+        // 敏感项留空表示不修改，避免页面回显误清空已保存的密码
+        if (secretKeys.has(key) && value === "") continue;
+        body[key] = value;
+      }
       const data = await api<SystemSettings>("/api/admin/settings", {
         method: "PATCH",
-        body: draft,
+        body,
       });
       settings.setData(data);
       setNotice("设置已保存并立即生效");
@@ -130,13 +141,22 @@ export default function SettingsPage() {
             list={item.key === "timezone" ? "settings-timezone" : undefined}
             max={item.maximum ?? undefined}
             min={item.minimum ?? undefined}
+            placeholder={
+              item.secret
+                ? item.has_value
+                  ? "已设置，留空保持不变"
+                  : "未设置"
+                : undefined
+            }
             step={item.kind === "float" ? "0.01" : item.kind === "int" ? "1" : undefined}
             type={
-              item.kind === "float" || item.kind === "int"
-                ? "number"
-                : item.key === "public_base_url"
-                  ? "url"
-                  : "text"
+              item.secret
+                ? "password"
+                : item.kind === "float" || item.kind === "int"
+                  ? "number"
+                  : item.key === "public_base_url"
+                    ? "url"
+                    : "text"
             }
             value={String(value ?? "")}
             onChange={(event) => update(item.key, event.target.value)}
@@ -195,7 +215,8 @@ export default function SettingsPage() {
         <h2 className="font-heading text-base font-medium">仍由环境变量提供</h2>
         <p className="text-muted-foreground">
           数据库连接信息、加密主密钥、初始管理员账号与 QQ 引导凭据属于敏感或启动依赖项，
-          不在本页修改；机器人凭据请到「机器人」页面维护。
+          不在本页修改；机器人凭据请到「机器人」页面维护。SMTP 密码在本页填写后会加密入库，
+          不会回显明文。
         </p>
       </section>
     </div>

@@ -71,6 +71,11 @@ def _env(monkeypatch: pytest.MonkeyPatch, db_path: Path):
     monkeypatch.setenv("QQ_APPID", "")
     monkeypatch.setenv("QQ_APP_SECRET", "")
     monkeypatch.setenv("OPENID", "")
+    # 默认不启用邮件验证码；需要时由各用例通过管理接口配置
+    monkeypatch.setenv("SMTP_HOST", "")
+    monkeypatch.setenv("SMTP_USERNAME", "")
+    monkeypatch.setenv("SMTP_PASSWORD", "")
+    monkeypatch.setenv("SMTP_FROM", "")
 
     from sqlalchemy import create_engine
 

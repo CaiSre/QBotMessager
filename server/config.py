@@ -95,6 +95,18 @@ class Settings(BaseSettings):
     # 业务统计使用的时区：留空则取容器 TZ，再退回本机时区
     timezone: str = ""
 
+    # SMTP 邮件（验证码）：运行期以库内「系统设置」为准，这里仅作首启导入
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_security: str = "starttls"
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_timeout: int = 15
+    email_code_ttl_minutes: int = 10
+    email_code_resend_seconds: int = 60
+    email_code_hourly_limit: int = 5
+
     @property
     def openids(self) -> list[str]:
         return load_openids(self.openid)

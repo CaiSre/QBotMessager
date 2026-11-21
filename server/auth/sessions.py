@@ -75,6 +75,16 @@ async def revoke_session(db: AsyncSession, token: str) -> None:
         await db.commit()
 
 
+async def revoke_user_sessions(db: AsyncSession, user_id: int) -> None:
+    """退出该用户的全部会话（重置密码后调用）。"""
+    await db.execute(
+        update(Session)
+        .where(Session.user_id == user_id, Session.revoked_at.is_(None))
+        .values(revoked_at=_utcnow())
+    )
+    await db.commit()
+
+
 async def revoke_other_sessions(db: AsyncSession, user_id: int, *, keep_token: str) -> None:
     """退出该用户除当前会话外的其他登录设备（改密后调用）。"""
     await db.execute(

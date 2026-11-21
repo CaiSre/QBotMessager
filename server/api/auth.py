@@ -6,6 +6,7 @@ import logging
 import re
 import secrets
 from datetime import datetime, timezone
+from typing import Literal
 from urllib.parse import urlsplit
 
 import httpx2 as httpx
@@ -19,7 +20,12 @@ from server.auth import oauth as oauth_flow
 from server.auth import passkey as passkey_flow
 from server.auth.deps import current_user, get_session_token
 from server.auth.passwords import burn_password, hash_password, verify_password
-from server.auth.sessions import create_session, revoke_other_sessions, revoke_session
+from server.auth.sessions import (
+    create_session,
+    revoke_other_sessions,
+    revoke_session,
+    revoke_user_sessions,
+)
 from server.config import Settings
 from server.db.crypto import decrypt_secret
 from server.db.models import (
@@ -33,6 +39,24 @@ from server.db.models import (
     WebAuthnCredential,
 )
 from server.db.session import get_session
+from server.services.email_codes import (
+    PURPOSE_LABELS,
+    PURPOSE_REGISTER,
+    PURPOSE_RESET_PASSWORD,
+    PURPOSE_SET_PASSWORD,
+    CodeQuotaExceeded,
+    CodeTooFrequent,
+    discard_latest,
+    issue_code,
+    verify_code,
+)
+from server.services.mail import (
+    MailNotConfigured,
+    MailSendError,
+    is_configured as mail_configured,
+    render_code_email,
+    send_mail,
+)
 from server.services.throttle import AttemptLimiter
 
 logger = logging.getLogger(__name__)
@@ -71,6 +95,16 @@ class RegisterIn(_EmailModel):
     invite_code: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=8, max_length=256)
     name: str = Field(default="", max_length=128)
+    email_code: str = Field(default="", max_length=12)
+
+
+class EmailCodeIn(_EmailModel):
+    purpose: Literal["register", "reset_password"]
+
+
+class PasswordResetIn(_EmailModel):
+    code: str = Field(min_length=4, max_length=12)
+    new_password: str = Field(min_length=8, max_length=256)
 
 
 class PasskeyFinishIn(BaseModel):
@@ -97,6 +131,7 @@ class EmailChangeIn(_EmailModel):
 class PasswordChangeIn(BaseModel):
     current_password: str = Field(default="", max_length=256)
     new_password: str = Field(min_length=8, max_length=256)
+    email_code: str = Field(default="", max_length=12)
 
 
 def _now() -> datetime:
@@ -147,6 +182,67 @@ def _rp_id(request: Request, settings: Settings) -> str:
     return request.url.hostname or "localhost"
 
 
+def _code_response(settings: Settings) -> dict:
+    return {
+        "ok": True,
+        "expires_in": settings.email_code_ttl_minutes * 60,
+        "resend_after": settings.email_code_resend_seconds,
+    }
+
+
+async def _send_code(
+    settings: Settings,
+    db: AsyncSession,
+    *,
+    email: str,
+    purpose: str,
+    ip: str | None,
+) -> dict:
+    try:
+        code = await issue_code(
+            db,
+            email=email,
+            purpose=purpose,
+            ttl_minutes=settings.email_code_ttl_minutes,
+            resend_seconds=settings.email_code_resend_seconds,
+            hourly_limit=settings.email_code_hourly_limit,
+            ip=ip,
+        )
+    except CodeTooFrequent as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"发送过于频繁，请 {exc.retry_after} 秒后再试",
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+    except CodeQuotaExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="发送次数过多，请稍后再试",
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+
+    subject, text, html = render_code_email(
+        code=code,
+        purpose_label=PURPOSE_LABELS[purpose],
+        ttl_minutes=settings.email_code_ttl_minutes,
+    )
+    try:
+        await send_mail(settings, to=email, subject=subject, text=text, html=html)
+    except (MailNotConfigured, MailSendError) as exc:
+        logger.warning("验证码邮件发送失败（%s）", purpose)
+        await discard_latest(db, email=email, purpose=purpose)
+        if isinstance(exc, MailNotConfigured):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="邮件服务未配置",
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="验证码邮件发送失败，请稍后重试",
+        ) from exc
+    return _code_response(settings)
+
+
 def _user_payload(user: User) -> dict:
     return {
         "id": user.id,
@@ -180,6 +276,7 @@ async def list_providers(
         "registration_enabled": await registration_enabled(db, settings),
         "password_enabled": True,
         "passkey_enabled": True,
+        "email_code_enabled": mail_configured(settings),
         "rp_id": _rp_id(request, settings),
         "oauth_providers": [
             {"key": p.key, "display_name": p.display_name} for p in providers
@@ -243,10 +340,12 @@ async def update_email(
 @router.patch("/me/password")
 async def update_password(
     data: PasswordChangeIn,
+    request: Request,
     token: str = Depends(get_session_token),
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_session),
 ) -> dict:
+    settings: Settings = request.app.state.settings
     if user.password_hash is not None:
         if not verify_password(data.current_password, user.password_hash):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前密码错误")
@@ -254,10 +353,119 @@ async def update_password(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="新密码不能与当前密码相同"
             )
-    # 仅 OAuth 创建的账号 password_hash 为空，可直接设置密码
+    elif mail_configured(settings):
+        # 仅 OAuth 创建的账号没有密码；配置邮件后需先验证邮箱归属
+        if not data.email_code:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="请填写邮箱验证码"
+            )
+        if not await verify_code(
+            db,
+            email=user.email,
+            purpose=PURPOSE_SET_PASSWORD,
+            code=data.email_code,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="邮箱验证码错误或已过期"
+            )
     user.password_hash = hash_password(data.new_password)
     await db.commit()
     await revoke_other_sessions(db, user.id, keep_token=token)
+    return {"ok": True}
+
+
+@router.post("/me/password-code")
+async def request_password_code(
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    settings: Settings = request.app.state.settings
+    if not mail_configured(settings):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="邮件服务未配置"
+        )
+    if user.password_hash is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="账号已有密码，请直接修改密码",
+        )
+    return await _send_code(
+        settings,
+        db,
+        email=user.email,
+        purpose=PURPOSE_SET_PASSWORD,
+        ip=request.client.host if request.client else None,
+    )
+
+
+@router.post("/email-code")
+async def request_email_code(
+    data: EmailCodeIn,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    settings: Settings = request.app.state.settings
+    if not mail_configured(settings):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="邮件服务未配置"
+        )
+    email = data.email.lower()
+    if data.purpose == PURPOSE_REGISTER:
+        if not await registration_enabled(db, settings):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="注册入口已关闭"
+            )
+        exists = (
+            await db.execute(select(User.id).where(User.email == email))
+        ).scalar_one_or_none()
+        # 邮箱已注册时不发信，但返回相同结果，避免枚举账号
+        if exists is not None:
+            return _code_response(settings)
+    else:
+        user = (
+            await db.execute(select(User).where(User.email == email))
+        ).scalar_one_or_none()
+        if user is None or user.status != STATUS_ACTIVE:
+            return _code_response(settings)
+    return await _send_code(
+        settings,
+        db,
+        email=email,
+        purpose=data.purpose,
+        ip=request.client.host if request.client else None,
+    )
+
+
+@router.post("/password/reset")
+async def reset_password(
+    data: PasswordResetIn,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    settings: Settings = request.app.state.settings
+    if not mail_configured(settings):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="邮件服务未配置"
+        )
+    email = data.email.lower()
+    user = (
+        await db.execute(select(User).where(User.email == email))
+    ).scalar_one_or_none()
+    if user is None or user.status != STATUS_ACTIVE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="验证码错误或已过期"
+        )
+    if not await verify_code(
+        db, email=email, purpose=PURPOSE_RESET_PASSWORD, code=data.code
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="验证码错误或已过期"
+        )
+    user.password_hash = hash_password(data.new_password)
+    await db.commit()
+    # 密码重置后所有旧会话立即失效
+    await revoke_user_sessions(db, user.id)
     return {"ok": True}
 
 
@@ -349,6 +557,18 @@ async def register(
     ).scalar_one_or_none()
     if exists is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该邮箱已注册")
+
+    if mail_configured(settings):
+        if not data.email_code:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="请填写邮箱验证码"
+            )
+        if not await verify_code(
+            db, email=email, purpose=PURPOSE_REGISTER, code=data.email_code
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="邮箱验证码错误或已过期"
+            )
 
     # 原子占用名额：条件 UPDATE 保证并发注册也不会突破 max_uses
     consumed = await db.execute(
