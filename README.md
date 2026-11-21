@@ -23,6 +23,7 @@
 - [目录结构](#目录结构)
 - [安全建议](#安全建议)
 - [已知限制](#已知限制)
+- [社区支持](#社区支持)
 - [许可证](#许可证)
 
 ## 功能特性
@@ -280,8 +281,12 @@ uv run pytest
 - 附件（图片 / 文件 / 语音）不会下发到 QQ：需要先调用 QQ 富媒体上传接口，当前未实现。
 - 飞书新版 schema 2.0 卡片的 `card.body.elements` 未解析（旧版 `card.elements` 正常）。
 - 钉钉 `audio` / `file` / `picture` 类型未支持。
-- 入站使用自建 `X-Webhook-Token`，不校验平台签名（钉钉 sign、飞书 sign / verification token）；适合由用户侧将平台格式请求转发到本服务。
+- 入站使用自建 token（`X-Webhook-Token` 或 `Authorization: Bearer`），不校验平台签名（钉钉 sign、飞书 sign / verification token）；适合由用户侧将平台格式请求转发到本服务。
 - 真实 QQ 推送与 OAuth2 第三方登录需要有效凭据，自动化测试仅覆盖到打桩层。
+
+## 社区支持
+
+- [LINUX DO](https://linux.do)：交流使用经验、反馈问题与建议。
 
 ## 许可证
 
