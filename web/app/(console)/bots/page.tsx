@@ -50,7 +50,7 @@ import {
   type Platform,
 } from "@/lib/types";
 
-const PLATFORMS: Platform[] = ["dingtalk", "wecom", "feishu"];
+const PLATFORMS: Platform[] = ["dingtalk", "wecom", "feishu", "github"];
 
 interface BotForm {
   name: string;
@@ -90,6 +90,12 @@ export default function BotsPage() {
   const [channelPlatform, setChannelPlatform] = useState<Platform>("dingtalk");
   const [channelBotId, setChannelBotId] = useState<string>("");
   const [channelEnabled, setChannelEnabled] = useState(true);
+  const [channelSecret, setChannelSecret] = useState("");
+  const [channelResult, setChannelResult] = useState<{
+    webhookUrl: string;
+    secret: string;
+    rotated: boolean;
+  } | null>(null);
 
   const [confirm, setConfirm] = useState<{
     title: string;
@@ -181,16 +187,30 @@ export default function BotsPage() {
     setSaving(true);
     setError(null);
     try {
-      await api("/api/admin/channels", {
-        method: "POST",
-        body: {
-          platform: channelPlatform,
-          bot_profile_id: Number(channelBotId),
-          enabled: channelEnabled,
+      const result = await api<{ webhook_url?: string; secret?: string }>(
+        "/api/admin/channels",
+        {
+          method: "POST",
+          body: {
+            platform: channelPlatform,
+            bot_profile_id: Number(channelBotId),
+            enabled: channelEnabled,
+            ...(channelPlatform === "github" && channelSecret.trim()
+              ? { secret: channelSecret.trim() }
+              : {}),
+          },
         },
-      });
+      );
       setChannelOpen(false);
+      setChannelSecret("");
       await channels.reload();
+      if (result.webhook_url && result.secret) {
+        setChannelResult({
+          webhookUrl: result.webhook_url,
+          secret: result.secret,
+          rotated: false,
+        });
+      }
     } catch (err) {
       setError(messageOf(err));
     } finally {
@@ -213,8 +233,18 @@ export default function BotsPage() {
   async function rotateChannel(channel: Channel) {
     setError(null);
     try {
-      await api(`/api/admin/channels/${channel.id}/rotate`, { method: "POST" });
+      const result = await api<{ webhook_url?: string; secret?: string }>(
+        `/api/admin/channels/${channel.id}/rotate`,
+        { method: "POST" },
+      );
       await channels.reload();
+      if (result.webhook_url && result.secret) {
+        setChannelResult({
+          webhookUrl: result.webhook_url,
+          secret: result.secret,
+          rotated: true,
+        });
+      }
     } catch (err) {
       setError(messageOf(err));
     }
@@ -341,7 +371,9 @@ export default function BotsPage() {
           <CardHeader>
             <CardTitle>Webhook 通道</CardTitle>
             <CardDescription>
-              按平台接入：钉钉 /webhook/dingtalk、企业微信 /webhook/wecom、飞书 /webhook/feishu
+              按平台接入：钉钉 /webhook/dingtalk、企业微信 /webhook/wecom、飞书
+              /webhook/feishu；GitHub 使用 /webhook/github/{"{token}"}，token 已包含在 Payload URL
+              中，并需在 GitHub 侧配置 Secret
             </CardDescription>
             <CardAction>
               <Button
@@ -351,6 +383,7 @@ export default function BotsPage() {
                   setChannelPlatform("dingtalk");
                   setChannelBotId(botList[0] ? String(botList[0].id) : "");
                   setChannelEnabled(true);
+                  setChannelSecret("");
                   setError(null);
                   setChannelOpen(true);
                 }}
@@ -613,6 +646,23 @@ export default function BotsPage() {
                   </SelectContent>
                 </Select>
               </div>
+              {channelPlatform === "github" ? (
+                <Field>
+                  <FieldLabel htmlFor="channel-secret">签名密钥 Secret</FieldLabel>
+                  <Input
+                    autoComplete="new-password"
+                    id="channel-secret"
+                    placeholder="留空时自动生成"
+                    value={channelSecret}
+                    onChange={(event) => setChannelSecret(event.target.value)}
+                  />
+                  <FieldDescription>
+                    GitHub 的 Webhook 设置里没有 token 输入框，token 会包含在创建后生成的
+                    Payload URL 中；这里填写或自动生成的密钥用来对应 GitHub 的 Secret，用于校验
+                    X-Hub-Signature-256。
+                  </FieldDescription>
+                </Field>
+              ) : null}
               <div className="flex items-center gap-2">
                 <Switch
                   checked={channelEnabled}
@@ -631,6 +681,51 @@ export default function BotsPage() {
               </div>
             </FieldGroup>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={channelResult !== null}
+        onOpenChange={(open) => {
+          if (!open) setChannelResult(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>
+              {channelResult?.rotated ? "GitHub 通道已轮换" : "GitHub 通道已创建"}
+            </DialogTitle>
+          </DialogHeader>
+          <div className="flex flex-col gap-4 text-sm">
+            <p className="text-muted-foreground">
+              请在 GitHub 仓库 Settings → Webhooks → Add webhook 中填写以下两项，Content type
+              选择 application/json，SSL verification 保持启用，再选择要订阅的事件。
+            </p>
+            <div className="flex flex-col gap-1">
+              <Label>Payload URL（token 已包含在地址中）</Label>
+              <div className="flex items-center gap-2">
+                <code className="min-w-0 flex-1 truncate rounded bg-muted px-2 py-1 font-mono text-xs">
+                  {channelResult?.webhookUrl}
+                </code>
+                <CopyButton value={channelResult?.webhookUrl ?? ""} />
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
+              <Label>Secret</Label>
+              <div className="flex items-center gap-2">
+                <code className="min-w-0 flex-1 truncate rounded bg-muted px-2 py-1 font-mono text-xs">
+                  {channelResult?.secret}
+                </code>
+                <CopyButton value={channelResult?.secret ?? ""} />
+              </div>
+            </div>
+            <FieldDescription>
+              密钥只显示这一次，关闭后无法再次查看；如需更换请使用通道列表中的「轮换」。
+            </FieldDescription>
+            <div className="flex justify-end">
+              <Button onClick={() => setChannelResult(null)}>知道了</Button>
+            </div>
+          </div>
         </DialogContent>
       </Dialog>
 

@@ -13,6 +13,10 @@ class PayloadError(ValueError):
     """负载非法或消息类型不受支持。"""
 
 
+class IgnoredEvent(Exception):
+    """事件合法但不在订阅范围内；调用方应按成功确认并跳过推送。"""
+
+
 @dataclass
 class Attachment:
     kind: str  # image / file / voice / link
@@ -41,4 +45,4 @@ class UnifiedMessage:
 class Adapter(Protocol):
     platform: str
 
-    def parse(self, payload: dict) -> UnifiedMessage: ...
+    def parse(self, payload: dict, *, event: str = "") -> UnifiedMessage: ...

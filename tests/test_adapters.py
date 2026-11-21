@@ -5,11 +5,15 @@ from __future__ import annotations
 import pytest
 
 from server.adapters import get_adapter
-from server.adapters.base import FMT_MARKDOWN, FMT_TEXT, PayloadError
+from server.adapters.base import FMT_MARKDOWN, FMT_TEXT, IgnoredEvent, PayloadError
 
 
 def parse(platform: str, payload: dict):
     return get_adapter(platform).parse(payload)
+
+
+def parse_event(platform: str, event: str, payload: dict):
+    return get_adapter(platform).parse(payload, event=event)
 
 
 # ------------------------------------------------------------------- 钉钉
@@ -261,3 +265,156 @@ def test_feishu_share_chat_and_post_media_tags() -> None:
 def test_feishu_unknown_type() -> None:
     with pytest.raises(PayloadError):
         parse("feishu", {"msg_type": "audio", "content": {}})
+
+
+# ------------------------------------------------------------------- GitHub
+
+
+def _github_payload(**overrides):
+    payload = {
+        "repository": {"full_name": "acme/widgets"},
+        "sender": {"login": "octocat"},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_github_ping() -> None:
+    message = parse_event(
+        "github",
+        "ping",
+        _github_payload(zen="Keep it logically awesome.", hook_id=42),
+    )
+    assert message.fmt == FMT_MARKDOWN
+    assert "接入成功" in message.title
+    assert "acme/widgets" in message.body
+    assert "Keep it logically awesome." in message.body
+    assert message.source_msgtype == "ping"
+
+
+def test_github_push_lists_commits_and_compare() -> None:
+    commits = [
+        {
+            "id": f"{i:040x}",
+            "message": f"fix #{i}\n\n细节",
+            "author": {"name": "Alice"},
+        }
+        for i in range(7)
+    ]
+    message = parse_event(
+        "github",
+        "push",
+        _github_payload(
+            ref="refs/heads/main",
+            before="a" * 40,
+            after="b" * 40,
+            commits=commits,
+            compare="https://github.com/acme/widgets/compare/a...b",
+        ),
+    )
+    assert message.title == "acme/widgets 推送 main"
+    assert "octocat" in message.body
+    assert "7 个提交" in message.body
+    assert "fix #0" in message.body
+    assert "fix #5" not in message.body
+    assert "另有 2 条提交" in message.body
+    assert "[查看对比]" in message.body
+    assert message.source_msgtype == "push"
+
+
+def test_github_push_deleted_branch() -> None:
+    message = parse_event(
+        "github",
+        "push",
+        _github_payload(ref="refs/heads/feature", deleted=True, commits=[]),
+    )
+    assert "删除分支" in message.title
+    assert "feature" in message.body
+
+
+def test_github_pull_request_merged_uses_merger() -> None:
+    message = parse_event(
+        "github",
+        "pull_request",
+        _github_payload(
+            action="closed",
+            number=12,
+            pull_request={
+                "number": 12,
+                "title": "新增登录",
+                "html_url": "https://github.com/acme/widgets/pull/12",
+                "merged": True,
+                "merged_by": {"login": "maintainer"},
+            },
+        ),
+    )
+    assert message.title == "acme/widgets PR #12"
+    assert "maintainer" in message.body
+    assert "合并" in message.body
+    assert message.source_msgtype == "pull_request.closed"
+
+
+def test_github_issues_and_release() -> None:
+    issue = parse_event(
+        "github",
+        "issues",
+        _github_payload(
+            action="opened",
+            issue={
+                "number": 7,
+                "title": "按钮错位",
+                "html_url": "https://github.com/acme/widgets/issues/7",
+            },
+        ),
+    )
+    assert "Issue #7" in issue.title
+    assert "打开" in issue.body
+
+    release = parse_event(
+        "github",
+        "release",
+        _github_payload(
+            action="published",
+            release={
+                "tag_name": "v1.2.0",
+                "name": "v1.2.0",
+                "html_url": "https://github.com/acme/widgets/releases/v1.2.0",
+                "body": "修复若干问题",
+            },
+        ),
+    )
+    assert "Release v1.2.0" in release.title
+    assert "修复若干问题" in release.body
+    assert release.source_msgtype == "release.published"
+
+
+def test_github_workflow_run_completed_only() -> None:
+    message = parse_event(
+        "github",
+        "workflow_run",
+        _github_payload(
+            action="completed",
+            workflow_run={
+                "name": "CI",
+                "conclusion": "failure",
+                "head_branch": "main",
+                "html_url": "https://github.com/acme/widgets/actions/runs/1",
+            },
+        ),
+    )
+    assert "工作流 CI 失败" in message.title
+    assert "main" in message.body
+
+    with pytest.raises(IgnoredEvent):
+        parse_event(
+            "github",
+            "workflow_run",
+            _github_payload(action="in_progress", workflow_run={"name": "CI"}),
+        )
+
+
+def test_github_unsupported_event_and_missing_header() -> None:
+    with pytest.raises(IgnoredEvent):
+        parse_event("github", "deployment", _github_payload())
+    with pytest.raises(PayloadError):
+        get_adapter("github").parse(_github_payload())

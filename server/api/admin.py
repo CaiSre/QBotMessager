@@ -17,6 +17,7 @@ from server.auth.passwords import hash_password
 from server.config import Settings
 from server.db.crypto import decrypt_secret, encrypt_secret, mask_secret
 from server.db.models import (
+    PLATFORM_GITHUB,
     PLATFORMS,
     ROLE_SUPER_ADMIN,
     ROLE_USER,
@@ -214,6 +215,12 @@ def _webhook_path(platform: str) -> str:
     return f"/webhook/{platform}"
 
 
+def _webhook_base(request: Request, settings: Settings) -> str:
+    if settings.public_base_url:
+        return settings.public_base_url.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
 async def _get_owned_channel(db: AsyncSession, user: User, channel_id: int) -> Channel:
     channel = await db.get(Channel, channel_id)
     bot = await db.get(BotProfile, channel.bot_profile_id) if channel is not None else None
@@ -231,7 +238,7 @@ async def list_channels(
     db: AsyncSession = Depends(get_session),
 ) -> list[dict]:
     settings: Settings = request.app.state.settings
-    base = settings.public_base_url.rstrip("/") if settings.public_base_url else str(request.base_url).rstrip("/")
+    base = _webhook_base(request, settings)
     stmt = (
         select(Channel, User.id, User.email)
         .join(BotProfile, Channel.bot_profile_id == BotProfile.id)
@@ -248,7 +255,12 @@ async def list_channels(
             "platform": row.platform,
             "bot_profile_id": row.bot_profile_id,
             "webhook_token": row.webhook_token,
-            "webhook_url": f"{base}{_webhook_path(row.platform)}",
+            "webhook_url": (
+                f"{base}/webhook/github/{row.webhook_token}"
+                if row.platform == PLATFORM_GITHUB
+                else f"{base}{_webhook_path(row.platform)}"
+            ),
+            "has_secret": bool((row.extra or {}).get("secret_cipher")),
             "enabled": row.enabled,
         }
         for row, owner_user_id, owner_email in rows
@@ -259,6 +271,8 @@ class ChannelIn(BaseModel):
     platform: str
     bot_profile_id: int
     enabled: bool = True
+    # GitHub 通道的签名密钥；留空时由服务端生成，仅在创建响应中返回一次
+    secret: str | None = None
 
 
 @router.post("/channels", status_code=status.HTTP_201_CREATED)
@@ -271,11 +285,20 @@ async def create_channel(
     if data.platform not in PLATFORMS:
         raise HTTPException(status_code=400, detail="平台不受支持")
     await _get_owned_bot(db, user, data.bot_profile_id)
+
+    settings: Settings = request.app.state.settings
+    extra: dict | None = None
+    secret_plain: str | None = None
+    if data.platform == PLATFORM_GITHUB:
+        secret_plain = (data.secret or "").strip() or secrets.token_urlsafe(32)
+        extra = {"secret_cipher": encrypt_secret(secret_plain, settings.app_secret_key)}
+
     channel = Channel(
         bot_profile_id=data.bot_profile_id,
         platform=data.platform,
         webhook_token=generate_token(),
         enabled=data.enabled,
+        extra=extra,
     )
     db.add(channel)
     await db.flush()
@@ -289,7 +312,13 @@ async def create_channel(
         ip=_client_ip(request),
     )
     await db.commit()
-    return {"id": channel.id, "webhook_token": channel.webhook_token}
+
+    result: dict[str, Any] = {"id": channel.id, "webhook_token": channel.webhook_token}
+    if secret_plain is not None:
+        base = _webhook_base(request, settings)
+        result["webhook_url"] = f"{base}/webhook/github/{channel.webhook_token}"
+        result["secret"] = secret_plain
+    return result
 
 
 class ChannelPatch(BaseModel):
@@ -331,7 +360,19 @@ async def rotate_channel_token(
     db: AsyncSession = Depends(get_session),
 ) -> dict:
     channel = await _get_owned_channel(db, user, channel_id)
+    settings: Settings = request.app.state.settings
     channel.webhook_token = generate_token()
+    result: dict[str, Any] = {"id": channel.id, "webhook_token": channel.webhook_token}
+    if channel.platform == PLATFORM_GITHUB:
+        # GitHub 不支持自定义请求头，URL token 与签名密钥需同时轮换
+        secret_plain = secrets.token_urlsafe(32)
+        extra = dict(channel.extra or {})
+        extra["secret_cipher"] = encrypt_secret(secret_plain, settings.app_secret_key)
+        channel.extra = extra
+        result["webhook_url"] = (
+            f"{_webhook_base(request, settings)}/webhook/github/{channel.webhook_token}"
+        )
+        result["secret"] = secret_plain
     await record_audit(
         db,
         actor=user,
@@ -341,7 +382,7 @@ async def rotate_channel_token(
         ip=_client_ip(request),
     )
     await db.commit()
-    return {"id": channel.id, "webhook_token": channel.webhook_token}
+    return result
 
 
 @router.delete("/channels/{channel_id}")

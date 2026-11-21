@@ -87,6 +87,16 @@ CATALOG: tuple[SettingSpec, ...] = (
         maximum=10_485_760,
     ),
     SettingSpec(
+        "github_max_body_bytes",
+        "GitHub 请求体上限",
+        GROUP_SITE,
+        "int",
+        2_097_152,
+        "GitHub Webhook 单次请求体上限（字节）；GitHub 自身的负载上限为 25MB",
+        minimum=1024,
+        maximum=26_214_400,
+    ),
+    SettingSpec(
         "webhook_allow_query_token",
         "允许 URL 传凭据",
         GROUP_SITE,

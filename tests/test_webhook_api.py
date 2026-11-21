@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+
 from fastapi.testclient import TestClient
 
 import pytest
@@ -227,3 +231,153 @@ def test_missing_target_returns_400(admin: TestClient, qq: StubQqClient) -> None
     )
     assert response.status_code == 400
     assert "默认目标" in response.json()["errmsg"]
+
+
+# ------------------------------------------------------------------- GitHub
+
+
+def _github_post(
+    client: TestClient,
+    token: str,
+    secret: str | None,
+    event: str,
+    payload: dict,
+    *,
+    signature: str | None = None,
+):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if signature is None and secret is not None:
+        signature = "sha256=" + hmac.new(
+            secret.encode("utf-8"), body, hashlib.sha256
+        ).hexdigest()
+    headers = {"X-GitHub-Event": event, "Content-Type": "application/json"}
+    if signature:
+        headers["X-Hub-Signature-256"] = signature
+    return client.post(f"/webhook/github/{token}", content=body, headers=headers)
+
+
+def _ping_payload() -> dict:
+    return {
+        "zen": "Keep it logically awesome.",
+        "hook_id": 1,
+        "repository": {"full_name": "acme/widgets"},
+        "sender": {"login": "octocat"},
+    }
+
+
+def test_github_signed_ping_pushes_and_logs(
+    admin: TestClient, qq: StubQqClient
+) -> None:
+    bot_id = create_bot(admin, group="g-default")
+    channel = create_channel(admin, bot_id, "github")
+
+    response = _github_post(
+        admin, channel["webhook_token"], channel["secret"], "ping", _ping_payload()
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True}
+    assert len(qq.calls) == 1
+    assert qq.calls[0]["target"] == "group:g-default"
+    assert qq.calls[0]["payload"]["msg_type"] == 2
+
+    logs = admin.get("/api/admin/logs").json()
+    assert logs["total"] == 1
+    assert logs["items"][0]["platform"] == "github"
+    assert logs["items"][0]["source_msgtype"] == "ping"
+
+
+def test_github_rejects_missing_or_bad_signature(
+    admin: TestClient, qq: StubQqClient
+) -> None:
+    bot_id = create_bot(admin, group="g-default")
+    channel = create_channel(admin, bot_id, "github")
+
+    missing = _github_post(
+        admin, channel["webhook_token"], None, "ping", _ping_payload()
+    )
+    assert missing.status_code == 401
+    assert "签名" in missing.json()["error"]
+
+    wrong = _github_post(
+        admin,
+        channel["webhook_token"],
+        None,
+        "ping",
+        _ping_payload(),
+        signature="sha256=" + "0" * 64,
+    )
+    assert wrong.status_code == 401
+    assert wrong.json()["error"] == "签名不匹配"
+
+    tampered = _github_post(
+        admin,
+        channel["webhook_token"],
+        channel["secret"],
+        "ping",
+        _ping_payload(),
+        signature=(
+            "sha256="
+            + hmac.new(b"other-secret", b"{}", hashlib.sha256).hexdigest()
+        ),
+    )
+    assert tampered.status_code == 401
+    assert qq.calls == []
+
+
+def test_github_ignores_unsupported_event_with_200(
+    admin: TestClient, qq: StubQqClient
+) -> None:
+    bot_id = create_bot(admin, group="g-default")
+    channel = create_channel(admin, bot_id, "github")
+
+    response = _github_post(
+        admin,
+        channel["webhook_token"],
+        channel["secret"],
+        "deployment",
+        {"repository": {"full_name": "acme/widgets"}},
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert qq.calls == []
+
+
+def test_github_without_path_token_is_rejected(
+    admin: TestClient, qq: StubQqClient
+) -> None:
+    bot_id = create_bot(admin, group="g-default")
+    create_channel(admin, bot_id, "github")
+
+    response = admin.post("/webhook/github", json={})
+    assert response.status_code == 404
+    assert "webhook/github/{token}" in response.json()["error"]
+
+
+def test_github_rotate_replaces_token_and_secret(
+    admin: TestClient, qq: StubQqClient
+) -> None:
+    bot_id = create_bot(admin, group="g-default")
+    channel = create_channel(admin, bot_id, "github")
+
+    rotated = admin.post(f"/api/admin/channels/{channel['id']}/rotate").json()
+    assert rotated["webhook_token"] != channel["webhook_token"]
+    assert rotated["secret"] and rotated["secret"] != channel["secret"]
+
+    stale = _github_post(
+        admin,
+        channel["webhook_token"],
+        channel["secret"],
+        "ping",
+        _ping_payload(),
+    )
+    assert stale.status_code == 401
+
+    fresh = _github_post(
+        admin,
+        rotated["webhook_token"],
+        rotated["secret"],
+        "ping",
+        _ping_payload(),
+    )
+    assert fresh.status_code == 200
+    assert len(qq.calls) == 1

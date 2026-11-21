@@ -86,6 +86,8 @@ const MSG_TYPES: Record<Platform, MsgTypeDef[]> = {
       contentLabel: "正文（按行分段）",
     },
   ],
+  // GitHub 事件需要真实事件结构并通过 X-Hub-Signature-256 校验，不在调试页构造
+  github: [],
 };
 
 const PLATFORMS: Platform[] = ["dingtalk", "wecom", "feishu"];
@@ -202,9 +204,11 @@ export default function DebugPage() {
 
   useEffect(() => {
     if (initialized.current) return;
-    if (channelList.length === 0) return;
+    const first =
+      channelList.find((item) => PLATFORMS.includes(item.platform) && item.enabled) ??
+      channelList.find((item) => PLATFORMS.includes(item.platform));
+    if (!first) return;
     initialized.current = true;
-    const first = channelList.find((item) => item.enabled) ?? channelList[0];
     setPlatform(first.platform);
     setChannelId(String(first.id));
     setToken(first.webhook_token);

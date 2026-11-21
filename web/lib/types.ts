@@ -1,6 +1,6 @@
 export type Role = "super_admin" | "user";
 export type AccountStatus = "active" | "disabled";
-export type Platform = "dingtalk" | "wecom" | "feishu";
+export type Platform = "dingtalk" | "wecom" | "feishu" | "github";
 
 export const ROLE_LABELS: Record<Role, string> = {
   super_admin: "超级管理员",
@@ -11,6 +11,7 @@ export const PLATFORM_LABELS: Record<Platform, string> = {
   dingtalk: "钉钉",
   wecom: "企业微信",
   feishu: "飞书",
+  github: "GitHub",
 };
 
 export interface Me {
@@ -59,6 +60,7 @@ export interface Channel {
   bot_profile_id: number;
   webhook_token: string;
   webhook_url: string;
+  has_secret: boolean;
   enabled: boolean;
 }
 

@@ -21,7 +21,7 @@ _AT_TAG = re.compile(r'<at user_id="([^"]*)"\s*>(.*?)</at>', re.DOTALL)
 class FeishuAdapter:
     platform = "feishu"
 
-    def parse(self, payload: dict) -> UnifiedMessage:
+    def parse(self, payload: dict, *, event: str = "") -> UnifiedMessage:
         if not isinstance(payload, dict):
             raise PayloadError("负载必须是 JSON 对象")
         msg_type = payload.get("msg_type") or payload.get("msgtype")

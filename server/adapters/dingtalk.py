@@ -19,7 +19,7 @@ _AT_KEYS = ("atMobiles", "atUserIds", "isAtAll")
 class DingTalkAdapter:
     platform = "dingtalk"
 
-    def parse(self, payload: dict) -> UnifiedMessage:
+    def parse(self, payload: dict, *, event: str = "") -> UnifiedMessage:
         if not isinstance(payload, dict):
             raise PayloadError("负载必须是 JSON 对象")
         msgtype = payload.get("msgtype") or payload.get("type")

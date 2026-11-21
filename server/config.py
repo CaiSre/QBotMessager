@@ -83,6 +83,8 @@ class Settings(BaseSettings):
 
     # 请求体上限
     max_body_bytes: int = 65536
+    # GitHub 的 Webhook 负载上限为 25MB，推送事件可能明显大于普通消息
+    github_max_body_bytes: int = 2_097_152
 
     # 入站鉴权：是否允许用 ?token= 传凭据（会落入访问日志，默认关闭）
     webhook_allow_query_token: bool = False

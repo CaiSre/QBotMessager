@@ -1,7 +1,9 @@
-"""Webhook 数据面：钉钉 / 企业微信 / 飞书 → QQ 机器人。"""
+"""Webhook 数据面：钉钉 / 企业微信 / 飞书 / GitHub → QQ 机器人。"""
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import time
@@ -13,9 +15,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.adapters import get_adapter
-from server.adapters.base import PayloadError, UnifiedMessage
+from server.adapters.base import IgnoredEvent, PayloadError, UnifiedMessage
 from server.db.crypto import decrypt_secret
-from server.db.models import PLATFORMS, BotProfile, Channel, PushLog
+from server.db.models import PLATFORM_GITHUB, PLATFORMS, BotProfile, Channel, PushLog
 from server.db.session import get_session_factory
 from server.renderer import QqPayload, render_qq
 from server.services.qq import QqClient, QqError, QqTarget
@@ -26,6 +28,8 @@ router = APIRouter()
 
 
 def ack(platform: str, *, errcode: int = 0, errmsg: str = "ok") -> dict:
+    if platform == PLATFORM_GITHUB:
+        return {"ok": True} if errcode == 0 else {"ok": False, "error": errmsg}
     if platform == "feishu":
         data = {} if errcode == 0 else {"error": errmsg}
         return {"code": errcode, "msg": "success" if errcode == 0 else errmsg, "data": data}
@@ -54,29 +58,71 @@ async def _read_body(request: Request, limit: int) -> bytes | None:
     return b"".join(chunks)
 
 
+def _verify_github_signature(
+    channel: Channel, request: Request, raw: bytes, settings
+) -> tuple[int, str | None]:
+    """校验 X-Hub-Signature-256；返回 (状态码, 错误信息)，通过时错误信息为 None。"""
+    stored = ((channel.extra or {}).get("secret_cipher") or "").strip()
+    if not stored:
+        return 401, "通道未配置签名密钥"
+    try:
+        secret = decrypt_secret(stored, settings.app_secret_key)
+    except Exception:  # noqa: BLE001 - 密钥不匹配时统一报配置错误
+        return 502, "签名密钥无法解密，请检查 APP_SECRET_KEY"
+
+    header = request.headers.get("X-Hub-Signature-256", "").strip()
+    if not header.startswith("sha256="):
+        return 401, "缺少 X-Hub-Signature-256 签名"
+    expected = "sha256=" + hmac.new(
+        secret.encode("utf-8"), raw, hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(expected, header):
+        return 401, "签名不匹配"
+    return 0, None
+
+
 @router.post("/webhook/{platform}")
 async def receive_webhook(platform: str, request: Request) -> JSONResponse:
     if platform not in PLATFORMS:
         return _json(platform, 404, errcode=404, errmsg=f"未知平台：{platform}")
+    if platform == PLATFORM_GITHUB:
+        return _json(
+            platform,
+            404,
+            errcode=404,
+            errmsg="GitHub 通道请使用 /webhook/github/{token}",
+        )
+    return await _receive(request, platform)
 
+
+@router.post("/webhook/github/{token}")
+async def receive_github_webhook(token: str, request: Request) -> JSONResponse:
+    return await _receive(request, PLATFORM_GITHUB, path_token=token)
+
+
+async def _receive(
+    request: Request, platform: str, *, path_token: str | None = None
+) -> JSONResponse:
     settings = request.app.state.settings
-    raw = await _read_body(request, settings.max_body_bytes)
+    limit = (
+        settings.github_max_body_bytes
+        if platform == PLATFORM_GITHUB
+        else settings.max_body_bytes
+    )
+    raw = await _read_body(request, limit)
     if raw is None:
         return _json(platform, 413, errcode=413, errmsg="请求体过大")
 
-    scheme, _, credentials = request.headers.get("Authorization", "").partition(" ")
-    bearer = credentials.strip() if scheme.lower() == "bearer" else ""
-    token = request.headers.get("X-Webhook-Token") or bearer or ""
-    if not token and settings.webhook_allow_query_token:
-        # 查询参数会落进访问日志，默认不开放
-        token = request.query_params.get("token") or ""
+    token = (path_token or "").strip()
+    if not token:
+        scheme, _, credentials = request.headers.get("Authorization", "").partition(" ")
+        bearer = credentials.strip() if scheme.lower() == "bearer" else ""
+        token = request.headers.get("X-Webhook-Token") or bearer or ""
+        if not token and settings.webhook_allow_query_token:
+            # 查询参数会落进访问日志，默认不开放
+            token = request.query_params.get("token") or ""
     if not token:
         return _json(platform, 401, errcode=401, errmsg="缺少 webhook token")
-
-    try:
-        payload = json.loads(raw.decode("utf-8") or "{}")
-    except (UnicodeDecodeError, ValueError):
-        return _json(platform, 400, errcode=400, errmsg="请求体不是合法 JSON")
 
     async with get_session_factory()() as db:
         channel = (
@@ -91,6 +137,16 @@ async def receive_webhook(platform: str, request: Request) -> JSONResponse:
         if channel is None:
             return _json(platform, 401, errcode=401, errmsg="token 无效或通道已停用")
 
+        if platform == PLATFORM_GITHUB:
+            status_code, error = _verify_github_signature(channel, request, raw, settings)
+            if error:
+                return _json(platform, status_code, errcode=status_code, errmsg=error)
+
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, ValueError):
+            return _json(platform, 400, errcode=400, errmsg="请求体不是合法 JSON")
+
         bot = (
             await db.execute(
                 select(BotProfile).where(
@@ -102,8 +158,16 @@ async def receive_webhook(platform: str, request: Request) -> JSONResponse:
         if bot is None:
             return _json(platform, 502, errcode=502, errmsg="机器人配置不可用")
 
+        event = (
+            request.headers.get("X-GitHub-Event", "")
+            if platform == PLATFORM_GITHUB
+            else ""
+        )
         try:
-            message = get_adapter(platform).parse(payload)
+            message = get_adapter(platform).parse(payload, event=event)
+        except IgnoredEvent as exc:
+            # 未订阅的事件按成功确认，避免 GitHub 判定投递失败并重试
+            return _json(platform, 200, errmsg=str(exc))
         except PayloadError as exc:
             return _json(platform, 400, errcode=400, errmsg=str(exc))
 
