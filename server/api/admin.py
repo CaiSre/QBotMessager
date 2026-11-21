@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import secrets
 from datetime import date, datetime, timedelta, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
@@ -24,15 +25,14 @@ from server.db.models import (
     STATUS_DISABLED,
     BotProfile,
     Channel,
-    EnvConfig,
     InviteCode,
     OAuthProvider,
     PushLog,
-    SystemSetting,
     User,
 )
 from server.db.session import get_session
 from server.services.audit import record_audit
+from server.services.runtime_settings import RuntimeSettings
 
 router = APIRouter(prefix="/api/admin")
 
@@ -455,168 +455,6 @@ async def get_log(
     }
 
 
-# ------------------------------------------------------------------- 环境配置
-
-
-@router.get("/env-configs")
-async def list_env_configs(
-    user: User = Depends(current_user), db: AsyncSession = Depends(get_session)
-) -> list[dict]:
-    stmt = select(EnvConfig, User.email).join(User, EnvConfig.owner_user_id == User.id)
-    if not is_super_admin(user):
-        stmt = stmt.where(EnvConfig.owner_user_id == user.id)
-    rows = (await db.execute(stmt.order_by(EnvConfig.key))).all()
-    items = []
-    for row, owner_email in rows:
-        value = row.value if not row.is_secret else "******"
-        items.append(
-            {
-                "id": row.id,
-                "owner_user_id": row.owner_user_id,
-                "owner_email": owner_email,
-                "key": row.key,
-                "value": value,
-                "is_secret": row.is_secret,
-                "description": row.description,
-                "updated_at": row.created_at.isoformat() if row.created_at else None,
-            }
-        )
-    return items
-
-
-async def _get_owned_env(db: AsyncSession, user: User, config_id: int) -> EnvConfig:
-    row = await db.get(EnvConfig, config_id)
-    if row is None or (row.owner_user_id != user.id and not is_super_admin(user)):
-        raise HTTPException(status_code=404, detail="配置项不存在")
-    return row
-
-
-class EnvIn(BaseModel):
-    key: str = Field(min_length=1, max_length=128)
-    value: str = ""
-    is_secret: bool = False
-    description: str = Field(default="", max_length=255)
-
-
-class EnvPatch(BaseModel):
-    value: str | None = None
-    is_secret: bool | None = None
-    description: str | None = Field(default=None, max_length=255)
-
-
-@router.post("/env-configs", status_code=status.HTTP_201_CREATED)
-async def create_env_config(
-    data: EnvIn,
-    request: Request,
-    user: User = Depends(current_user),
-    db: AsyncSession = Depends(get_session),
-) -> dict:
-    settings: Settings = request.app.state.settings
-    exists = (
-        await db.execute(
-            select(EnvConfig.id).where(
-                EnvConfig.owner_user_id == user.id, EnvConfig.key == data.key
-            )
-        )
-    ).scalar_one_or_none()
-    if exists is not None:
-        raise HTTPException(status_code=409, detail="配置项已存在")
-    row = EnvConfig(
-        owner_user_id=user.id,
-        key=data.key,
-        value=None if data.is_secret else data.value,
-        value_enc=encrypt_secret(data.value, settings.app_secret_key) if data.is_secret else None,
-        is_secret=data.is_secret,
-        description=data.description,
-        updated_by=user.id,
-    )
-    db.add(row)
-    await record_audit(
-        db,
-        actor=user,
-        action="env.create",
-        target_type="env_config",
-        target_id=data.key,
-        detail={"is_secret": data.is_secret},
-        ip=_client_ip(request),
-    )
-    await db.commit()
-    return {"id": row.id}
-
-
-@router.patch("/env-configs/{config_id}")
-async def patch_env_config(
-    config_id: int,
-    data: EnvPatch,
-    request: Request,
-    user: User = Depends(current_user),
-    db: AsyncSession = Depends(get_session),
-) -> dict:
-    settings: Settings = request.app.state.settings
-    row = await _get_owned_env(db, user, config_id)
-    # 只有前端明确给了新值才动密文；否则保留原密文，
-    # 否则「只改描述」这类请求会把已保存的密钥清空。
-    new_value = data.value if data.value is not None else None
-    turning_secret = data.is_secret is not None and data.is_secret != row.is_secret
-    if data.is_secret is not None:
-        row.is_secret = data.is_secret
-    if turning_secret and row.is_secret:
-        # 转成密文存储：优先用新值，否则沿用原来的明文
-        plain = new_value if new_value is not None else (row.value or "")
-        row.value = None
-        row.value_enc = encrypt_secret(plain, settings.app_secret_key)
-    elif turning_secret:
-        # 转成明文存储：把密文解回原文；给了新值则以新值为准
-        plain = new_value
-        if plain is None and row.value_enc is not None:
-            try:
-                plain = decrypt_secret(row.value_enc, settings.app_secret_key)
-            except Exception:  # noqa: BLE001
-                plain = None
-        row.value = plain
-        row.value_enc = None
-    elif new_value is not None:
-        if row.is_secret:
-            row.value_enc = encrypt_secret(new_value, settings.app_secret_key)
-        else:
-            row.value = new_value
-    if data.description is not None:
-        row.description = data.description
-    row.updated_by = user.id
-    await record_audit(
-        db,
-        actor=user,
-        action="env.update",
-        target_type="env_config",
-        target_id=row.key,
-        ip=_client_ip(request),
-    )
-    await db.commit()
-    return {"id": row.id}
-
-
-@router.delete("/env-configs/{config_id}")
-async def delete_env_config(
-    config_id: int,
-    request: Request,
-    user: User = Depends(current_user),
-    db: AsyncSession = Depends(get_session),
-) -> dict:
-    row = await _get_owned_env(db, user, config_id)
-    key = row.key
-    await db.delete(row)
-    await record_audit(
-        db,
-        actor=user,
-        action="env.delete",
-        target_type="env_config",
-        target_id=key,
-        ip=_client_ip(request),
-    )
-    await db.commit()
-    return {"ok": True}
-
-
 # ------------------------------------------------------------------------- 用户
 
 
@@ -971,56 +809,57 @@ async def delete_oauth_provider(
     return {"ok": True}
 
 
+def _settings_payload(request: Request, runtime: RuntimeSettings) -> dict:
+    base: Settings = request.app.state.base_settings
+    return {
+        "register_enabled": bool(runtime.register_enabled),
+        # 兼容安全设置页的来源提示
+        "register_enabled_source": (
+            "database" if runtime.source_of("register_enabled") == "database" else "env"
+        ),
+        "env_default": base.register_enabled,
+        "groups": runtime.describe_groups(),
+    }
+
+
 @router.get("/settings")
 async def get_settings(
     request: Request,
     user: User = Depends(require_super_admin),
-    db: AsyncSession = Depends(get_session),
 ) -> dict:
-    settings: Settings = request.app.state.settings
-    row = await db.get(SystemSetting, "register_enabled")
-    value = (
-        row.value.strip().lower() in ("1", "true", "yes", "on")
-        if row is not None
-        else settings.register_enabled
-    )
-    return {
-        "register_enabled": value,
-        "register_enabled_source": "database" if row is not None else "env",
-        "env_default": settings.register_enabled,
-    }
-
-
-class SettingsPatch(BaseModel):
-    register_enabled: bool | None = None
+    return _settings_payload(request, request.app.state.settings)
 
 
 @router.patch("/settings")
 async def patch_settings(
-    data: SettingsPatch,
+    data: dict[str, Any],
     request: Request,
     user: User = Depends(require_super_admin),
     db: AsyncSession = Depends(get_session),
 ) -> dict:
-    if data.register_enabled is None:
-        return await get_settings(request, user, db)
-    row = await db.get(SystemSetting, "register_enabled")
-    value = "true" if data.register_enabled else "false"
-    if row is None:
-        db.add(SystemSetting(key="register_enabled", value=value))
-    else:
-        row.value = value
+    runtime: RuntimeSettings = request.app.state.settings
+    try:
+        values = runtime.validate(data)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    if not values:
+        return _settings_payload(request, runtime)
+
+    await runtime.persist(db, values)
     await record_audit(
         db,
         actor=user,
         action="settings.update",
         target_type="system_setting",
-        target_id="register_enabled",
-        detail={"value": value},
+        detail={"values": {key: str(value) for key, value in values.items()}},
         ip=_client_ip(request),
     )
     await db.commit()
-    return {"register_enabled": data.register_enabled}
+    runtime.apply(values)
+    runtime.apply_side_effects(request.app)
+    return _settings_payload(request, runtime)
 
 
 # ------------------------------------------------------------------------- 统计

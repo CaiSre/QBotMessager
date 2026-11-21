@@ -1,4 +1,4 @@
-"""ORM 模型：账号、鉴权凭据、机器人配置、通道、日志、环境配置、审计。"""
+"""ORM 模型：账号、鉴权凭据、机器人配置、通道、日志、系统设置、审计。"""
 
 from __future__ import annotations
 
@@ -204,28 +204,6 @@ class PushLog(TimestampMixin, Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     duration_ms: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     request_id: Mapped[str] = mapped_column(String(64), nullable=False)
-
-
-class EnvConfig(TimestampMixin, Base):
-    """环境信息等键值配置；敏感项加密入库。"""
-
-    __tablename__ = "env_configs"
-    __table_args__ = (
-        UniqueConstraint("owner_user_id", "key", name="uq_env_owner_key"),
-    )
-
-    id: Mapped[int] = mapped_column(_AUTO_PK, primary_key=True, autoincrement=True)
-    owner_user_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("users.id"), nullable=False
-    )
-    key: Mapped[str] = mapped_column(String(128), nullable=False)
-    value: Mapped[str | None] = mapped_column(Text, nullable=True)
-    value_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
-    is_secret: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    description: Mapped[str] = mapped_column(String(255), default="", nullable=False)
-    updated_by: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey("users.id"), nullable=True
-    )
 
 
 class AdminAuditLog(TimestampMixin, Base):

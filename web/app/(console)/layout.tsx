@@ -25,12 +25,14 @@ const NAV = [
   { href: "/bots", label: "机器人", icon: BotIcon },
   { href: "/debug", label: "推送调试", icon: FlaskConicalIcon },
   { href: "/logs", label: "推送日志", icon: ScrollTextIcon },
-  { href: "/env", label: "环境配置", icon: Settings2Icon },
   { href: "/security", label: "安全设置", icon: ShieldCheckIcon },
   { href: "/account", label: "个人中心", icon: UserRoundIcon },
 ];
 
-const ADMIN_NAV = [{ href: "/users", label: "用户管理", icon: UsersIcon }];
+const ADMIN_NAV = [
+  { href: "/settings", label: "系统设置", icon: Settings2Icon },
+  { href: "/users", label: "用户管理", icon: UsersIcon },
+];
 
 export default function ConsoleLayout({ children }: { children: ReactNode }) {
   const router = useRouter();

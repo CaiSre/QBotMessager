@@ -6,7 +6,7 @@
   <a href="https://nextjs.org/"><img alt="Next.js" src="https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white"></a>
   <a href="https://www.mysql.com/"><img alt="MySQL" src="https://img.shields.io/badge/MySQL-8.4-4479A1?logo=mysql&logoColor=white"></a>
   <a href="https://docs.docker.com/compose/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white"></a>
-  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-70%20passed-brightgreen"></a>
+  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-76%20passed-brightgreen"></a>
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img alt="License: AGPL v3" src="https://img.shields.io/badge/License-AGPL_v3-blue"></a>
 </p>
 
@@ -38,11 +38,11 @@
   - 企业微信：text / markdown / markdown_v2 / news / image / file / voice / template_card
   - 飞书：text / post / image / share_chat / interactive
 - **QQ 推送**：支持 `msg_type=0` 纯文本与 `msg_type=2` Markdown，支持用户与群目标、账号级频控、401 自动刷新、5xx 与超频退避重试。
-- **多用户隔离**：每个用户独立管理自己的机器人、通道、环境配置与推送日志，数据按 `owner_user_id` 隔离。
+- **多用户隔离**：每个用户独立管理自己的机器人、通道与推送日志，数据按 `owner_user_id` 隔离。
 - **超级管理员**：可见并管理全部用户的资源；用户账号、邀请码、注册开关与 OAuth2 提供方仅超管可操作。
 - **多种登录方式**：邮箱密码、OAuth2 授权码、通行密钥（WebAuthn），服务端会话 Cookie。
 - **推送审计**：记录平台、来源类型、目标、状态、错误码、耗时与请求 ID，支持分页与筛选。
-- **敏感数据加密**：QQ AppSecret、OAuth Client Secret、加密型环境配置以 Fernet 密文入库。
+- **敏感数据加密**：QQ AppSecret、OAuth Client Secret 以 Fernet 密文入库。
 
 ## 技术栈
 
@@ -91,8 +91,9 @@ cp .env.example .env
 APP_SECRET_KEY=请填入 Fernet 密钥
 BOOTSTRAP_ADMIN_EMAIL=admin@example.com
 BOOTSTRAP_ADMIN_PASSWORD=请替换为强密码
-PUBLIC_BASE_URL=http://localhost:3000
 ```
+
+> 对外地址、会话、限速与 QQ 推送等非敏感配置已改为数据库持久化，登录后在「系统设置」中修改即可，重建容器无需再提供。若旧部署的 `.env` 中仍有这些变量，首次启动会导入数据库，之后以数据库为准。
 
 生成 `APP_SECRET_KEY`：
 
@@ -153,28 +154,37 @@ docker compose up -d --build
 
 ## 配置说明
 
+### 环境变量（敏感与启动依赖）
+
 | 变量 | 说明 | 默认 |
 |---|---|---|
 | `MYSQL_URL` | 数据库连接串；源码 compose 自动注入为 `db` 服务的 `qbotmessager` 库，预构建镜像需在 `.env` 中显式设置 | 空 |
 | `MYSQL_PASSWORD` / `MYSQL_ROOT_PASSWORD` | MySQL 业务账号与 root 密码（compose 必填） | 无 |
 | `APP_SECRET_KEY` | Fernet 主密钥，用于加密库内敏感字段 | 空（降级明文并告警） |
-| `PUBLIC_BASE_URL` | 对外访问地址，用于生成 Webhook URL 与 OAuth 回调 | 空（按请求头推导） |
-| `COOKIE_SECURE` | 会话 Cookie 是否仅限 HTTPS；`PUBLIC_BASE_URL` 为 https 时自动开启 | `false` |
-| `SESSION_TTL_HOURS` | 会话有效期（小时） | `72` |
-| `WEBHOOK_ALLOW_QUERY_TOKEN` | 是否允许用 `?token=` 传 Webhook 凭据（会落入访问日志） | `false` |
-| `LOGIN_MAX_FAILURES` / `LOGIN_IP_MAX_FAILURES` / `LOGIN_WINDOW_SECONDS` | 登录失败限速：同一 (IP, 账号) / 同一 IP 的失败次数上限与统计窗口 | `5` / `30` / `900` |
-| `TIMEZONE` | 统计口径使用的时区；留空取容器 `TZ`，再退回本机时区 | 空 |
 | `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` | 初始超级管理员；账号已存在时不改动 | 空 |
-| `REGISTER_ENABLED` | 是否允许凭邀请码注册（可被后台设置覆盖） | `false` |
 | `QQ_APPID` / `QQ_APP_SECRET` / `OPENID` | 首启导入的机器人凭据与默认推送目标 | 空 |
-| `QQ_HOST` | QQ 开放平台地址 | `https://api.bot.qq.com` |
-| `QQ_QPS` / `QQ_QPM` / `QQ_MIN_INTERVAL` | 账号级频控 | `5` / `30` / `0.21` |
-| `MARKDOWN_MAX_LEN` / `TEXT_MAX_LEN` | 下发内容长度上限 | `4000` / `2000` |
-| `MAX_BODY_BYTES` | Webhook 请求体上限 | `65536` |
-| `RP_ID` / `RP_NAME` | WebAuthn 依赖方标识与名称 | `localhost` / 项目名 |
-| `LOG_LEVEL` | 日志级别 | `INFO` |
 | `APP_PORT` | 宿主机映射端口（源码 compose） | `3000` |
 | `PYPI_MIRROR` / `NPM_MIRROR` | 构建时使用的软件源 | 官方源 |
+
+### 系统设置（数据库内持久化）
+
+以下配置在管理台「系统设置」页面修改，保存后立即生效。同名环境变量仅在首次启动、库内尚无该设置时作为初始值导入，之后以数据库为准。
+
+| 设置项 | 说明 | 默认 |
+|---|---|---|
+| 对外访问地址（`PUBLIC_BASE_URL`） | 用于生成 Webhook URL 与 OAuth 回调 | 空（按请求头推导） |
+| 统计时区（`TIMEZONE`） | 留空取容器 `TZ`，再退回本机时区 | 空 |
+| 日志级别（`LOG_LEVEL`） | 保存后立即调整后端日志输出 | `INFO` |
+| 请求体上限（`MAX_BODY_BYTES`） | Webhook 单次请求体上限（字节） | `65536` |
+| 允许 URL 传凭据（`WEBHOOK_ALLOW_QUERY_TOKEN`） | 是否允许 `?token=`（会落入访问日志） | `false` |
+| 允许邀请注册（`REGISTER_ENABLED`） | 也可在「安全设置」中切换 | `false` |
+| 会话有效期（`SESSION_TTL_HOURS`） | 对新登录生效 | `72` |
+| Cookie 仅限 HTTPS（`COOKIE_SECURE`） | 对外地址为 https 时自动开启 | `false` |
+| 通行密钥 RP ID / 名称（`RP_ID` / `RP_NAME`） | WebAuthn 依赖方标识与展示名 | 空 / 项目名 |
+| 登录失败限速（`LOGIN_MAX_FAILURES` / `LOGIN_IP_MAX_FAILURES` / `LOGIN_WINDOW_SECONDS`） | 同一 (IP, 账号) / 同一 IP 的失败上限与统计窗口 | `5` / `30` / `900` |
+| QQ API 域名（`QQ_HOST`） | 机器人未单独配置时使用的默认地址 | `https://api.bot.qq.com` |
+| QQ 频控（`QQ_QPS` / `QQ_QPM` / `QQ_MIN_INTERVAL`） | 账号级频控，保存后重建限速器 | `5` / `30` / `0.21` |
+| 内容长度上限（`MARKDOWN_MAX_LEN` / `TEXT_MAX_LEN`） | 下发内容长度上限 | `4000` / `2000` |
 
 ## 使用指南
 
@@ -186,7 +196,7 @@ docker compose up -d --build
 
 ### 发送 Webhook
 
-按对应平台的原始格式 POST，鉴权支持两种方式（优先级从高到低）：`X-Webhook-Token` 请求头、`Authorization: Bearer <token>` 请求头。查询参数 `?token=` 默认关闭（凭据会落进访问日志），需要时把 `WEBHOOK_ALLOW_QUERY_TOKEN` 设为 `true` 开启：
+按对应平台的原始格式 POST，鉴权支持两种方式（优先级从高到低）：`X-Webhook-Token` 请求头、`Authorization: Bearer <token>` 请求头。查询参数 `?token=` 默认关闭（凭据会落进访问日志），需要时在「系统设置」中开启：
 
 ```bash
 curl -X POST http://localhost:3000/webhook/dingtalk \
@@ -203,8 +213,8 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 
 | 角色 | 权限 |
 |---|---|
-| `super_admin` | 管理全部用户的机器人、通道、环境配置与推送日志；管理用户、邀请码、注册开关、OAuth2 提供方 |
-| `user` | 仅管理本人创建的机器人、通道、环境配置与推送日志 |
+| `super_admin` | 管理全部用户的机器人、通道与推送日志；管理用户、邀请码、注册开关、OAuth2 提供方与系统设置 |
+| `user` | 仅管理本人创建的机器人、通道与推送日志 |
 
 - 注册需邀请码，注册用户固定为 `user`；邀请码由超级管理员签发，可限定邮箱、次数与有效期。
 - 系统至少保留一个启用的超级管理员，且不能修改自己的角色或账号状态。
@@ -221,7 +231,7 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 | | `GET /api/auth/me` | 当前用户信息 |
 | | `GET /api/auth/oauth/{key}/start`、`/callback` | OAuth2 授权码流程 |
 | | `GET /api/auth/passkey`、`POST /api/auth/passkey/*` | 通行密钥注册与登录 |
-| 管理台 | `/api/admin/bot-profiles`、`/channels`、`/env-configs` | 资源增删改查（按归属过滤） |
+| 管理台 | `/api/admin/bot-profiles`、`/channels` | 资源增删改查（按归属过滤） |
 | | `GET /api/admin/logs`、`/stats` | 推送日志与统计 |
 | 超管 | `/api/admin/users`、`/invites`、`/oauth-providers`、`/settings` | 用户、邀请码、OAuth2 与系统设置 |
 
@@ -253,7 +263,7 @@ npm run dev
 uv run pytest
 ```
 
-测试使用临时 SQLite，覆盖适配器、渲染、频控、QQ 客户端、鉴权、用户隔离、Webhook 数据面与推送日志。
+测试使用临时 SQLite，覆盖适配器、渲染、频控、QQ 客户端、鉴权、用户隔离、Webhook 数据面、推送日志与系统设置。
 
 ## 目录结构
 
@@ -267,7 +277,7 @@ uv run pytest
 │   ├── services/           QQ 客户端、频控、审计
 │   └── db/                 模型、会话、加密、启动引导
 ├── web/                    Next.js 控制台
-│   ├── app/(console)/      概览 / 机器人 / 日志 / 环境 / 用户 / 安全
+│   ├── app/(console)/      概览 / 机器人 / 日志 / 系统设置 / 用户 / 安全
 │   └── lib/                类型、请求封装、通行密钥
 ├── alembic/                数据库迁移
 ├── deploy/                 容器入口与 supervisord 配置
@@ -279,7 +289,7 @@ uv run pytest
 ## 安全建议
 
 - 生产环境务必设置 `APP_SECRET_KEY`，密钥丢失将无法解密已入库的敏感字段。
-- 使用 HTTPS 并将 `COOKIE_SECURE` 设为 `true`；`PUBLIC_BASE_URL` 填写真实对外地址，保证 OAuth 回调与 Webhook 地址正确。
+- 使用 HTTPS，并在「系统设置」中开启 Cookie 仅限 HTTPS、填写真实对外地址，保证 OAuth 回调与 Webhook 地址正确。
 - 只有在提供方确实验证过邮箱归属时才开启 OAuth2 提供方的「信任邮箱」，否则同邮箱的本地账号可能被冒名登录接管。
 - 不要将 MySQL 端口暴露到公网（compose 未映射 3306）。
 - Webhook token 具有推送权限，泄露后请在「机器人 → 通道」中立即轮换。

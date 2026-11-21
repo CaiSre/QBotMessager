@@ -87,6 +87,13 @@ class LimiterRegistry:
             self._limiters[key] = limiter
         return limiter
 
+    def configure(self, *, qps: int, qpm: int, min_interval: float) -> None:
+        """采用新的频控参数；已建限流器丢弃，下次取用时按新参数重建。"""
+        self._qps = max(1, qps)
+        self._qpm = max(1, qpm)
+        self._min_interval = max(0.0, min_interval)
+        self._limiters.clear()
+
 
 def _is_shared_peer(ip: str | None) -> bool:
     """判断客户端地址能否区分来源。
@@ -126,6 +133,11 @@ class AttemptLimiter:
         self.window_seconds = max(1, window_seconds)
         self._failures: dict[str, deque[float]] = {}
         self._lock = asyncio.Lock()
+
+    def configure(self, *, pair_limit: int, ip_limit: int, window_seconds: int) -> None:
+        self.pair_limit = max(1, pair_limit)
+        self.ip_limit = max(1, ip_limit)
+        self.window_seconds = max(1, window_seconds)
 
     @staticmethod
     def _pair_key(ip: str | None, account: str) -> str:

@@ -244,7 +244,7 @@ export default function SecurityPage() {
                 {settings.data
                   ? settings.data.register_enabled_source === "database"
                     ? "（当前由管理后台覆盖）"
-                    : "（当前取环境变量默认值）"
+                    : "（当前为默认值）"
                   : ""}
               </CardDescription>
             </CardHeader>

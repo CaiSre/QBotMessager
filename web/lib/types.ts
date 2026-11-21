@@ -86,17 +86,6 @@ export interface LogPage {
   items: PushLog[];
 }
 
-export interface EnvConfig {
-  id: number;
-  owner_user_id: number;
-  owner_email: string;
-  key: string;
-  value: string | null;
-  is_secret: boolean;
-  description: string | null;
-  updated_at: string | null;
-}
-
 export interface UserRow {
   id: number;
   email: string;
@@ -138,6 +127,30 @@ export interface SecuritySettings {
   register_enabled: boolean;
   register_enabled_source: "database" | "env";
   env_default: boolean;
+}
+
+export type SettingKind = "bool" | "int" | "float" | "string" | "select";
+
+export interface SettingItem {
+  key: string;
+  label: string;
+  description: string;
+  kind: SettingKind;
+  value: boolean | number | string;
+  default: boolean | number | string;
+  minimum: number | null;
+  maximum: number | null;
+  options: string[];
+  source: "default" | "environment" | "database";
+}
+
+export interface SettingGroup {
+  name: string;
+  items: SettingItem[];
+}
+
+export interface SystemSettings extends SecuritySettings {
+  groups: SettingGroup[];
 }
 
 export interface Passkey {
