@@ -690,35 +690,35 @@ export default function BotsPage() {
           if (!open) setChannelResult(null);
         }}
       >
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent className="grid-cols-[minmax(0,1fr)] sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>
               {channelResult?.rotated ? "GitHub 通道已轮换" : "GitHub 通道已创建"}
             </DialogTitle>
           </DialogHeader>
-          <div className="flex flex-col gap-4 text-sm">
+          <div className="flex min-w-0 flex-col gap-4 text-sm">
             <p className="text-muted-foreground">
               请在 GitHub 仓库 Settings → Webhooks → Add webhook 中填写以下两项，Content type
               选择 application/json，SSL verification 保持启用，再选择要订阅的事件。
             </p>
-            <div className="flex flex-col gap-1">
-              <Label>Payload URL（token 已包含在地址中）</Label>
-              <div className="flex items-center gap-2">
-                <code className="min-w-0 flex-1 truncate rounded bg-muted px-2 py-1 font-mono text-xs">
+            <Field className="min-w-0 gap-1.5">
+              <FieldLabel>Payload URL（token 已包含在地址中）</FieldLabel>
+              <div className="flex min-w-0 items-center gap-2">
+                <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded bg-muted px-2 py-1 font-mono text-xs">
                   {channelResult?.webhookUrl}
                 </code>
                 <CopyButton value={channelResult?.webhookUrl ?? ""} />
               </div>
-            </div>
-            <div className="flex flex-col gap-1">
-              <Label>Secret</Label>
-              <div className="flex items-center gap-2">
-                <code className="min-w-0 flex-1 truncate rounded bg-muted px-2 py-1 font-mono text-xs">
+            </Field>
+            <Field className="min-w-0 gap-1.5">
+              <FieldLabel>Secret</FieldLabel>
+              <div className="flex min-w-0 items-center gap-2">
+                <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded bg-muted px-2 py-1 font-mono text-xs">
                   {channelResult?.secret}
                 </code>
                 <CopyButton value={channelResult?.secret ?? ""} />
               </div>
-            </div>
+            </Field>
             <FieldDescription>
               密钥只显示这一次，关闭后无法再次查看；如需更换请使用通道列表中的「轮换」。
             </FieldDescription>

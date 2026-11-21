@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -10,8 +11,15 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldGroup,
+  FieldLabel,
+  FieldTitle,
+} from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -95,33 +103,34 @@ export default function SettingsPage() {
 
     if (item.kind === "bool") {
       return (
-        <div
+        <Field
           key={item.key}
-          className="flex items-start justify-between gap-4 rounded-3xl border bg-muted/20 p-4"
+          orientation="horizontal"
+          className="rounded-2xl border bg-muted/20 p-3"
         >
-          <div>
-            <p className="text-sm font-medium">{item.label}</p>
-            <p className="mt-0.5 text-xs text-muted-foreground">{item.description}</p>
-          </div>
+          <FieldContent>
+            <FieldTitle>{item.label}</FieldTitle>
+            <FieldDescription className="text-xs">{item.description}</FieldDescription>
+          </FieldContent>
           <Switch
             checked={Boolean(value)}
             id={`setting-${item.key}`}
             onCheckedChange={(checked) => update(item.key, checked)}
           />
-        </div>
+        </Field>
       );
     }
 
     return (
-      <div key={item.key}>
-        <Label htmlFor={`setting-${item.key}`}>{item.label}</Label>
+      <Field key={item.key} className="gap-2">
+        <FieldLabel htmlFor={`setting-${item.key}`}>{item.label}</FieldLabel>
         {item.kind === "select" ? (
           <Select
             items={item.options.map((option) => ({ value: option, label: option }))}
             value={String(value ?? "")}
             onValueChange={(next) => update(item.key, String(next))}
           >
-            <SelectTrigger className="mt-2 w-full" id={`setting-${item.key}`}>
+            <SelectTrigger className="w-full" id={`setting-${item.key}`}>
               <SelectValue />
             </SelectTrigger>
             <SelectContent alignItemWithTrigger={false}>
@@ -136,7 +145,6 @@ export default function SettingsPage() {
           </Select>
         ) : (
           <Input
-            className="mt-2"
             id={`setting-${item.key}`}
             list={item.key === "timezone" ? "settings-timezone" : undefined}
             max={item.maximum ?? undefined}
@@ -162,8 +170,8 @@ export default function SettingsPage() {
             onChange={(event) => update(item.key, event.target.value)}
           />
         )}
-        <p className="mt-1.5 text-xs text-muted-foreground">{item.description}</p>
-      </div>
+        <FieldDescription className="text-xs">{item.description}</FieldDescription>
+      </Field>
     );
   }
 
@@ -186,9 +194,9 @@ export default function SettingsPage() {
           {settings.loading ? "正在读取系统设置…" : "暂无设置数据"}
         </p>
       ) : (
-        <div className="grid items-start gap-6 xl:grid-cols-2">
+        <div className="grid items-start gap-4 xl:grid-cols-2">
           {settings.data.groups.map((group) => (
-            <Card key={group.name}>
+            <Card key={group.name} size="sm">
               <CardHeader>
                 <CardTitle>{group.name}</CardTitle>
                 <CardDescription>
@@ -196,9 +204,9 @@ export default function SettingsPage() {
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <div className="flex flex-col gap-4">
+                <FieldGroup className="gap-4">
                   {group.items.map((item) => renderControl(item))}
-                </div>
+                </FieldGroup>
               </CardContent>
             </Card>
           ))}
@@ -211,14 +219,14 @@ export default function SettingsPage() {
         ))}
       </datalist>
 
-      <section className="mt-6 space-y-2 rounded-3xl border bg-muted/30 p-5 text-sm">
-        <h2 className="font-heading text-base font-medium">仍由环境变量提供</h2>
-        <p className="text-muted-foreground">
+      <Alert className="mt-4">
+        <AlertTitle>仍由环境变量提供</AlertTitle>
+        <AlertDescription>
           数据库连接信息、加密主密钥、初始管理员账号与 QQ 引导凭据属于敏感或启动依赖项，
           不在本页修改；机器人凭据请到「机器人」页面维护。SMTP 密码在本页填写后会加密入库，
           不会回显明文。
-        </p>
-      </section>
+        </AlertDescription>
+      </Alert>
     </div>
   );
 }

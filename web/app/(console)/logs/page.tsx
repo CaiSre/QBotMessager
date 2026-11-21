@@ -219,13 +219,15 @@ export default function LogsPage() {
                     </TableCell>
                     <TableCell>{row.target ?? "—"}</TableCell>
                     <TableCell>
-                      <button
-                        className="block max-w-80 truncate text-left text-xs text-primary hover:underline"
+                      <Button
+                        className="block h-auto max-w-80 justify-start truncate p-0 text-left"
+                        size="xs"
                         type="button"
+                        variant="link"
                         onClick={() => setDetail(row)}
                       >
                         {truncate(row.content_preview, 50)}
-                      </button>
+                      </Button>
                     </TableCell>
                     <TableCell>
                       {row.duration_ms != null ? `${row.duration_ms} ms` : "—"}
