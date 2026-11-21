@@ -1,6 +1,6 @@
 [project]
 name = "qbotmessager"
-version = "0.2.0"
+version = "0.3.0"
 description = "多用户消息推送中台：钉钉/企业微信/飞书 Webhook 统一转换后推送至 QQ 机器人"
 readme = "README.md"
 license = "AGPL-3.0-only"
