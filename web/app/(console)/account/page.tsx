@@ -159,7 +159,7 @@ export default function AccountPage() {
   }
 
   return (
-    <div className="max-w-4xl">
+    <div>
       <PageHeader
         title="个人中心"
         description="管理账号的用户名、登录邮箱与密码"
