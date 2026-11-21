@@ -85,9 +85,6 @@ export default function ConsoleLayout({ children }: { children: ReactNode }) {
         <aside className="flex shrink-0 flex-col gap-4 border-b bg-sidebar px-4 py-4 text-sidebar-foreground lg:w-60 lg:border-r lg:border-b-0 lg:px-3 lg:py-6">
           <div className="px-2">
             <p className="font-heading text-base leading-snug font-medium tracking-tight">QBotMessager</p>
-            <p className="font-heading text-base leading-snug font-medium tracking-tight">
-              for Message Server
-            </p>
             <div className="mt-2 flex items-center gap-2">
               <span className="truncate text-xs text-muted-foreground">{me.email}</span>
               <Badge variant="secondary">{ROLE_LABELS[me.role]}</Badge>
