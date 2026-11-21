@@ -413,8 +413,59 @@ def test_github_workflow_run_completed_only() -> None:
         )
 
 
-def test_github_unsupported_event_and_missing_header() -> None:
-    with pytest.raises(IgnoredEvent):
-        parse_event("github", "deployment", _github_payload())
+def test_github_workflow_job_status() -> None:
+    message = parse_event(
+        "github",
+        "workflow_job",
+        _github_payload(
+            action="completed",
+            workflow_job={
+                "name": "build",
+                "status": "completed",
+                "conclusion": "success",
+                "head_branch": "main",
+                "html_url": "https://github.com/acme/widgets/actions/runs/1/job/2",
+            },
+        ),
+    )
+    assert "工作流任务 build 成功" in message.title
+    assert "main" in message.body
+    assert message.source_msgtype == "workflow_job.completed"
+
+    running = parse_event(
+        "github",
+        "workflow_job",
+        _github_payload(
+            action="in_progress",
+            workflow_job={"name": "build", "status": "in_progress"},
+        ),
+    )
+    assert "build 进行中" in running.title
+
+
+def test_github_generic_event_and_missing_header() -> None:
+    message = parse_event(
+        "github",
+        "deployment",
+        _github_payload(
+            action="created",
+            deployment={
+                "environment": "production",
+                "html_url": "https://github.com/acme/widgets/deployments/1",
+            },
+        ),
+    )
+    assert message.fmt == FMT_MARKDOWN
+    assert message.title == "acme/widgets 部署"
+    assert "octocat" in message.body
+    assert "创建" in message.body
+    assert "[production](https://github.com/acme/widgets/deployments/1)" in message.body
+    assert message.source_msgtype == "deployment.created"
+
+    unknown = parse_event("github", "future_event", _github_payload(action="happened"))
+    assert unknown.title == "acme/widgets future_event"
+    assert "octocat" in unknown.body
+    assert unknown.source_msgtype == "future_event.happened"
+
     with pytest.raises(PayloadError):
         get_adapter("github").parse(_github_payload())

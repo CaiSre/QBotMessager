@@ -6,7 +6,7 @@
   <a href="https://nextjs.org/"><img alt="Next.js" src="https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white"></a>
   <a href="https://www.mysql.com/"><img alt="MySQL" src="https://img.shields.io/badge/MySQL-8.4-4479A1?logo=mysql&logoColor=white"></a>
   <a href="https://docs.docker.com/compose/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white"></a>
-  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-94%20passed-brightgreen"></a>
+  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-96%20passed-brightgreen"></a>
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img alt="License: AGPL v3" src="https://img.shields.io/badge/License-AGPL_v3-blue"></a>
 </p>
 
@@ -37,7 +37,7 @@
   - 钉钉：text / markdown / link / actionCard / feedCard
   - 企业微信：text / markdown / markdown_v2 / news / image / file / voice / template_card
   - 飞书：text / post / image / share_chat / interactive
-  - GitHub：ping / push / pull_request / issues / release / workflow_run
+  - GitHub：全部事件类型；ping / push / pull_request / issues / release / workflow_run / workflow_job 使用专门格式，其余事件使用通用格式
 - **QQ 推送**：支持 `msg_type=0` 纯文本与 `msg_type=2` Markdown，支持用户与群目标、账号级频控、401 自动刷新、5xx 与超频退避重试。
 - **多用户隔离**：每个用户独立管理自己的机器人、通道与推送日志，数据按 `owner_user_id` 隔离。
 - **超级管理员**：可见并管理全部用户的资源；用户账号、邀请码、注册开关与 OAuth2 提供方仅超管可操作。
@@ -214,7 +214,7 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 
 - **推送目标**：请求体顶层可选 `openid` 或 `group_openid`，缺省使用机器人配置的默认目标。
 - **响应格式**：钉钉 / 企业微信返回 `errcode` / `errmsg`，飞书返回 `code` / `msg` / `data`。
-- **GitHub**：token 只在 URL 路径中传递，并强制校验 `X-Hub-Signature-256`；成功返回 `{"ok": true}`，未订阅的事件同样返回 200 以免 GitHub 判定投递失败并重试。
+- **GitHub**：token 只在 URL 路径中传递，并强制校验 `X-Hub-Signature-256`；成功返回 `{"ok": true}`。所有事件类型都会处理，已知事件使用专门格式、其余使用通用格式；`workflow_run` 仅推送 completed，其余动作返回 200 以免 GitHub 判定投递失败并重试。
 - **状态码**：鉴权或 GitHub 签名失败返回 401；目标缺失或消息不支持返回 400；QQ 侧失败返回 502，并写入推送日志。
 
 ### 用户与权限

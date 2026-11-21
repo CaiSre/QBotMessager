@@ -324,7 +324,7 @@ def test_github_rejects_missing_or_bad_signature(
     assert qq.calls == []
 
 
-def test_github_ignores_unsupported_event_with_200(
+def test_github_arbitrary_event_pushes_and_logs(
     admin: TestClient, qq: StubQqClient
 ) -> None:
     bot_id = create_bot(admin, group="g-default")
@@ -335,11 +335,19 @@ def test_github_ignores_unsupported_event_with_200(
         channel["webhook_token"],
         channel["secret"],
         "deployment",
-        {"repository": {"full_name": "acme/widgets"}},
+        {
+            "action": "created",
+            "deployment": {"environment": "production"},
+            "repository": {"full_name": "acme/widgets"},
+            "sender": {"login": "octocat"},
+        },
     )
     assert response.status_code == 200
     assert response.json()["ok"] is True
-    assert qq.calls == []
+    assert len(qq.calls) == 1
+
+    logs = admin.get("/api/admin/logs").json()
+    assert logs["items"][0]["source_msgtype"] == "deployment.created"
 
 
 def test_github_without_path_token_is_rejected(
