@@ -48,6 +48,7 @@ const PLATFORM_OPTIONS: { id: string; label: string }[] = [
   { id: "dingtalk", label: PLATFORM_LABELS.dingtalk },
   { id: "wecom", label: PLATFORM_LABELS.wecom },
   { id: "feishu", label: PLATFORM_LABELS.feishu },
+  { id: "github", label: PLATFORM_LABELS.github },
 ];
 
 const STATUS_OPTIONS = [

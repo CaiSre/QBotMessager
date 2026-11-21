@@ -14,6 +14,7 @@ import {
   UsersIcon,
 } from "lucide-react";
 
+import { ThemeToggle } from "@/components/theme-toggle";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { api, isUnauthorized, messageOf } from "@/lib/api";
@@ -30,8 +31,8 @@ const NAV = [
 ];
 
 const ADMIN_NAV = [
-  { href: "/settings", label: "系统设置", icon: Settings2Icon },
   { href: "/users", label: "用户管理", icon: UsersIcon },
+  { href: "/settings", label: "系统设置", icon: Settings2Icon },
 ];
 
 export default function ConsoleLayout({ children }: { children: ReactNode }) {
@@ -89,12 +90,15 @@ export default function ConsoleLayout({ children }: { children: ReactNode }) {
     <MeProvider me={me} refresh={load}>
       <div className="flex min-h-screen flex-col lg:flex-row">
         <aside className="flex shrink-0 flex-col gap-4 border-b bg-sidebar px-4 py-4 text-sidebar-foreground lg:w-60 lg:border-r lg:border-b-0 lg:px-3 lg:py-6">
-          <div className="px-2">
-            <p className="font-heading text-base leading-snug font-medium tracking-tight">QBotMessager</p>
-            <div className="mt-2 flex items-center gap-2">
-              <span className="truncate text-xs text-muted-foreground">{me.email}</span>
-              <Badge variant="secondary">{ROLE_LABELS[me.role]}</Badge>
+          <div className="flex items-start justify-between gap-2 px-2">
+            <div className="min-w-0">
+              <p className="font-heading text-base leading-snug font-medium tracking-tight">QBotMessager</p>
+              <div className="mt-2 flex items-center gap-2">
+                <span className="truncate text-xs text-muted-foreground">{me.email}</span>
+                <Badge variant="secondary">{ROLE_LABELS[me.role]}</Badge>
+              </div>
             </div>
+            <ThemeToggle className="-mt-1 -mr-1 shrink-0" />
           </div>
 
           <nav className="flex gap-1 overflow-x-auto lg:flex-col lg:overflow-visible">

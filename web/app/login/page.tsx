@@ -32,7 +32,7 @@ export default function LoginPage() {
   async function submitPassword(event: React.FormEvent) {
     event.preventDefault();
     const next: { account?: string; password?: string } = {};
-    if (!account.trim()) next.account = "请填写用户名或邮箱";
+    if (!account.trim()) next.account = "请填写账户";
     if (!password) next.password = "请填写密码";
     setFieldErrors(next);
     if (next.account || next.password) return;
@@ -85,12 +85,12 @@ export default function LoginPage() {
             <form noValidate onSubmit={submitPassword}>
               <FieldGroup className="gap-4">
                 <Field data-invalid={Boolean(fieldErrors.account)}>
-                  <FieldLabel htmlFor="account">用户名或邮箱</FieldLabel>
+                  <FieldLabel htmlFor="account">账户</FieldLabel>
                   <Input
                     aria-invalid={Boolean(fieldErrors.account) || undefined}
                     autoComplete="username"
                     id="account"
-                    placeholder="用户名或 you@example.com"
+                    placeholder="用户名或邮箱"
                     type="text"
                     value={account}
                     onChange={(event) => {
