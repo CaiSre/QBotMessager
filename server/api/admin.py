@@ -6,8 +6,10 @@ import secrets
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+from urllib.parse import urlsplit
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import Select, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from server.auth.deps import current_user, is_super_admin, require_super_admin
 from server.auth.oauth import GITHUB_PRESET
 from server.auth.passwords import hash_password
-from server.config import Settings
+from server.config import Settings, get_settings as load_settings
 from server.db.crypto import decrypt_secret, encrypt_secret, mask_secret
 from server.db.models import (
     PLATFORM_GITHUB,
@@ -92,14 +94,61 @@ async def list_bots(
     ]
 
 
+MAX_DEFAULT_TARGETS = 50
+MAX_TARGET_LEN = 128
+
+
+def _validate_qq_host(value: str | None) -> str | None:
+    """只允许 https 且主机在白名单内，避免把请求打到内网或任意地址。"""
+    if value is None:
+        return None
+    value = value.strip().rstrip("/")
+    if not value:
+        return "https://api.bot.qq.com"
+    parts = urlsplit(value)
+    if parts.scheme != "https" or not parts.hostname:
+        raise ValueError("QQ 接口地址必须是以 https:// 开头的完整地址")
+    if parts.username or parts.password:
+        raise ValueError("QQ 接口地址不能包含用户信息")
+    if parts.query or parts.fragment:
+        raise ValueError("QQ 接口地址不能包含查询参数或锚点")
+    allowed = {
+        item.strip().lower()
+        for item in load_settings().qq_allowed_hosts.split(",")
+        if item.strip()
+    }
+    if parts.hostname.lower() not in allowed:
+        raise ValueError("QQ 接口地址不在允许的主机列表中")
+    return value
+
+
+def _validate_openids(value: list[str] | None) -> list[str] | None:
+    if value is None:
+        return None
+    if len(value) > MAX_DEFAULT_TARGETS:
+        raise ValueError(f"默认目标最多 {MAX_DEFAULT_TARGETS} 个")
+    out: list[str] = []
+    for item in value:
+        item = item.strip()
+        if not item:
+            continue
+        if len(item) > MAX_TARGET_LEN:
+            raise ValueError(f"单个 openid 最长 {MAX_TARGET_LEN} 个字符")
+        out.append(item)
+    return out
+
+
 class BotIn(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     qq_appid: str = Field(min_length=1, max_length=128)
     qq_app_secret: str = Field(min_length=1, max_length=512)
     qq_host: str = "https://api.bot.qq.com"
     default_openids: list[str] = Field(default_factory=list)
-    default_group_openid: str | None = None
+    default_group_openid: str | None = Field(default=None, max_length=MAX_TARGET_LEN)
     enabled: bool = True
+
+    _qq_host = field_validator("qq_host")(_validate_qq_host)
+    _openids = field_validator("default_openids")(_validate_openids)
 
 
 class BotPatch(BaseModel):
@@ -108,8 +157,11 @@ class BotPatch(BaseModel):
     qq_app_secret: str | None = Field(default=None, max_length=512)
     qq_host: str | None = None
     default_openids: list[str] | None = None
-    default_group_openid: str | None = None
+    default_group_openid: str | None = Field(default=None, max_length=MAX_TARGET_LEN)
     enabled: bool | None = None
+
+    _qq_host = field_validator("qq_host")(_validate_qq_host)
+    _openids = field_validator("default_openids")(_validate_openids)
 
 
 @router.post("/bot-profiles", status_code=status.HTTP_201_CREATED)

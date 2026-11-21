@@ -8,17 +8,50 @@ from __future__ import annotations
 
 import re
 
-_HTML_TAG = re.compile(r"<[^>]+>")
 _IMAGE = re.compile(r"!\[([^\]]*)\]\(([^)]*)\)")
 _BARE_IMAGE = re.compile(r"\[!\(([^)]*)\)\]")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _BLANK_LINES = re.compile(r"\n{3,}")
 _TRUNCATION_SUFFIX = "\n…（内容过长已截断）"
 
+# 正则清洗前允许的最大输入长度。图片正则 `!\[([^\]]*)\]\(([^)]*)\)` 在
+# 大量 `![` 上会退化为平方级，因此必须先限定输入再清洗。
+_MAX_SCAN = 20_000
+
+
+def _bound(text: str, max_len: int | None) -> str:
+    """清洗前的长度上限；最终输出仍会按 max_len 精确截断。"""
+    cap = min(max_len * 2, _MAX_SCAN) if max_len else _MAX_SCAN
+    if len(text) <= cap:
+        return text
+    return text[:cap]
+
 
 def strip_html(text: str) -> str:
-    """去掉 HTML 标签，保留标签内文字。"""
-    return _HTML_TAG.sub("", text)
+    """去掉 HTML 标签，保留标签内文字（线性扫描，避免正则回溯）。"""
+    if "<" not in text:
+        return text
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        lt = text.find("<", i)
+        if lt < 0:
+            out.append(text[i:])
+            break
+        out.append(text[i:lt])
+        gt = text.find(">", lt + 1)
+        if gt < 0:
+            # 没有闭合的 '>'：保留剩余文本，不再当作标签
+            out.append(text[lt:])
+            break
+        if gt == lt + 1:
+            # "<>" 不是标签
+            out.append("<")
+            i = lt + 1
+            continue
+        i = gt + 1
+    return "".join(out)
 
 
 def degrade_tables(content: str) -> str:
@@ -59,7 +92,7 @@ def sanitize_markdown(text: str, *, max_len: int | None = None) -> str:
     """清洗 Markdown 并按需截断。"""
     if not text:
         return ""
-    content = text.replace("\r\n", "\n").replace("\r", "\n")
+    content = _bound(text.replace("\r\n", "\n").replace("\r", "\n"), max_len)
     content = strip_html(content)
     content = _IMAGE.sub(lambda m: f"（图片：{m.group(1)}）" if m.group(1) else "（图片）", content)
     content = _BARE_IMAGE.sub("（图片）", content)
@@ -75,7 +108,7 @@ def sanitize_text(text: str, *, max_len: int | None = None) -> str:
     """清洗纯文本：去控制字符、压缩空白、按需截断。"""
     if not text:
         return ""
-    content = text.replace("\r\n", "\n").replace("\r", "\n")
+    content = _bound(text.replace("\r\n", "\n").replace("\r", "\n"), max_len)
     content = strip_html(content)
     content = _CONTROL.sub("", content)
     content = _BLANK_LINES.sub("\n\n", content).strip()

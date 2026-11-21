@@ -37,7 +37,10 @@ class StubQqClient:
         app_secret: str,
         target,
         payload,
+        before_attempt=None,
     ) -> dict:
+        if before_attempt is not None:
+            await before_attempt()
         self.calls.append(
             {
                 "key": key,

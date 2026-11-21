@@ -6,21 +6,21 @@ import hashlib
 import hmac
 import json
 import logging
-import time
 import uuid
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.adapters import get_adapter
-from server.adapters.base import IgnoredEvent, PayloadError, UnifiedMessage
+from server.adapters.base import IgnoredEvent, PayloadError
 from server.db.crypto import decrypt_secret
-from server.db.models import PLATFORM_GITHUB, PLATFORMS, BotProfile, Channel, PushLog
+from server.db.models import PLATFORM_GITHUB, PLATFORMS, BotProfile, Channel
 from server.db.session import get_session_factory
-from server.renderer import QqPayload, render_qq
-from server.services.qq import QqClient, QqError, QqTarget
+from server.renderer import render_qq
+from server.services.push import PushJob, execute_push
+from server.services.qq import QqTarget
+from server.services.queue import PushQueue, QueueFull
 
 logger = logging.getLogger(__name__)
 
@@ -176,40 +176,76 @@ async def _receive(
             return _json(platform, 400, errcode=400, errmsg="未指定推送目标且机器人未配置默认目标")
 
         try:
-            app_secret = decrypt_secret(bot.qq_app_secret, settings.app_secret_key)
+            decrypt_secret(bot.qq_app_secret, settings.app_secret_key)
         except Exception:  # noqa: BLE001 - 密钥不匹配时统一报配置错误
             return _json(platform, 502, errcode=502, errmsg="机器人密钥无法解密，请检查 APP_SECRET_KEY")
 
-        qq_payload = render_qq(
-            message,
-            markdown_max_len=settings.markdown_max_len,
-            text_max_len=settings.text_max_len,
-        )
-
-        client: QqClient = request.app.state.qq_client
-        # 频控按机器人 AppID 计算，每个机器人各用一份窗口
-        limiter = request.app.state.limiters.get(f"bot:{bot.id}")
+        # 推送所需字段在会话关闭前取出，避免出站 HTTP 期间一直占用数据库连接
+        channel_id = channel.id
+        channel_platform = channel.platform
+        bot_id = bot.id
+        owner_user_id = bot.owner_user_id
+        bot_host = bot.qq_host
+        bot_appid = bot.qq_appid
+        bot_secret_cipher = bot.qq_app_secret
         request_id = uuid.uuid4().hex
-        results = await _push_all(
-            db,
-            settings=settings,
-            client=client,
-            limiter=limiter,
-            bot=bot,
-            channel=channel,
-            app_secret=app_secret,
-            qq_payload=qq_payload,
-            message=message,
-            targets=targets,
-            request_id=request_id,
-        )
 
-    failures = [r for r in results if r]
+    qq_payload = render_qq(
+        message,
+        markdown_max_len=settings.markdown_max_len,
+        text_max_len=settings.text_max_len,
+    )
+    job = PushJob(
+        request_id=request_id,
+        platform=channel_platform,
+        channel_id=channel_id,
+        bot_id=bot_id,
+        owner_user_id=owner_user_id,
+        bot_host=bot_host,
+        bot_appid=bot_appid,
+        # 只传密文，worker 用环境变量里的主密钥解密，避免明文落到 Redis
+        app_secret_cipher=bot_secret_cipher,
+        source_msgtype=message.source_msgtype or "unknown",
+        msg_type=qq_payload.msg_type,
+        content=qq_payload.content,
+        markdown=qq_payload.markdown,
+        targets=tuple(targets),
+    )
+
+    queue: PushQueue | None = getattr(request.app.state, "push_queue", None)
+    if queue is not None:
+        try:
+            queued = await queue.enqueue(job, job_id=_job_id(platform, request, payload, request_id))
+        except QueueFull:
+            logger.warning("推送队列积压，拒绝入队（request_id=%s）", request_id)
+            # 其他平台会对失败的投递重试；GitHub 不会，改走下面的同步发送，避免事件丢失
+            if platform != PLATFORM_GITHUB:
+                return _json(platform, 503, errcode=503, errmsg="推送队列繁忙，请稍后重试")
+        except Exception:  # noqa: BLE001 - Redis 异常时降级为同步发送，避免丢消息
+            logger.exception("推送队列不可用，改为同步发送（request_id=%s）", request_id)
+        else:
+            if not queued:
+                # 平台重试投递同一条消息时直接确认，避免重复推送
+                return _json(platform, 200, errmsg="重复投递，已忽略")
+            return _json(platform, 200)
+
+    # 未配置 Redis：同步发送，行为与引入队列前一致
+    outcome = await execute_push(
+        job,
+        settings=settings,
+        client=request.app.state.qq_client,
+        limiter=request.app.state.limiters.get(f"bot:{bot_id}"),
+    )
+    failures = outcome.failed
     if not failures:
         return _json(platform, 200)
-    if len(failures) == len(results):
+    if len(failures) == len(outcome.errors):
         return _json(platform, 502, errcode=502, errmsg=failures[0])
     return _json(platform, 502, errcode=502, errmsg=f"部分目标推送失败：{failures[0]}")
+
+
+MAX_FANOUT = 50
+MAX_TARGET_LEN = 128
 
 
 def _resolve_targets(payload: dict, bot: BotProfile) -> list[QqTarget]:
@@ -217,73 +253,44 @@ def _resolve_targets(payload: dict, bot: BotProfile) -> list[QqTarget]:
     if isinstance(payload, dict):
         group_openid = (payload.get("group_openid") or "").strip()
         if group_openid:
-            return [QqTarget(group_openid=group_openid)]
+            return [QqTarget(group_openid=group_openid)] if len(group_openid) <= MAX_TARGET_LEN else []
         openid = (payload.get("openid") or "").strip()
         if openid:
-            return [QqTarget(openid=openid)]
+            return [QqTarget(openid=openid)] if len(openid) <= MAX_TARGET_LEN else []
     group_default = (bot.default_group_openid or "").strip()
     if group_default:
         return [QqTarget(group_openid=group_default)]
-    return [QqTarget(openid=oid) for oid in (bot.default_openids or []) if oid]
+    return [
+        QqTarget(openid=oid)
+        for oid in (bot.default_openids or [])[:MAX_FANOUT]
+        if oid
+    ]
 
 
-async def _push_all(
-    db: AsyncSession,
-    *,
-    settings,
-    client: QqClient,
-    limiter,
-    bot: BotProfile,
-    channel: Channel,
-    app_secret: str,
-    qq_payload: QqPayload,
-    message: UnifiedMessage,
-    targets: list[QqTarget],
-    request_id: str,
-) -> list[str | None]:
-    """逐个目标串行发送并落推送日志；返回每个目标的错误信息（None 表示成功）。"""
-    errors: list[str | None] = []
-    for target in targets:
-        started = time.perf_counter()
-        error: str | None = None
-        error_code: str | None = None
-        try:
-            await limiter.acquire()
-            await client.send(
-                key=f"bot:{bot.id}",
-                host=bot.qq_host or settings.qq_host,
-                app_id=bot.qq_appid,
-                app_secret=app_secret,
-                target=target,
-                payload=qq_payload,
-            )
-        except QqError as exc:
-            error, error_code = exc.message, exc.code
-            logger.warning("QQ 推送失败 [%s] %s: %s", target.label(), exc.code, exc.message)
-        except Exception as exc:  # noqa: BLE001 - 记录后按失败处理，避免中断其他目标
-            error, error_code = str(exc), "unexpected"
-            logger.exception("QQ 推送异常 [%s]", target.label())
+def _job_id(platform: str, request: Request, payload: object, request_id: str) -> str:
+    """任务去重键：平台会重投同一条消息，重复入队只会推送一次。
 
-        duration_ms = (time.perf_counter() - started) * 1000
-        db.add(
-            PushLog(
-                owner_user_id=bot.owner_user_id,
-                channel_id=channel.id,
-                bot_profile_id=bot.id,
-                platform=channel.platform,
-                source_msgtype=message.source_msgtype or "unknown",
-                target=target.to_db_value(),
-                qq_msg_type=qq_payload.msg_type,
-                content_preview=qq_payload.text[:200],
-                content_len=len(qq_payload.text),
-                status="success" if error is None else "failed",
-                error_code=error_code,
-                error_message=error,
-                duration_ms=round(duration_ms, 2),
-                request_id=request_id,
-            )
-        )
-        errors.append(error)
+    平台提供的投递 ID 先做哈希，避免超长或含特殊字符的 ID 直接成为 Redis 键。
+    """
+    delivery = _delivery_id(platform, request, payload)
+    if not delivery:
+        return f"push:{request_id}"
+    digest = hashlib.sha256(f"{platform}:{delivery}".encode("utf-8")).hexdigest()
+    return f"push:{digest}"
 
-    await db.commit()
-    return errors
+
+def _delivery_id(platform: str, request: Request, payload: object) -> str | None:
+    if platform == PLATFORM_GITHUB:
+        return request.headers.get("X-GitHub-Delivery") or None
+    if not isinstance(payload, dict):
+        return None
+    if platform == "feishu":
+        header = payload.get("header")
+        if isinstance(header, dict):
+            return header.get("event_id") or None
+        return None
+    for key in ("msgid", "msg_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None

@@ -531,6 +531,7 @@ export default function BotsPage() {
                   aria-invalid={Boolean(botErrors.secret) || undefined}
                   autoComplete="new-password"
                   id="bot-secret"
+                  type="password"
                   placeholder={editingBot?.has_secret ? "留空表示不修改" : "QQ 机器人 AppSecret"}
                   value={botForm.secret}
                   onChange={(event) => {
@@ -652,6 +653,7 @@ export default function BotsPage() {
                   <Input
                     autoComplete="new-password"
                     id="channel-secret"
+                    type="password"
                     placeholder="留空时自动生成"
                     value={channelSecret}
                     onChange={(event) => setChannelSecret(event.target.value)}

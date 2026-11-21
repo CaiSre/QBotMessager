@@ -35,8 +35,12 @@ services:
       - .env
     environment:
       MYSQL_URL: mysql+asyncmy://qbotmessager:${MYSQL_PASSWORD}@db:3306/qbotmessager
+      # 默认使用容器内随镜像启动的 Redis；也可指向外部实例
+      REDIS_URL: ${REDIS_URL:-redis://127.0.0.1:6379}
     ports:
       - "${APP_PORT:-3000}:3000"
+    # 与 supervisord 的 stopwaitsecs 对齐，让 worker 把当前任务跑完
+    stop_grace_period: 30s
 
 volumes:
   mysql-data:

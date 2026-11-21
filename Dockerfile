@@ -34,7 +34,7 @@ RUN uv export --frozen --no-dev --no-hashes --no-emit-project --output-file requ
 # ------------------------------------------------ 运行时
 FROM alpine:${ALPINE_VERSION}
 
-RUN apk add --no-cache python3 nodejs supervisor tzdata
+RUN apk add --no-cache python3 nodejs supervisor tzdata redis
 
 ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \
@@ -49,6 +49,7 @@ COPY server ./server
 COPY alembic ./alembic
 COPY alembic.ini ./
 COPY deploy/supervisord.conf /etc/supervisord.conf
+COPY deploy/redis.conf /etc/redis.conf
 COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 COPY --from=web-builder /build/web/.next/standalone ./
@@ -64,7 +65,7 @@ USER app
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD wget -q -O /dev/null http://127.0.0.1:3000/login || exit 1
+    CMD wget -q -O /dev/null http://127.0.0.1:8000/readyz || exit 1
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["supervisord", "-c", "/etc/supervisord.conf"]

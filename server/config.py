@@ -68,6 +68,8 @@ class Settings(BaseSettings):
 
     # QQ 机器人（引导导入用；运行期以库内 bot_profiles 为准）
     qq_host: str = "https://api.bot.qq.com"
+    # 允许机器人配置的 QQ 接口主机（逗号分隔）；默认只允许官方域名
+    qq_allowed_hosts: str = "api.bot.qq.com"
     qq_appid: str = ""
     qq_app_secret: str = ""
     openid: str = ""
@@ -80,6 +82,16 @@ class Settings(BaseSettings):
     # 内容长度上限（QQ 侧未公开，保守取值）
     markdown_max_len: int = 4000
     text_max_len: int = 2000
+
+    # 数据库连接池（仅 MySQL 生效）
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    db_pool_timeout: int = 10
+
+    # 推送队列（Redis）：留空时 Webhook 同步推送，单机或测试环境无需 Redis
+    redis_url: str = ""
+    # 队列积压上限，超过后拒绝入队并由上游平台重试（GitHub 改为同步发送）
+    push_queue_max: int = 200
 
     # 请求体上限
     max_body_bytes: int = 65536

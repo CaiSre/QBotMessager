@@ -27,30 +27,33 @@ class RateLimiter:
         self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
-        """获取一次发送许可（阻塞直到满足频率限制）。"""
-        async with self._lock:
-            while True:
+        """获取一次发送许可（阻塞直到满足频率限制）。
+
+        只有记账在锁内完成，等待在锁外进行：否则一个请求排队时会把同机器人
+        的其他请求全部堵在锁上。
+        """
+        while True:
+            async with self._lock:
                 now = time.monotonic()
                 self._prune(now)
-                if (
-                    len(self._second_window) < self.qps
-                    and len(self._minute_window) < self.qpm
-                ):
-                    wait = self.min_interval - (now - self._last_sent)
-                    if wait > 0:
-                        await asyncio.sleep(wait)
-                        now = time.monotonic()
+                wait = 0.0
+                if len(self._second_window) >= self.qps:
+                    wait = max(wait, self._second_window[0] + 1.0 - now)
+                if len(self._minute_window) >= self.qpm:
+                    wait = max(wait, self._minute_window[0] + 60.0 - now)
+                wait = max(wait, self._last_sent + self.min_interval - now)
+                if wait <= 0:
                     self._last_sent = now
                     self._second_window.append(now)
                     self._minute_window.append(now)
                     return
-                # 窗口已满：睡到最早的记录过期
-                oldest = min(
-                    self._second_window[0] if self._second_window else now,
-                    self._minute_window[0] if self._minute_window else now,
-                )
-                sleep_for = max(0.01, min(oldest + 1.0 - now, 1.0))
-                await asyncio.sleep(sleep_for)
+            await asyncio.sleep(max(0.01, wait))
+
+    def configure(self, *, qps: int, qpm: int, min_interval: float) -> None:
+        """更新参数但保留已有窗口，避免瞬时放行双倍配额。"""
+        self.qps = max(1, qps)
+        self.qpm = max(1, qpm)
+        self.min_interval = max(0.0, min_interval)
 
     def _prune(self, now: float) -> None:
         while self._second_window and now - self._second_window[0] >= 1.0:
@@ -88,11 +91,12 @@ class LimiterRegistry:
         return limiter
 
     def configure(self, *, qps: int, qpm: int, min_interval: float) -> None:
-        """采用新的频控参数；已建限流器丢弃，下次取用时按新参数重建。"""
+        """采用新的频控参数；保留已有窗口，避免瞬时放行双倍配额。"""
         self._qps = max(1, qps)
         self._qpm = max(1, qpm)
         self._min_interval = max(0.0, min_interval)
-        self._limiters.clear()
+        for limiter in self._limiters.values():
+            limiter.configure(qps=self._qps, qpm=self._qpm, min_interval=self._min_interval)
 
 
 def _is_shared_peer(ip: str | None) -> bool:

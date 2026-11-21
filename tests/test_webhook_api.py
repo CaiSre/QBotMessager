@@ -389,3 +389,95 @@ def test_github_rotate_replaces_token_and_secret(
     )
     assert fresh.status_code == 200
     assert len(qq.calls) == 1
+
+
+class _FakeQueue:
+    """模拟 PushQueue：记录入队内容，可切换重复投递与队列已满。"""
+
+    def __init__(self) -> None:
+        self.jobs: list[tuple[object, str]] = []
+        self.duplicate = False
+        self.full = False
+
+    async def enqueue(self, job, *, job_id: str) -> bool:
+        from server.services.queue import QueueFull
+
+        if self.full:
+            raise QueueFull("full")
+        self.jobs.append((job, job_id))
+        return not self.duplicate
+
+
+def _with_queue(admin: TestClient, fake: _FakeQueue):
+    original = admin.app.state.push_queue
+    admin.app.state.push_queue = fake
+    return original
+
+
+def test_queue_accepts_before_any_send(admin: TestClient, qq: StubQqClient) -> None:
+    from server.services.push import PushJob
+
+    bot_id = create_bot(admin, openids=["u-default"])
+    channel = create_channel(admin, bot_id, "dingtalk")
+    fake = _FakeQueue()
+    original = _with_queue(admin, fake)
+    try:
+        response = _post(
+            admin,
+            "dingtalk",
+            channel["webhook_token"],
+            {"msgtype": "text", "text": {"content": "入队即确认"}},
+        )
+    finally:
+        admin.app.state.push_queue = original
+
+    assert response.status_code == 200
+    assert qq.calls == []
+    assert len(fake.jobs) == 1
+    job, job_id = fake.jobs[0]
+    assert isinstance(job, PushJob)
+    assert job.bot_id == bot_id
+    assert job.content == "入队即确认"
+    assert job_id.startswith("push:")
+
+
+def test_queue_duplicate_delivery_is_acked(admin: TestClient, qq: StubQqClient) -> None:
+    bot_id = create_bot(admin, openids=["u-default"])
+    channel = create_channel(admin, bot_id, "dingtalk")
+    fake = _FakeQueue()
+    fake.duplicate = True
+    original = _with_queue(admin, fake)
+    try:
+        response = _post(
+            admin,
+            "dingtalk",
+            channel["webhook_token"],
+            {"msgtype": "text", "text": {"content": "重复"}},
+        )
+    finally:
+        admin.app.state.push_queue = original
+
+    assert response.status_code == 200
+    assert response.json()["errmsg"] == "重复投递，已忽略"
+    assert qq.calls == []
+
+
+def test_queue_full_asks_sender_to_retry(admin: TestClient, qq: StubQqClient) -> None:
+    bot_id = create_bot(admin, openids=["u-default"])
+    channel = create_channel(admin, bot_id, "dingtalk")
+    fake = _FakeQueue()
+    fake.full = True
+    original = _with_queue(admin, fake)
+    try:
+        response = _post(
+            admin,
+            "dingtalk",
+            channel["webhook_token"],
+            {"msgtype": "text", "text": {"content": "积压"}},
+        )
+    finally:
+        admin.app.state.push_queue = original
+
+    assert response.status_code == 503
+    assert response.json()["errcode"] == 503
+    assert qq.calls == []

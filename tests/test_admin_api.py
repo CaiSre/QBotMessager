@@ -73,3 +73,22 @@ def test_stats_today_follows_configured_timezone(
     assert len(trend) == 7
     days = [date.fromisoformat(item["date"]) for item in trend]
     assert days == [days[-1] - timedelta(days=offset) for offset in range(6, -1, -1)]
+
+
+_BOT_BODY = {"name": "白名单机器人", "qq_appid": "102000002", "qq_app_secret": "s"}
+
+
+def test_create_bot_accepts_allowlisted_qq_host(admin: TestClient) -> None:
+    response = admin.post(
+        "/api/admin/bot-profiles",
+        json={**_BOT_BODY, "qq_host": "https://api.bot.qq.com"},
+    )
+    assert response.status_code == 201, response.text
+
+
+def test_create_bot_rejects_qq_host_outside_allowlist(admin: TestClient) -> None:
+    response = admin.post(
+        "/api/admin/bot-profiles",
+        json={**_BOT_BODY, "qq_host": "https://169.254.169.254"},
+    )
+    assert response.status_code == 422, response.text

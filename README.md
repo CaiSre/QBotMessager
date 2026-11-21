@@ -6,7 +6,7 @@
   <a href="https://nextjs.org/"><img alt="Next.js" src="https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white"></a>
   <a href="https://www.mysql.com/"><img alt="MySQL" src="https://img.shields.io/badge/MySQL-8.4-4479A1?logo=mysql&logoColor=white"></a>
   <a href="https://docs.docker.com/compose/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white"></a>
-  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-102%20passed-brightgreen"></a>
+  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-105%20passed-brightgreen"></a>
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img alt="License: AGPL v3" src="https://img.shields.io/badge/License-AGPL_v3-blue"></a>
 </p>
 
@@ -39,6 +39,7 @@
   - 飞书：text / post / image / share_chat / interactive
   - GitHub：全部事件类型；ping / push / pull_request / issues / release / workflow_run / workflow_job 使用专门格式，其余事件使用通用格式
 - **QQ 推送**：支持 `msg_type=0` 纯文本与 `msg_type=2` Markdown，支持用户与群目标、账号级频控、401 自动刷新、5xx 与超频退避重试。
+- **推送队列**：配置 `REDIS_URL` 后 Webhook 入队即确认，由 worker 按频控节奏发送，推送方不会因等待 QQ 响应而超时重投；重复投递按平台投递 ID 去重。
 - **多用户隔离**：每个用户独立管理自己的机器人、通道与推送日志，数据按 `owner_user_id` 隔离。
 - **明暗主题**：默认跟随系统，控制台侧边栏与登录页可手动切换，并记住选择。
 - **超级管理员**：可见并管理全部用户的资源；用户账号、邀请码、注册开关与 OAuth2 提供方仅超管可操作。
@@ -54,25 +55,26 @@
 | 后端 | FastAPI、SQLAlchemy 2（async）、Alembic、Pydantic v2 |
 | 数据库 | MySQL 8.4（asyncmy）；测试使用 SQLite（aiosqlite） |
 | 前端 | Next.js 16（App Router、standalone）、React 19、Tailwind CSS v4、shadcn/ui |
-| 部署 | 单容器：supervisord 同时托管 Next.js 与 Uvicorn，启动时自动执行迁移 |
+| 队列 | Redis + SAQ；未配置 `REDIS_URL` 时退化为同步发送 |
+| 部署 | 单容器：supervisord 同时托管 Redis、Uvicorn、SAQ worker 与 Next.js，启动时自动执行迁移 |
 | 测试 | pytest、pytest-asyncio、FastAPI TestClient |
 
 ## 系统架构
 
-单容器内运行两个进程，由 supervisord 托管：
+单容器内由 supervisord 托管 Redis、FastAPI、SAQ worker 与 Next.js：
 
 ```text
 浏览器 / 推送方
       │
       ▼
-Next.js :3000  ──/api/*、/webhook/* 反代──▶  FastAPI :8000
-      │                                            │
-      └──────────────── 同一容器 ──────────────────┘
-                                                   ▼
-                                             MySQL 8.4
+Next.js :3000 ──/api/*、/webhook/* 反代──▶ FastAPI :8000 ──入队──▶ Redis
+                                              │                      │
+                                              ▼                      ▼
+                                          MySQL 8.4 ◀───────── SAQ worker ──▶ QQ 机器人
 ```
 
 - 容器入口 `deploy/entrypoint.sh` 等待数据库就绪后执行 `alembic upgrade head`，再启动 supervisord。
+- 配置 `REDIS_URL` 时 Webhook 只做校验与入队，worker 按机器人频控发送并写入推送日志；Redis 不可用时降级为同步发送。
 - 后端启动时执行幂等引导：创建超级管理员，并在提供 `QQ_APPID` / `QQ_APP_SECRET` 时导入默认机器人及三条通道（GitHub 通道需手动创建）。
 
 ## 快速开始
@@ -165,6 +167,7 @@ docker compose up -d --build
 | `MYSQL_URL` | 数据库连接串；源码 compose 自动注入为 `db` 服务的 `qbotmessager` 库，预构建镜像需在 `.env` 中显式设置 | 空 |
 | `MYSQL_PASSWORD` / `MYSQL_ROOT_PASSWORD` | MySQL 业务账号与 root 密码（compose 必填） | 无 |
 | `APP_SECRET_KEY` | Fernet 主密钥，用于加密库内敏感字段 | 空（降级明文并告警） |
+| `REDIS_URL` | 推送队列（SAQ）连接串；配置后 Webhook 入队即确认，由 worker 按频控发送。留空则同步推送 | 空（源码 compose 为容器内 Redis） |
 | `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` | 初始超级管理员；账号已存在时不改动 | 空 |
 | `QQ_APPID` / `QQ_APP_SECRET` / `OPENID` | 首启导入的机器人凭据与默认推送目标 | 空 |
 | `APP_PORT` | 宿主机映射端口（源码 compose） | `3000` |
@@ -286,7 +289,8 @@ uv run pytest
 │   ├── api/                路由：auth / admin / webhook / health
 │   ├── auth/               会话、密码、OAuth2、WebAuthn
 │   ├── adapters/           钉钉 / 企业微信 / 飞书 / GitHub 消息解析
-│   ├── services/           QQ 客户端、频控、审计
+│   ├── services/           QQ 客户端、频控、推送队列、审计
+│   ├── worker.py           SAQ 推送 worker
 │   └── db/                 模型、会话、加密、启动引导
 ├── web/                    Next.js 控制台
 │   ├── app/(console)/      概览 / 机器人 / 日志 / 系统设置 / 用户 / 安全

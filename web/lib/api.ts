@@ -12,7 +12,10 @@ interface RequestOptions {
   method?: "GET" | "POST" | "PATCH" | "DELETE";
   body?: unknown;
   signal?: AbortSignal;
+  timeoutMs?: number;
 }
+
+const DEFAULT_TIMEOUT_MS = 20_000;
 
 function detailOf(payload: unknown): string {
   if (!payload || typeof payload !== "object") return "";
@@ -32,9 +35,19 @@ function detailOf(payload: unknown): string {
 }
 
 export async function api<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = "GET", body, signal } = options;
+  const { method = "GET", body, signal, timeoutMs = DEFAULT_TIMEOUT_MS } = options;
   const hasBody = body !== undefined;
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const onAbort = () => controller.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
+
   let response: Response;
+  let text: string;
   try {
     response = await fetch(path, {
       method,
@@ -42,14 +55,20 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
       body: hasBody ? JSON.stringify(body) : undefined,
       credentials: "include",
       cache: "no-store",
-      signal,
+      signal: controller.signal,
     });
+    text = await response.text();
   } catch (error) {
-    if ((error as Error).name === "AbortError") throw error;
+    if ((error as Error).name === "AbortError") {
+      if (timedOut) throw new ApiError(408, "请求超时，请稍后重试");
+      throw error;
+    }
     throw new ApiError(0, "网络异常，无法连接服务");
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
   }
 
-  const text = await response.text();
   let payload: unknown = null;
   if (text) {
     try {

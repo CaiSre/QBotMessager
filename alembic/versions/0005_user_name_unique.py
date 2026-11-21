@@ -7,9 +7,8 @@ Create Date: 2026-11-21 20:00:00.000000
 """
 from typing import Sequence, Union
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = '0005_user_name_unique'
@@ -48,7 +47,7 @@ def _dedupe_names(connection) -> None:
 def upgrade() -> None:
     """先去重，再建立基于 lower(name) 的唯一索引。"""
     _dedupe_names(op.get_bind())
-    op.create_index(INDEX_NAME, 'users', [sa.text('lower(name)')], unique=True)
+    op.create_index(INDEX_NAME, "users", [sa.text("(lower(name))")], unique=True)
 
 
 def downgrade() -> None:

@@ -20,7 +20,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from server.auth import oauth as oauth_flow
 from server.auth import passkey as passkey_flow
 from server.auth.deps import current_user, get_session_token
-from server.auth.passwords import burn_password, hash_password, verify_password
+from server.auth.passwords import (
+    burn_password_async,
+    hash_password_async,
+    verify_password_async,
+)
 from server.auth.sessions import (
     create_session,
     revoke_other_sessions,
@@ -339,7 +343,7 @@ async def update_email(
     db: AsyncSession = Depends(get_session),
 ) -> dict:
     # 没有邮件验证通道，改邮箱以当前密码作为身份确认
-    if user.password_hash is not None and not verify_password(
+    if user.password_hash is not None and not await verify_password_async(
         data.current_password, user.password_hash
     ):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前密码错误")
@@ -367,9 +371,9 @@ async def update_password(
 ) -> dict:
     settings: Settings = request.app.state.settings
     if user.password_hash is not None:
-        if not verify_password(data.current_password, user.password_hash):
+        if not await verify_password_async(data.current_password, user.password_hash):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前密码错误")
-        if verify_password(data.new_password, user.password_hash):
+        if await verify_password_async(data.new_password, user.password_hash):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="新密码不能与当前密码相同"
             )
@@ -388,7 +392,7 @@ async def update_password(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="邮箱验证码错误或已过期"
             )
-    user.password_hash = hash_password(data.new_password)
+    user.password_hash = await hash_password_async(data.new_password)
     await db.commit()
     await revoke_other_sessions(db, user.id, keep_token=token)
     return {"ok": True}
@@ -482,7 +486,7 @@ async def reset_password(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="验证码错误或已过期"
         )
-    user.password_hash = hash_password(data.new_password)
+    user.password_hash = await hash_password_async(data.new_password)
     await db.commit()
     # 密码重置后所有旧会话立即失效
     await revoke_user_sessions(db, user.id)
@@ -518,12 +522,12 @@ async def login(
     user = (await db.execute(query)).scalars().first()
     if user is None:
         # 账号不存在时也走一次等价 PBKDF2，避免用响应时间枚举已注册账号
-        burn_password(data.password)
+        await burn_password_async(data.password)
         await limiter.record_failure(ip, account_key)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误"
         )
-    if not verify_password(data.password, user.password_hash):
+    if not await verify_password_async(data.password, user.password_hash):
         await limiter.record_failure(ip, account_key)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误"
@@ -625,7 +629,7 @@ async def register(
     user = User(
         email=email,
         name=name or await unique_name(db, email.split("@")[0]),
-        password_hash=hash_password(data.password),
+        password_hash=await hash_password_async(data.password),
         role=ROLE_USER,
         status=STATUS_ACTIVE,
     )

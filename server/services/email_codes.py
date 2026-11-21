@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from server.auth.passwords import hash_password, verify_password
+from server.auth.passwords import hash_password_async, verify_password_async
 from server.db.models import EmailVerificationCode
 
 PURPOSE_REGISTER = "register"
@@ -112,7 +112,7 @@ async def issue_code(
         EmailVerificationCode(
             email=email,
             purpose=purpose,
-            code_hash=hash_password(code),
+            code_hash=await hash_password_async(code),
             expires_at=now + timedelta(minutes=ttl_minutes),
             ip=ip,
         )
@@ -146,7 +146,7 @@ async def verify_code(
         await db.commit()
         return False
 
-    if not verify_password(code.strip(), row.code_hash):
+    if not await verify_password_async(code.strip(), row.code_hash):
         row.attempts += 1
         if row.attempts >= MAX_ATTEMPTS:
             row.consumed_at = now

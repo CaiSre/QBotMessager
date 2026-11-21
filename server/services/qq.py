@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import httpx2 as httpx
@@ -125,12 +126,18 @@ class QqClient:
         target: QqTarget,
         payload: QqPayload,
         max_retries: int = 3,
+        before_attempt: Callable[[], Awaitable[None]] | None = None,
     ) -> dict:
-        """发送消息；401 刷新 token 重试一次，5xx/网络错误退避重试。"""
+        """发送消息；401 刷新 token 重试一次，5xx/网络错误退避重试。
+
+        before_attempt 在每次实际请求（含重试）前调用，用于重新获取频控许可。
+        """
         attempt = 0
         token_refreshed = False
         backoff = 0.5
         while True:
+            if before_attempt is not None:
+                await before_attempt()
             token = await self.get_access_token(
                 key=key, host=host, app_id=app_id, app_secret=app_secret
             )
@@ -163,16 +170,34 @@ class QqClient:
                 logger.info("QQ 返回消息去重（视为成功）：%s", body)
                 return body
 
-            retryable = resp.status_code >= 500 or code == ERR_RATE_LIMIT
+            rate_limited = code == ERR_RATE_LIMIT or str(code) == str(ERR_RATE_LIMIT)
+            retryable = resp.status_code >= 500 or rate_limited
             if retryable and attempt < max_retries:
                 attempt += 1
-                await asyncio.sleep(backoff if code != ERR_RATE_LIMIT else max(backoff, 2.0))
-                backoff *= 2
+                delay = _retry_after(resp)
+                if delay is None:
+                    delay = backoff
+                if rate_limited:
+                    delay = max(delay, 2.0)
+                await asyncio.sleep(delay)
+                backoff = min(backoff * 2, 8.0)
                 continue
 
             raise QqError(
                 str(code), _extract_message(body) or f"HTTP {resp.status_code}", retryable=retryable
             )
+
+
+def _retry_after(resp: httpx.Response) -> float | None:
+    """读取 Retry-After（秒）；无法解析或过长时忽略。"""
+    raw = resp.headers.get("Retry-After", "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return min(max(value, 0.0), 30.0)
 
 
 def _safe_json(resp: httpx.Response) -> dict:

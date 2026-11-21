@@ -17,7 +17,13 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
-def build_engine(url: str) -> AsyncEngine:
+def build_engine(
+    url: str,
+    *,
+    pool_size: int = 10,
+    max_overflow: int = 20,
+    pool_timeout: int = 10,
+) -> AsyncEngine:
     """创建异步引擎。
 
     MySQL 走 asyncmy 驱动；SQLite 仅用于本地测试（aiosqlite）。
@@ -27,12 +33,26 @@ def build_engine(url: str) -> AsyncEngine:
         kwargs["poolclass"] = StaticPool if ":memory:" in url else NullPool
         kwargs.pop("pool_pre_ping")
         kwargs.pop("pool_recycle")
+    else:
+        kwargs.update(
+            pool_size=max(1, pool_size),
+            max_overflow=max(0, max_overflow),
+            pool_timeout=max(1, pool_timeout),
+        )
     return create_async_engine(url, **kwargs)
 
 
-def init_engine(url: str) -> AsyncEngine:
+def init_engine(
+    url: str,
+    *,
+    pool_size: int = 10,
+    max_overflow: int = 20,
+    pool_timeout: int = 10,
+) -> AsyncEngine:
     global _engine, _session_factory
-    _engine = build_engine(url)
+    _engine = build_engine(
+        url, pool_size=pool_size, max_overflow=max_overflow, pool_timeout=pool_timeout
+    )
     _session_factory = async_sessionmaker(
         _engine, class_=AsyncSession, expire_on_commit=False
     )
