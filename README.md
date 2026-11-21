@@ -6,11 +6,11 @@
   <a href="https://nextjs.org/"><img alt="Next.js" src="https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white"></a>
   <a href="https://www.mysql.com/"><img alt="MySQL" src="https://img.shields.io/badge/MySQL-8.4-4479A1?logo=mysql&logoColor=white"></a>
   <a href="https://docs.docker.com/compose/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white"></a>
-  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-82%20passed-brightgreen"></a>
+  <a href="#测试"><img alt="Tests" src="https://img.shields.io/badge/tests-94%20passed-brightgreen"></a>
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img alt="License: AGPL v3" src="https://img.shields.io/badge/License-AGPL_v3-blue"></a>
 </p>
 
-<p align="center">面向钉钉、企业微信与飞书的统一消息接入层：全异步链路即时完成转换与推送，Access Token 常驻缓存、失效即刷，显著降低端到端延迟；账号级频控与退避重试保障高峰下的稳定吞吐，多用户控制台按归属隔离机器人、通道与推送日志，敏感凭据以 Fernet 加密入库。</p>
+<p align="center">面向钉钉、企业微信、飞书与 GitHub 的统一消息接入层：全异步链路即时完成转换与推送，Access Token 常驻缓存、失效即刷，显著降低端到端延迟；账号级频控与退避重试保障高峰下的稳定吞吐，多用户控制台按归属隔离机器人、通道与推送日志，敏感凭据以 Fernet 加密入库。</p>
 
 ## 目录
 
@@ -32,11 +32,12 @@
 
 ## 功能特性
 
-- **多平台入站**：`POST /webhook/dingtalk`、`/webhook/wecom`、`/webhook/feishu`，直接接受三个平台的原始消息参数。
+- **多平台入站**：`POST /webhook/dingtalk`、`/webhook/wecom`、`/webhook/feishu` 直接接受三个平台的原始消息参数；GitHub 使用 `POST /webhook/github/{token}`，并校验 `X-Hub-Signature-256` 签名。
 - **消息转换**：
   - 钉钉：text / markdown / link / actionCard / feedCard
   - 企业微信：text / markdown / markdown_v2 / news / image / file / voice / template_card
   - 飞书：text / post / image / share_chat / interactive
+  - GitHub：ping / push / pull_request / issues / release / workflow_run
 - **QQ 推送**：支持 `msg_type=0` 纯文本与 `msg_type=2` Markdown，支持用户与群目标、账号级频控、401 自动刷新、5xx 与超频退避重试。
 - **多用户隔离**：每个用户独立管理自己的机器人、通道与推送日志，数据按 `owner_user_id` 隔离。
 - **超级管理员**：可见并管理全部用户的资源；用户账号、邀请码、注册开关与 OAuth2 提供方仅超管可操作。
@@ -71,7 +72,7 @@ Next.js :3000  ──/api/*、/webhook/* 反代──▶  FastAPI :8000
 ```
 
 - 容器入口 `deploy/entrypoint.sh` 等待数据库就绪后执行 `alembic upgrade head`，再启动 supervisord。
-- 后端启动时执行幂等引导：创建超级管理员，并在提供 `QQ_APPID` / `QQ_APP_SECRET` 时导入默认机器人及三条通道。
+- 后端启动时执行幂等引导：创建超级管理员，并在提供 `QQ_APPID` / `QQ_APP_SECRET` 时导入默认机器人及三条通道（GitHub 通道需手动创建）。
 
 ## 快速开始
 
@@ -150,7 +151,7 @@ docker compose up -d --build
 访问 `http://localhost:3000`，使用 `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` 登录。首次启动会：
 
 1. 创建超级管理员账号；
-2. 若配置了 `QQ_APPID` / `QQ_APP_SECRET`，导入默认机器人、默认推送目标与钉钉 / 企业微信 / 飞书三条通道；
+2. 若配置了 `QQ_APPID` / `QQ_APP_SECRET`，导入默认机器人、默认推送目标与钉钉 / 企业微信 / 飞书三条通道（GitHub 通道需在「机器人」页手动创建）；
 3. 默认关闭注册入口，需要时在「安全设置」中开启，并在「用户管理」中生成邀请码。
 4. 如需邮箱验证码（注册验证、找回密码），先在「系统设置 → 邮件服务」填写 SMTP 服务器与发件人；未配置时注册仍只校验邀请码。
 
@@ -178,6 +179,7 @@ docker compose up -d --build
 | 统计时区（`TIMEZONE`） | 留空取容器 `TZ`，再退回本机时区 | 空 |
 | 日志级别（`LOG_LEVEL`） | 保存后立即调整后端日志输出 | `INFO` |
 | 请求体上限（`MAX_BODY_BYTES`） | Webhook 单次请求体上限（字节） | `65536` |
+| GitHub 请求体上限（`GITHUB_MAX_BODY_BYTES`） | GitHub Webhook 单次请求体上限（字节）；GitHub 自身负载上限为 25MB | `2097152` |
 | 允许 URL 传凭据（`WEBHOOK_ALLOW_QUERY_TOKEN`） | 是否允许 `?token=`（会落入访问日志） | `false` |
 | 允许邀请注册（`REGISTER_ENABLED`） | 也可在「安全设置」中切换 | `false` |
 | 会话有效期（`SESSION_TTL_HOURS`） | 对新登录生效 | `72` |
@@ -196,12 +198,12 @@ docker compose up -d --build
 ### 创建机器人与通道
 
 1. 在「机器人」页新增机器人，填写 AppID、AppSecret 与默认接收方（openid 或群 openid）。
-2. 在同一页新增通道，选择平台后即生成 `webhook_token` 与完整 Webhook 地址，可直接复制。
-3. 通道可在「轮换」后立即失效旧 token，也可停用而不删除。
+2. 在同一页新增通道，选择平台后即生成 `webhook_token` 与完整 Webhook 地址，可直接复制。GitHub 的 Webhook 设置中没有单独的 token 字段：token 已包含在 `/webhook/github/{token}` 地址中，填入 Payload URL 即可；创建时还会生成 Secret，需填到 GitHub 的 Secret 字段。
+3. 通道可在「轮换」后立即失效旧 token，也可停用而不删除；GitHub 通道轮换会同时更换签名密钥，需要同步更新 GitHub 配置。
 
 ### 发送 Webhook
 
-按对应平台的原始格式 POST，鉴权支持两种方式（优先级从高到低）：`X-Webhook-Token` 请求头、`Authorization: Bearer <token>` 请求头。查询参数 `?token=` 默认关闭（凭据会落进访问日志），需要时在「系统设置」中开启：
+按对应平台的原始格式 POST。钉钉 / 企业微信 / 飞书的鉴权支持两种方式（优先级从高到低）：`X-Webhook-Token` 请求头、`Authorization: Bearer <token>` 请求头。查询参数 `?token=` 默认关闭（凭据会落进访问日志），需要时在「系统设置」中开启：
 
 ```bash
 curl -X POST http://localhost:3000/webhook/dingtalk \
@@ -212,7 +214,8 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 
 - **推送目标**：请求体顶层可选 `openid` 或 `group_openid`，缺省使用机器人配置的默认目标。
 - **响应格式**：钉钉 / 企业微信返回 `errcode` / `errmsg`，飞书返回 `code` / `msg` / `data`。
-- **状态码**：鉴权失败返回 401；目标缺失或消息不支持返回 400；QQ 侧失败返回 502，并写入推送日志。
+- **GitHub**：token 只在 URL 路径中传递，并强制校验 `X-Hub-Signature-256`；成功返回 `{"ok": true}`，未订阅的事件同样返回 200 以免 GitHub 判定投递失败并重试。
+- **状态码**：鉴权或 GitHub 签名失败返回 401；目标缺失或消息不支持返回 400；QQ 侧失败返回 502，并写入推送日志。
 
 ### 用户与权限
 
@@ -231,6 +234,7 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 |---|---|---|
 | 健康检查 | `GET /healthz`、`GET /readyz` | 存活与就绪探针（含数据库连通性） |
 | 数据面 | `POST /webhook/{platform}` | `dingtalk` / `wecom` / `feishu` |
+| | `POST /webhook/github/{token}` | GitHub Webhook，校验 `X-Hub-Signature-256` |
 | 认证 | `GET /api/auth/providers` | 注册开关、可用登录方式与邮件验证码开关（公开） |
 | | `POST /api/auth/login`、`/logout`、`/register` | 邮箱密码登录、退出、邀请码注册（配置 SMTP 后需邮箱验证码） |
 | | `POST /api/auth/email-code`、`/password/reset` | 发送注册/找回密码验证码、用验证码重置密码 |
@@ -269,7 +273,7 @@ npm run dev
 uv run pytest
 ```
 
-测试使用临时 SQLite，覆盖适配器、渲染、频控、QQ 客户端、鉴权、用户隔离、Webhook 数据面、推送日志、系统设置与邮箱验证码。
+测试使用临时 SQLite，覆盖适配器（含 GitHub 事件与签名校验）、渲染、频控、QQ 客户端、鉴权、用户隔离、Webhook 数据面、推送日志、系统设置与邮箱验证码。
 
 ## 目录结构
 
@@ -279,7 +283,7 @@ uv run pytest
 ├── server/                 FastAPI 后端
 │   ├── api/                路由：auth / admin / webhook / health
 │   ├── auth/               会话、密码、OAuth2、WebAuthn
-│   ├── adapters/           钉钉 / 企业微信 / 飞书消息解析
+│   ├── adapters/           钉钉 / 企业微信 / 飞书 / GitHub 消息解析
 │   ├── services/           QQ 客户端、频控、审计
 │   └── db/                 模型、会话、加密、启动引导
 ├── web/                    Next.js 控制台
@@ -298,7 +302,7 @@ uv run pytest
 - 使用 HTTPS，并在「系统设置」中开启 Cookie 仅限 HTTPS、填写真实对外地址，保证 OAuth 回调与 Webhook 地址正确。
 - 只有在提供方确实验证过邮箱归属时才开启 OAuth2 提供方的「信任邮箱」，否则同邮箱的本地账号可能被冒名登录接管。
 - 不要将 MySQL 端口暴露到公网（compose 未映射 3306）。
-- Webhook token 具有推送权限，泄露后请在「机器人 → 通道」中立即轮换。
+- Webhook token 具有推送权限，泄露后请在「机器人 → 通道」中立即轮换。GitHub 通道的 URL token 与 Secret 相互独立：token 泄露不足以伪造投递，但仍应同时轮换并同步更新 GitHub 配置。
 - 邀请码按需签发并限定邮箱与有效期，注册入口用完即关。
 - 登录失败限速按 (来源地址, 账号) 计数：后端只经本机反代访问、拿不到真实客户端地址时，来源维度不可用，退化为按账号计数，可用 `LOGIN_MAX_FAILURES` / `LOGIN_WINDOW_SECONDS` 调整。
 
@@ -307,7 +311,8 @@ uv run pytest
 - 附件（图片 / 文件 / 语音）不会下发到 QQ：需要先调用 QQ 富媒体上传接口，当前未实现。
 - 飞书新版 schema 2.0 卡片的 `card.body.elements` 未解析（旧版 `card.elements` 正常）。
 - 钉钉 `audio` / `file` / `picture` 类型未支持。
-- 入站使用自建 token（`X-Webhook-Token` 或 `Authorization: Bearer`），不校验平台签名（钉钉 sign、飞书 sign / verification token）；适合由用户侧将平台格式请求转发到本服务。
+- 除 GitHub 外，入站使用自建 token（`X-Webhook-Token` 或 `Authorization: Bearer`），不校验平台签名（钉钉 sign、飞书 sign / verification token）；适合由用户侧将平台格式请求转发到本服务。
+- GitHub 通道仅接受 `application/json` 投递，且不支持在「推送调试」页构造事件；调试请直接使用 GitHub 的 Webhook 测试投递。
 - 真实 QQ 推送与 OAuth2 第三方登录需要有效凭据，自动化测试仅覆盖到打桩层。
 
 ## 社区支持
