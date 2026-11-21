@@ -44,6 +44,13 @@ class AuthenticationResult:
     backed_up: bool
 
 
+def _device_type(value: object | None) -> str | None:
+    """webauthn 返回的枚举取 value（如 single_device），避免 str(Enum) 超出库字段长度。"""
+    if value is None:
+        return None
+    return str(getattr(value, "value", value))
+
+
 def b64url_encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
@@ -95,7 +102,7 @@ def verify_registration(
         public_key=verified.credential_public_key,
         sign_count=verified.sign_count,
         aaguid=str(verified.aaguid),
-        device_type=str(verified.credential_device_type) if verified.credential_device_type else None,
+        device_type=_device_type(verified.credential_device_type),
         backed_up=bool(verified.credential_backed_up),
     )
 
@@ -119,7 +126,7 @@ def verify_authentication(
     )
     return AuthenticationResult(
         new_sign_count=verified.new_sign_count,
-        device_type=str(verified.credential_device_type) if verified.credential_device_type else None,
+        device_type=_device_type(verified.credential_device_type),
         backed_up=bool(verified.credential_backed_up),
     )
 

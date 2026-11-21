@@ -242,3 +242,42 @@ def test_invite_max_uses_never_exceeded(admin: TestClient, db_path) -> None:
         ).fetchone()[0]
     assert used == 1
     assert users == 1
+
+
+def test_passkey_register_stores_device_type_value(
+    admin: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from webauthn.helpers.structs import CredentialDeviceType
+
+    import server.auth.passkey as passkey_flow
+
+    def fake_verify_registration(**_kwargs):
+        return SimpleNamespace(
+            credential_id=b"cred-1",
+            credential_public_key=b"public-key",
+            sign_count=0,
+            aaguid="00000000-0000-0000-0000-000000000000",
+            credential_device_type=CredentialDeviceType.SINGLE_DEVICE,
+            credential_backed_up=False,
+        )
+
+    monkeypatch.setattr(
+        passkey_flow, "verify_registration_response", fake_verify_registration
+    )
+
+    begin = admin.post("/api/auth/passkey/register/begin")
+    assert begin.status_code == 200, begin.text
+
+    finish = admin.post(
+        "/api/auth/passkey/register/finish",
+        json={"credential": {"id": "cred-1", "response": {"transports": ["internal"]}}},
+    )
+    assert finish.status_code == 200, finish.text
+
+    rows = admin.get("/api/auth/passkey").json()
+    assert len(rows) == 1
+    # webauthn 3.x 的枚举 str() 是 "CredentialDeviceType.SINGLE_DEVICE"，超出库内 32 字符
+    assert rows[0]["device_type"] == "single_device"
+    assert len(rows[0]["device_type"]) <= 32
