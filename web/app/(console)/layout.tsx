@@ -88,8 +88,8 @@ export default function ConsoleLayout({ children }: { children: ReactNode }) {
 
   return (
     <MeProvider me={me} refresh={load}>
-      <div className="flex min-h-screen flex-col lg:flex-row">
-        <aside className="flex shrink-0 flex-col gap-4 border-b bg-sidebar px-4 py-4 text-sidebar-foreground lg:w-60 lg:border-r lg:border-b-0 lg:px-3 lg:py-6">
+      <div className="flex min-h-screen flex-col lg:h-dvh lg:min-h-0 lg:flex-row lg:overflow-hidden">
+        <aside className="flex shrink-0 flex-col gap-4 border-b bg-sidebar px-4 py-4 text-sidebar-foreground lg:h-full lg:w-60 lg:overflow-y-auto lg:border-r lg:border-b-0 lg:px-3 lg:py-6">
           <div className="flex items-start justify-between gap-2 px-2">
             <div className="min-w-0">
               <p className="font-heading text-base leading-snug font-medium tracking-tight">QBotMessager</p>
@@ -134,7 +134,7 @@ export default function ConsoleLayout({ children }: { children: ReactNode }) {
           </div>
         </aside>
 
-        <main className="min-w-0 flex-1 px-4 py-6 lg:px-8 lg:py-8">
+        <main className="min-w-0 flex-1 px-4 py-6 lg:overflow-y-auto lg:px-8 lg:py-8">
           <div className="mx-auto w-full max-w-[1400px]">{children}</div>
         </main>
       </div>
