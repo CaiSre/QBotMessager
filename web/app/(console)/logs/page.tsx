@@ -20,6 +20,15 @@ import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
+  Pagination,
+  PaginationContent,
+  PaginationEllipsis,
+  PaginationItem,
+  PaginationLink,
+  PaginationNext,
+  PaginationPrevious,
+} from "@/components/ui/pagination";
+import {
   Select,
   SelectContent,
   SelectGroup,
@@ -101,6 +110,19 @@ const STATUS_VARIANTS: Record<string, "default" | "destructive" | "secondary" | 
   partial: "secondary",
 };
 
+/** 最多 7 个页码位，超出部分用省略号折叠。 */
+function pageWindow(current: number, total: number): (number | "gap-start" | "gap-end")[] {
+  if (total <= 7) return Array.from({ length: total }, (_, index) => index + 1);
+  const start = Math.max(2, Math.min(current - 1, total - 3));
+  const end = Math.min(total - 1, Math.max(current + 1, 4));
+  const items: (number | "gap-start" | "gap-end")[] = [1];
+  if (start > 2) items.push("gap-start");
+  for (let value = start; value <= end; value += 1) items.push(value);
+  if (end < total - 1) items.push("gap-end");
+  items.push(total);
+  return items;
+}
+
 export default function LogsPage() {
   const me = useMe();
   const superAdmin = isSuperAdmin(me.role);
@@ -122,18 +144,24 @@ export default function LogsPage() {
   const { data, error, loading } = useApi<LogPage>(query);
 
   const totalPages = data ? Math.max(1, Math.ceil(data.total / data.page_size)) : 1;
+  const currentPage = data?.page ?? page;
 
   function applyFilters() {
     setAppliedKeyword(keyword.trim());
     setPage(1);
   }
 
+  function goTo(next: number) {
+    if (next < 1 || next > totalPages || next === page) return;
+    setPage(next);
+  }
+
   return (
-    <div>
+    <div className="flex flex-col lg:h-[calc(100dvh-4rem)]">
       <PageHeader title="推送日志" description="记录每一次 Webhook 转换与 QQ 推送的结果" />
       <ErrorAlert message={error} />
 
-      <Card className="mb-4" size="sm">
+      <Card className="mb-4 shrink-0" size="sm">
         <CardContent>
           <div className="flex flex-row flex-wrap items-end gap-4">
             <div className="w-44">
@@ -179,88 +207,125 @@ export default function LogsPage() {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader>
+      <Card className="min-h-[24rem] flex-1">
+        <CardHeader className="shrink-0">
           <CardTitle>记录</CardTitle>
         </CardHeader>
-        <CardContent>
-          {loading && !data ? (
-            <p className="py-6 text-sm text-muted-foreground">加载中…</p>
-          ) : null}
-          {data && data.items.length === 0 ? <EmptyHint>没有符合条件的日志</EmptyHint> : null}
-          {data && data.items.length > 0 ? (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>时间</TableHead>
-                  {superAdmin ? <TableHead>所属用户</TableHead> : null}
-                  <TableHead>平台</TableHead>
-                  <TableHead>状态</TableHead>
-                  <TableHead>目标</TableHead>
-                  <TableHead>内容</TableHead>
-                  <TableHead>耗时</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.items.map((row) => (
-                  <TableRow key={row.id}>
-                    <TableCell>{formatDateTime(row.created_at)}</TableCell>
-                    {superAdmin ? (
-                      <TableCell>
-                        <span className="text-xs">{row.owner_email ?? "—"}</span>
-                      </TableCell>
-                    ) : null}
-                    <TableCell>
-                      {PLATFORM_LABELS[row.platform as Platform] ?? row.platform}
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant={STATUS_VARIANTS[row.status] ?? "outline"}>
-                        {STATUS_LABELS[row.status] ?? row.status}
-                      </Badge>
-                    </TableCell>
-                    <TableCell>{row.target ?? "—"}</TableCell>
-                    <TableCell>
-                      <Button
-                        className="block h-auto max-w-80 justify-start truncate p-0 text-left"
-                        size="xs"
-                        type="button"
-                        variant="link"
-                        onClick={() => setDetail(row)}
-                      >
-                        {truncate(row.content_preview, 50)}
-                      </Button>
-                    </TableCell>
-                    <TableCell>
-                      {row.duration_ms != null ? `${row.duration_ms} ms` : "—"}
-                    </TableCell>
+        <CardContent className="flex min-h-0 flex-1 flex-col">
+          <div className="min-h-0 flex-1 overflow-auto max-lg:max-h-[60dvh]">
+            {loading && !data ? (
+              <p className="py-6 text-sm text-muted-foreground">加载中…</p>
+            ) : null}
+            {data && data.items.length === 0 ? (
+              <EmptyHint>没有符合条件的日志</EmptyHint>
+            ) : null}
+            {data && data.items.length > 0 ? (
+              <Table containerClassName="overflow-visible">
+                <TableHeader className="sticky top-0 z-10 bg-card">
+                  <TableRow>
+                    <TableHead>时间</TableHead>
+                    {superAdmin ? <TableHead>所属用户</TableHead> : null}
+                    <TableHead>平台</TableHead>
+                    <TableHead>状态</TableHead>
+                    <TableHead>目标</TableHead>
+                    <TableHead>内容</TableHead>
+                    <TableHead>耗时</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          ) : null}
+                </TableHeader>
+                <TableBody>
+                  {data.items.map((row) => (
+                    <TableRow key={row.id}>
+                      <TableCell>{formatDateTime(row.created_at)}</TableCell>
+                      {superAdmin ? (
+                        <TableCell>
+                          <span className="text-xs">{row.owner_email ?? "—"}</span>
+                        </TableCell>
+                      ) : null}
+                      <TableCell>
+                        {PLATFORM_LABELS[row.platform as Platform] ?? row.platform}
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant={STATUS_VARIANTS[row.status] ?? "outline"}>
+                          {STATUS_LABELS[row.status] ?? row.status}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>{row.target ?? "—"}</TableCell>
+                      <TableCell>
+                        <Button
+                          className="block h-auto max-w-80 justify-start truncate p-0 text-left"
+                          size="xs"
+                          type="button"
+                          variant="link"
+                          onClick={() => setDetail(row)}
+                        >
+                          {truncate(row.content_preview, 50)}
+                        </Button>
+                      </TableCell>
+                      <TableCell>
+                        {row.duration_ms != null ? `${row.duration_ms} ms` : "—"}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            ) : null}
+          </div>
 
-          <div className="mt-4 flex items-center justify-between">
+          <div className="mt-4 flex shrink-0 flex-wrap items-center justify-between gap-3">
             <p className="text-sm text-muted-foreground">
-              共 {data?.total ?? 0} 条 · 第 {data?.page ?? page} / {totalPages} 页
+              共 {data?.total ?? 0} 条 · 第 {currentPage} / {totalPages} 页
             </p>
-            <div className="flex gap-2">
-              <Button
-                disabled={page <= 1}
-                size="sm"
-                variant="outline"
-                onClick={() => setPage((value) => Math.max(1, value - 1))}
-              >
-                上一页
-              </Button>
-              <Button
-                disabled={page >= totalPages}
-                size="sm"
-                variant="outline"
-                onClick={() => setPage((value) => Math.min(totalPages, value + 1))}
-              >
-                下一页
-              </Button>
-            </div>
+            <Pagination className="mx-0 w-auto">
+              <PaginationContent>
+                <PaginationItem>
+                  <PaginationPrevious
+                    aria-disabled={page <= 1}
+                    aria-label="上一页"
+                    className={page <= 1 ? "pointer-events-none opacity-50" : undefined}
+                    href="#"
+                    text="上一页"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      goTo(page - 1);
+                    }}
+                  />
+                </PaginationItem>
+                {pageWindow(currentPage, totalPages).map((item) =>
+                  typeof item === "number" ? (
+                    <PaginationItem key={item}>
+                      <PaginationLink
+                        aria-label={`第 ${item} 页`}
+                        href="#"
+                        isActive={item === currentPage}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          goTo(item);
+                        }}
+                      >
+                        {item}
+                      </PaginationLink>
+                    </PaginationItem>
+                  ) : (
+                    <PaginationItem key={item}>
+                      <PaginationEllipsis />
+                    </PaginationItem>
+                  ),
+                )}
+                <PaginationItem>
+                  <PaginationNext
+                    aria-disabled={page >= totalPages}
+                    aria-label="下一页"
+                    className={page >= totalPages ? "pointer-events-none opacity-50" : undefined}
+                    href="#"
+                    text="下一页"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      goTo(page + 1);
+                    }}
+                  />
+                </PaginationItem>
+              </PaginationContent>
+            </Pagination>
           </div>
         </CardContent>
       </Card>
