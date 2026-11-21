@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -65,6 +65,24 @@ export default function SettingsPage() {
     setDraft(next);
   }, [settings.data]);
 
+  const timezoneItems = useMemo(() => {
+    const supported = (
+      Intl as { supportedValuesOf?: (key: string) => string[] }
+    ).supportedValuesOf?.("timeZone");
+    const extras = Array.from(
+      new Set([...(supported ?? []), ...TIMEZONE_SUGGESTIONS]),
+    )
+      .filter((zone) => !TIMEZONE_SUGGESTIONS.includes(zone))
+      .sort();
+    const names = [...TIMEZONE_SUGGESTIONS, ...extras];
+    const current = String(draft.timezone ?? "").trim();
+    if (current && !names.includes(current)) names.unshift(current);
+    return [
+      { value: "", label: "跟随容器 TZ" },
+      ...names.map((zone) => ({ value: zone, label: zone })),
+    ];
+  }, [draft.timezone]);
+
   function update(key: string, value: string | number | boolean) {
     setDraft((previous) => ({ ...previous, [key]: value }));
   }
@@ -124,7 +142,26 @@ export default function SettingsPage() {
     return (
       <Field key={item.key} className="gap-2">
         <FieldLabel htmlFor={`setting-${item.key}`}>{item.label}</FieldLabel>
-        {item.kind === "select" ? (
+        {item.key === "timezone" ? (
+          <Select
+            items={timezoneItems}
+            value={String(value ?? "")}
+            onValueChange={(next) => update(item.key, String(next))}
+          >
+            <SelectTrigger className="w-full" id={`setting-${item.key}`}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent alignItemWithTrigger={false}>
+              <SelectGroup>
+                {timezoneItems.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+        ) : item.kind === "select" ? (
           <Select
             items={item.options.map((option) => ({ value: option, label: option }))}
             value={String(value ?? "")}
@@ -146,7 +183,6 @@ export default function SettingsPage() {
         ) : (
           <Input
             id={`setting-${item.key}`}
-            list={item.key === "timezone" ? "settings-timezone" : undefined}
             max={item.maximum ?? undefined}
             min={item.minimum ?? undefined}
             placeholder={
@@ -194,9 +230,9 @@ export default function SettingsPage() {
           {settings.loading ? "正在读取系统设置…" : "暂无设置数据"}
         </p>
       ) : (
-        <div className="grid items-start gap-4 xl:grid-cols-2">
+        <div className="columns-1 gap-4 xl:columns-2">
           {settings.data.groups.map((group) => (
-            <Card key={group.name} size="sm">
+            <Card key={group.name} size="sm" className="mb-4 break-inside-avoid">
               <CardHeader>
                 <CardTitle>{group.name}</CardTitle>
                 <CardDescription>
@@ -212,12 +248,6 @@ export default function SettingsPage() {
           ))}
         </div>
       )}
-
-      <datalist id="settings-timezone">
-        {TIMEZONE_SUGGESTIONS.map((zone) => (
-          <option key={zone} value={zone} />
-        ))}
-      </datalist>
 
       <Alert className="mt-4">
         <AlertTitle>仍由环境变量提供</AlertTitle>
