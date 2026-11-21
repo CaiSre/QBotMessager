@@ -160,6 +160,28 @@ def test_rejects_bad_token_platform_and_body(admin: TestClient, qq: StubQqClient
     assert qq.calls == []
 
 
+def test_authorization_bearer_token_accepted(
+    admin: TestClient, qq: StubQqClient
+) -> None:
+    bot_id = create_bot(admin, openids=["u-bearer"])
+    channel = create_channel(admin, bot_id, "dingtalk")
+
+    response = admin.post(
+        "/webhook/dingtalk",
+        json={"msgtype": "text", "text": {"content": "bearer"}},
+        headers={"Authorization": f"Bearer {channel['webhook_token']}"},
+    )
+    assert response.status_code == 200
+    assert len(qq.calls) == 1
+
+    wrong_scheme = admin.post(
+        "/webhook/dingtalk",
+        json={"msgtype": "text", "text": {"content": "basic"}},
+        headers={"Authorization": f"Basic {channel['webhook_token']}"},
+    )
+    assert wrong_scheme.status_code == 401
+
+
 def test_missing_target_returns_400(admin: TestClient, qq: StubQqClient) -> None:
     bot_id = create_bot(admin)
     channel = create_channel(admin, bot_id, "dingtalk")

@@ -46,7 +46,14 @@ async def receive_webhook(platform: str, request: Request) -> JSONResponse:
     if len(raw) > settings.max_body_bytes:
         return _json(platform, 413, errcode=413, errmsg="请求体过大")
 
-    token = request.headers.get("X-Webhook-Token") or request.query_params.get("token") or ""
+    scheme, _, credentials = request.headers.get("Authorization", "").partition(" ")
+    bearer = credentials.strip() if scheme.lower() == "bearer" else ""
+    token = (
+        request.headers.get("X-Webhook-Token")
+        or bearer
+        or request.query_params.get("token")
+        or ""
+    )
     if not token:
         return _json(platform, 401, errcode=401, errmsg="缺少 webhook token")
 

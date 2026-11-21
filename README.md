@@ -5,7 +5,7 @@
 [![Next.js](https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white)](https://nextjs.org/)
 [![MySQL](https://img.shields.io/badge/MySQL-8.4-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/compose/)
-[![Tests](https://img.shields.io/badge/tests-44%20passed-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-45%20passed-brightgreen)](#测试)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue)](https://www.gnu.org/licenses/agpl-3.0)
 
 > 接收钉钉、企业微信、飞书的 Webhook，统一转换为 QQ 机器人消息并推送；内置多用户控制台，按用户隔离机器人配置与推送日志。
@@ -178,7 +178,7 @@ docker compose up -d --build
 
 ### 发送 Webhook
 
-按对应平台的原始格式 POST，鉴权使用 `X-Webhook-Token` 请求头（或 `?token=` 查询参数）：
+按对应平台的原始格式 POST，鉴权支持三种方式（优先级从高到低）：`X-Webhook-Token` 请求头、`Authorization: Bearer <token>` 请求头、`?token=` 查询参数：
 
 ```bash
 curl -X POST http://localhost:3000/webhook/dingtalk \
