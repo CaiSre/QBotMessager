@@ -265,39 +265,43 @@ export default function LogsPage() {
       </Card>
 
       <Dialog open={detail !== null} onOpenChange={(open) => !open && setDetail(null)}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent className="grid-cols-[minmax(0,1fr)] sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>推送详情 #{detail?.id}</DialogTitle>
           </DialogHeader>
           {detail ? (
-            <dl className="grid grid-cols-[7rem_1fr] gap-y-3 text-sm">
-              <dt className="text-muted-foreground">时间</dt>
-              <dd>{formatDateTime(detail.created_at)}</dd>
-              <dt className="text-muted-foreground">平台</dt>
-              <dd>{PLATFORM_LABELS[detail.platform] ?? detail.platform}</dd>
-              <dt className="text-muted-foreground">来源类型</dt>
-              <dd>{detail.source_msgtype ?? "—"}</dd>
-              <dt className="text-muted-foreground">状态</dt>
-              <dd>{STATUS_LABELS[detail.status] ?? detail.status}</dd>
-              <dt className="text-muted-foreground">接收目标</dt>
-              <dd className="break-all">{detail.target ?? "—"}</dd>
-              <dt className="text-muted-foreground">QQ msg_type</dt>
-              <dd>{detail.qq_msg_type ?? "—"}</dd>
-              <dt className="text-muted-foreground">内容长度</dt>
-              <dd>{detail.content_len ?? "—"}</dd>
-              <dt className="text-muted-foreground">耗时</dt>
-              <dd>{detail.duration_ms != null ? `${detail.duration_ms} ms` : "—"}</dd>
-              <dt className="text-muted-foreground">错误码</dt>
-              <dd>{detail.error_code ?? "—"}</dd>
-              <dt className="text-muted-foreground">错误信息</dt>
-              <dd className="break-all">{detail.error_message ?? "—"}</dd>
-              <dt className="text-muted-foreground">请求 ID</dt>
-              <dd className="break-all text-xs">{detail.request_id ?? "—"}</dd>
-              <dt className="text-muted-foreground">内容预览</dt>
-              <dd className="whitespace-pre-wrap break-words text-xs">
-                {detail.content_preview ?? "—"}
-              </dd>
-            </dl>
+            <>
+              <dl className="grid grid-cols-[7rem_minmax(0,1fr)] gap-y-3 text-sm">
+                <dt className="text-muted-foreground">时间</dt>
+                <dd>{formatDateTime(detail.created_at)}</dd>
+                <dt className="text-muted-foreground">平台</dt>
+                <dd>{PLATFORM_LABELS[detail.platform] ?? detail.platform}</dd>
+                <dt className="text-muted-foreground">来源类型</dt>
+                <dd>{detail.source_msgtype ?? "—"}</dd>
+                <dt className="text-muted-foreground">状态</dt>
+                <dd>{STATUS_LABELS[detail.status] ?? detail.status}</dd>
+                <dt className="text-muted-foreground">接收目标</dt>
+                <dd className="break-all">{detail.target ?? "—"}</dd>
+                <dt className="text-muted-foreground">QQ msg_type</dt>
+                <dd>{detail.qq_msg_type ?? "—"}</dd>
+                <dt className="text-muted-foreground">内容长度</dt>
+                <dd>{detail.content_len ?? "—"}</dd>
+                <dt className="text-muted-foreground">耗时</dt>
+                <dd>{detail.duration_ms != null ? `${detail.duration_ms} ms` : "—"}</dd>
+                <dt className="text-muted-foreground">错误码</dt>
+                <dd>{detail.error_code ?? "—"}</dd>
+                <dt className="text-muted-foreground">错误信息</dt>
+                <dd className="break-all">{detail.error_message ?? "—"}</dd>
+                <dt className="text-muted-foreground">请求 ID</dt>
+                <dd className="break-all text-xs">{detail.request_id ?? "—"}</dd>
+              </dl>
+              <Field className="min-w-0 gap-2">
+                <FieldLabel>内容预览</FieldLabel>
+                <div className="max-h-64 overflow-y-auto rounded-2xl border bg-muted/20 p-3 text-xs whitespace-pre-wrap wrap-anywhere">
+                  {detail.content_preview ?? "—"}
+                </div>
+              </Field>
+            </>
           ) : null}
         </DialogContent>
       </Dialog>
