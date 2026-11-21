@@ -1,0 +1,1084 @@
+"""中台管理接口（需登录；普通用户仅限自己的资源，超级管理员可见全部）。"""
+
+from __future__ import annotations
+
+import secrets
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import BaseModel, Field
+from sqlalchemy import Select, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from server.auth.deps import current_user, is_super_admin, require_super_admin
+from server.auth.oauth import GITHUB_PRESET
+from server.auth.passwords import hash_password
+from server.config import Settings
+from server.db.crypto import decrypt_secret, encrypt_secret, mask_secret
+from server.db.models import (
+    PLATFORMS,
+    ROLE_SUPER_ADMIN,
+    ROLE_USER,
+    ROLES,
+    STATUS_ACTIVE,
+    STATUS_DISABLED,
+    BotProfile,
+    Channel,
+    EnvConfig,
+    InviteCode,
+    OAuthProvider,
+    PushLog,
+    SystemSetting,
+    User,
+)
+from server.db.session import get_session
+from server.services.audit import record_audit
+
+router = APIRouter(prefix="/api/admin")
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _client_ip(request: Request) -> str | None:
+    return request.client.host if request.client else None
+
+
+def generate_token() -> str:
+    return secrets.token_urlsafe(24)
+
+
+# ------------------------------------------------------------------- 机器人配置
+
+
+@router.get("/bot-profiles")
+async def list_bots(
+    user: User = Depends(current_user), db: AsyncSession = Depends(get_session)
+) -> list[dict]:
+    stmt = select(BotProfile, User.email).join(User, BotProfile.owner_user_id == User.id)
+    if not is_super_admin(user):
+        stmt = stmt.where(BotProfile.owner_user_id == user.id)
+    rows = (await db.execute(stmt.order_by(BotProfile.id))).all()
+    return [
+        {
+            "id": row.id,
+            "owner_user_id": row.owner_user_id,
+            "owner_email": owner_email,
+            "name": row.name,
+            "qq_appid": row.qq_appid,
+            "qq_app_secret_masked": mask_secret(row.qq_app_secret),
+            "has_secret": bool(row.qq_app_secret),
+            "qq_host": row.qq_host,
+            "default_openids": row.default_openids or [],
+            "default_group_openid": row.default_group_openid,
+            "enabled": row.enabled,
+        }
+        for row, owner_email in rows
+    ]
+
+
+class BotIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    qq_appid: str = Field(min_length=1, max_length=128)
+    qq_app_secret: str = Field(min_length=1, max_length=512)
+    qq_host: str = "https://api.bot.qq.com"
+    default_openids: list[str] = Field(default_factory=list)
+    default_group_openid: str | None = None
+    enabled: bool = True
+
+
+class BotPatch(BaseModel):
+    name: str | None = Field(default=None, max_length=128)
+    qq_appid: str | None = Field(default=None, max_length=128)
+    qq_app_secret: str | None = Field(default=None, max_length=512)
+    qq_host: str | None = None
+    default_openids: list[str] | None = None
+    default_group_openid: str | None = None
+    enabled: bool | None = None
+
+
+@router.post("/bot-profiles", status_code=status.HTTP_201_CREATED)
+async def create_bot(
+    data: BotIn,
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    settings: Settings = request.app.state.settings
+    bot = BotProfile(
+        owner_user_id=user.id,
+        name=data.name,
+        qq_appid=data.qq_appid,
+        qq_app_secret=encrypt_secret(data.qq_app_secret, settings.app_secret_key),
+        qq_host=data.qq_host,
+        default_openids=data.default_openids,
+        default_group_openid=data.default_group_openid or None,
+        enabled=data.enabled,
+    )
+    db.add(bot)
+    await db.flush()
+    await record_audit(
+        db,
+        actor=user,
+        action="bot.create",
+        target_type="bot_profile",
+        target_id=bot.id,
+        detail={"name": bot.name, "appid": bot.qq_appid},
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"id": bot.id}
+
+
+async def _get_owned_bot(db: AsyncSession, user: User, bot_id: int) -> BotProfile:
+    bot = await db.get(BotProfile, bot_id)
+    if bot is None or (bot.owner_user_id != user.id and not is_super_admin(user)):
+        raise HTTPException(status_code=404, detail="机器人配置不存在")
+    return bot
+
+
+@router.patch("/bot-profiles/{bot_id}")
+async def patch_bot(
+    bot_id: int,
+    data: BotPatch,
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    settings: Settings = request.app.state.settings
+    bot = await _get_owned_bot(db, user, bot_id)
+    payload = data.model_dump(exclude_unset=True)
+    if "qq_app_secret" in payload and payload["qq_app_secret"]:
+        payload["qq_app_secret"] = encrypt_secret(payload["qq_app_secret"], settings.app_secret_key)
+    for key, value in payload.items():
+        if key == "default_group_openid":
+            value = value or None
+        setattr(bot, key, value)
+    await record_audit(
+        db,
+        actor=user,
+        action="bot.update",
+        target_type="bot_profile",
+        target_id=bot.id,
+        detail={"fields": sorted(k for k in payload if k != "qq_app_secret")},
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"id": bot.id}
+
+
+@router.delete("/bot-profiles/{bot_id}")
+async def delete_bot(
+    bot_id: int,
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    bot = await _get_owned_bot(db, user, bot_id)
+    channels = (
+        (await db.execute(select(Channel).where(Channel.bot_profile_id == bot.id)))
+        .scalars()
+        .all()
+    )
+    for channel in channels:
+        await db.delete(channel)
+    await db.delete(bot)
+    await record_audit(
+        db,
+        actor=user,
+        action="bot.delete",
+        target_type="bot_profile",
+        target_id=bot_id,
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------------- 通道
+
+
+def _webhook_path(platform: str) -> str:
+    return f"/webhook/{platform}"
+
+
+async def _get_owned_channel(db: AsyncSession, user: User, channel_id: int) -> Channel:
+    channel = await db.get(Channel, channel_id)
+    bot = await db.get(BotProfile, channel.bot_profile_id) if channel is not None else None
+    if channel is None or bot is None or (
+        bot.owner_user_id != user.id and not is_super_admin(user)
+    ):
+        raise HTTPException(status_code=404, detail="通道不存在")
+    return channel
+
+
+@router.get("/channels")
+async def list_channels(
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> list[dict]:
+    settings: Settings = request.app.state.settings
+    base = settings.public_base_url.rstrip("/") if settings.public_base_url else str(request.base_url).rstrip("/")
+    stmt = (
+        select(Channel, User.id, User.email)
+        .join(BotProfile, Channel.bot_profile_id == BotProfile.id)
+        .join(User, BotProfile.owner_user_id == User.id)
+    )
+    if not is_super_admin(user):
+        stmt = stmt.where(BotProfile.owner_user_id == user.id)
+    rows = (await db.execute(stmt.order_by(Channel.id))).all()
+    return [
+        {
+            "id": row.id,
+            "owner_user_id": owner_user_id,
+            "owner_email": owner_email,
+            "platform": row.platform,
+            "bot_profile_id": row.bot_profile_id,
+            "webhook_token": row.webhook_token,
+            "webhook_url": f"{base}{_webhook_path(row.platform)}",
+            "enabled": row.enabled,
+        }
+        for row, owner_user_id, owner_email in rows
+    ]
+
+
+class ChannelIn(BaseModel):
+    platform: str
+    bot_profile_id: int
+    enabled: bool = True
+
+
+@router.post("/channels", status_code=status.HTTP_201_CREATED)
+async def create_channel(
+    data: ChannelIn,
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    if data.platform not in PLATFORMS:
+        raise HTTPException(status_code=400, detail="平台不受支持")
+    await _get_owned_bot(db, user, data.bot_profile_id)
+    channel = Channel(
+        bot_profile_id=data.bot_profile_id,
+        platform=data.platform,
+        webhook_token=generate_token(),
+        enabled=data.enabled,
+    )
+    db.add(channel)
+    await db.flush()
+    await record_audit(
+        db,
+        actor=user,
+        action="channel.create",
+        target_type="channel",
+        target_id=channel.id,
+        detail={"platform": channel.platform},
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"id": channel.id, "webhook_token": channel.webhook_token}
+
+
+class ChannelPatch(BaseModel):
+    enabled: bool | None = None
+    bot_profile_id: int | None = None
+
+
+@router.patch("/channels/{channel_id}")
+async def patch_channel(
+    channel_id: int,
+    data: ChannelPatch,
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    channel = await _get_owned_channel(db, user, channel_id)
+    if data.bot_profile_id is not None:
+        await _get_owned_bot(db, user, data.bot_profile_id)
+        channel.bot_profile_id = data.bot_profile_id
+    if data.enabled is not None:
+        channel.enabled = data.enabled
+    await record_audit(
+        db,
+        actor=user,
+        action="channel.update",
+        target_type="channel",
+        target_id=channel.id,
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"id": channel.id, "enabled": channel.enabled}
+
+
+@router.post("/channels/{channel_id}/rotate")
+async def rotate_channel_token(
+    channel_id: int,
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    channel = await _get_owned_channel(db, user, channel_id)
+    channel.webhook_token = generate_token()
+    await record_audit(
+        db,
+        actor=user,
+        action="channel.rotate_token",
+        target_type="channel",
+        target_id=channel.id,
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"id": channel.id, "webhook_token": channel.webhook_token}
+
+
+@router.delete("/channels/{channel_id}")
+async def delete_channel(
+    channel_id: int,
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    channel = await _get_owned_channel(db, user, channel_id)
+    await db.delete(channel)
+    await record_audit(
+        db,
+        actor=user,
+        action="channel.delete",
+        target_type="channel",
+        target_id=channel_id,
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------------- 日志
+
+
+@router.get("/logs")
+async def list_logs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    platform: str | None = None,
+    status_filter: str | None = Query(None, alias="status"),
+    keyword: str | None = None,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    conditions = [] if is_super_admin(user) else [PushLog.owner_user_id == user.id]
+    if platform:
+        conditions.append(PushLog.platform == platform)
+    if status_filter:
+        conditions.append(PushLog.status == status_filter)
+    if keyword:
+        conditions.append(PushLog.content_preview.contains(keyword))
+
+    total = (
+        await db.execute(select(func.count()).select_from(PushLog).where(*conditions))
+    ).scalar_one()
+    rows = (
+        await db.execute(
+            select(PushLog, User.email)
+            .join(User, PushLog.owner_user_id == User.id)
+            .where(*conditions)
+            .order_by(PushLog.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    ).all()
+    return {
+        "total": int(total),
+        "page": page,
+        "page_size": page_size,
+        "items": [
+            {
+                "id": row.id,
+                "owner_user_id": row.owner_user_id,
+                "owner_email": owner_email,
+                "platform": row.platform,
+                "source_msgtype": row.source_msgtype,
+                "target": row.target,
+                "qq_msg_type": row.qq_msg_type,
+                "content_preview": row.content_preview,
+                "content_len": row.content_len,
+                "status": row.status,
+                "error_code": row.error_code,
+                "error_message": row.error_message,
+                "duration_ms": row.duration_ms,
+                "request_id": row.request_id,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row, owner_email in rows
+        ],
+    }
+
+
+@router.get("/logs/{log_id}")
+async def get_log(
+    log_id: int,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    row = await db.get(PushLog, log_id)
+    if row is None or (row.owner_user_id != user.id and not is_super_admin(user)):
+        raise HTTPException(status_code=404, detail="日志不存在")
+    owner = await db.get(User, row.owner_user_id)
+    return {
+        "id": row.id,
+        "owner_user_id": row.owner_user_id,
+        "owner_email": owner.email if owner else None,
+        "platform": row.platform,
+        "source_msgtype": row.source_msgtype,
+        "target": row.target,
+        "qq_msg_type": row.qq_msg_type,
+        "content_preview": row.content_preview,
+        "content_len": row.content_len,
+        "status": row.status,
+        "error_code": row.error_code,
+        "error_message": row.error_message,
+        "duration_ms": row.duration_ms,
+        "request_id": row.request_id,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+# ------------------------------------------------------------------- 环境配置
+
+
+@router.get("/env-configs")
+async def list_env_configs(
+    user: User = Depends(current_user), db: AsyncSession = Depends(get_session)
+) -> list[dict]:
+    stmt = select(EnvConfig, User.email).join(User, EnvConfig.owner_user_id == User.id)
+    if not is_super_admin(user):
+        stmt = stmt.where(EnvConfig.owner_user_id == user.id)
+    rows = (await db.execute(stmt.order_by(EnvConfig.key))).all()
+    items = []
+    for row, owner_email in rows:
+        value = row.value if not row.is_secret else "******"
+        items.append(
+            {
+                "id": row.id,
+                "owner_user_id": row.owner_user_id,
+                "owner_email": owner_email,
+                "key": row.key,
+                "value": value,
+                "is_secret": row.is_secret,
+                "description": row.description,
+                "updated_at": row.created_at.isoformat() if row.created_at else None,
+            }
+        )
+    return items
+
+
+async def _get_owned_env(db: AsyncSession, user: User, config_id: int) -> EnvConfig:
+    row = await db.get(EnvConfig, config_id)
+    if row is None or (row.owner_user_id != user.id and not is_super_admin(user)):
+        raise HTTPException(status_code=404, detail="配置项不存在")
+    return row
+
+
+class EnvIn(BaseModel):
+    key: str = Field(min_length=1, max_length=128)
+    value: str = ""
+    is_secret: bool = False
+    description: str = Field(default="", max_length=255)
+
+
+class EnvPatch(BaseModel):
+    value: str | None = None
+    is_secret: bool | None = None
+    description: str | None = Field(default=None, max_length=255)
+
+
+@router.post("/env-configs", status_code=status.HTTP_201_CREATED)
+async def create_env_config(
+    data: EnvIn,
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    settings: Settings = request.app.state.settings
+    exists = (
+        await db.execute(
+            select(EnvConfig.id).where(
+                EnvConfig.owner_user_id == user.id, EnvConfig.key == data.key
+            )
+        )
+    ).scalar_one_or_none()
+    if exists is not None:
+        raise HTTPException(status_code=409, detail="配置项已存在")
+    row = EnvConfig(
+        owner_user_id=user.id,
+        key=data.key,
+        value=None if data.is_secret else data.value,
+        value_enc=encrypt_secret(data.value, settings.app_secret_key) if data.is_secret else None,
+        is_secret=data.is_secret,
+        description=data.description,
+        updated_by=user.id,
+    )
+    db.add(row)
+    await record_audit(
+        db,
+        actor=user,
+        action="env.create",
+        target_type="env_config",
+        target_id=data.key,
+        detail={"is_secret": data.is_secret},
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"id": row.id}
+
+
+@router.patch("/env-configs/{config_id}")
+async def patch_env_config(
+    config_id: int,
+    data: EnvPatch,
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    settings: Settings = request.app.state.settings
+    row = await _get_owned_env(db, user, config_id)
+    if data.is_secret is not None:
+        row.is_secret = data.is_secret
+        if data.is_secret:
+            plain = data.value if data.value is not None else (row.value or "")
+            row.value = None
+            row.value_enc = encrypt_secret(plain, settings.app_secret_key)
+        else:
+            if row.value_enc is not None:
+                try:
+                    row.value = decrypt_secret(row.value_enc, settings.app_secret_key)
+                except Exception:  # noqa: BLE001
+                    row.value = None
+                row.value_enc = None
+    elif data.value is not None:
+        if row.is_secret:
+            row.value_enc = encrypt_secret(data.value, settings.app_secret_key)
+        else:
+            row.value = data.value
+    if data.description is not None:
+        row.description = data.description
+    row.updated_by = user.id
+    await record_audit(
+        db,
+        actor=user,
+        action="env.update",
+        target_type="env_config",
+        target_id=row.key,
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"id": row.id}
+
+
+@router.delete("/env-configs/{config_id}")
+async def delete_env_config(
+    config_id: int,
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    row = await _get_owned_env(db, user, config_id)
+    key = row.key
+    await db.delete(row)
+    await record_audit(
+        db,
+        actor=user,
+        action="env.delete",
+        target_type="env_config",
+        target_id=key,
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------------- 用户
+
+
+@router.get("/users")
+async def list_users(
+    user: User = Depends(require_super_admin), db: AsyncSession = Depends(get_session)
+) -> list[dict]:
+    rows = (
+        (await db.execute(select(User).order_by(User.id))).scalars().all()
+    )
+    return [
+        {
+            "id": row.id,
+            "email": row.email,
+            "name": row.name,
+            "role": row.role,
+            "status": row.status,
+            "last_login_at": row.last_login_at.isoformat() if row.last_login_at else None,
+        }
+        for row in rows
+    ]
+
+
+class UserPatch(BaseModel):
+    role: str | None = None
+    status: str | None = None
+    name: str | None = Field(default=None, max_length=128)
+
+
+@router.patch("/users/{user_id}")
+async def patch_user(
+    user_id: int,
+    data: UserPatch,
+    request: Request,
+    user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    target = await db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if data.role is not None:
+        if data.role not in ROLES:
+            raise HTTPException(status_code=400, detail="角色非法")
+        if target.id == user.id and data.role != target.role:
+            raise HTTPException(status_code=400, detail="不能修改自己的角色")
+    if data.status is not None:
+        if data.status not in (STATUS_ACTIVE, STATUS_DISABLED):
+            raise HTTPException(status_code=400, detail="状态非法")
+        if target.id == user.id and data.status != target.status:
+            raise HTTPException(status_code=400, detail="不能修改自己的账号状态")
+    demoting = target.role == ROLE_SUPER_ADMIN and (
+        (data.role is not None and data.role != ROLE_SUPER_ADMIN)
+        or (data.status is not None and data.status != STATUS_ACTIVE)
+    )
+    if demoting:
+        remaining = (
+            await db.execute(
+                select(func.count())
+                .select_from(User)
+                .where(
+                    User.role == ROLE_SUPER_ADMIN,
+                    User.status == STATUS_ACTIVE,
+                    User.id != target.id,
+                )
+            )
+        ).scalar_one()
+        if remaining == 0:
+            raise HTTPException(status_code=400, detail="系统至少需要一个启用的超级管理员")
+    if data.role is not None:
+        target.role = data.role
+    if data.status is not None:
+        target.status = data.status
+    if data.name is not None:
+        target.name = data.name
+    await record_audit(
+        db,
+        actor=user,
+        action="user.update",
+        target_type="user",
+        target_id=target.id,
+        detail={"role": data.role, "status": data.status},
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"id": target.id}
+
+
+class InviteIn(BaseModel):
+    email: str | None = None
+    max_uses: int = Field(default=1, ge=1, le=100)
+    expires_in_days: int = Field(default=7, ge=1, le=365)
+
+
+@router.get("/invites")
+async def list_invites(
+    user: User = Depends(require_super_admin), db: AsyncSession = Depends(get_session)
+) -> list[dict]:
+    rows = (
+        (await db.execute(select(InviteCode).order_by(InviteCode.id.desc())))
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "code": row.code,
+            "email": row.email,
+            "max_uses": row.max_uses,
+            "used_count": row.used_count,
+            "expires_at": row.expires_at.isoformat() if row.expires_at else None,
+            "revoked": row.revoked_at is not None,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        for row in rows
+    ]
+
+
+@router.post("/invites", status_code=status.HTTP_201_CREATED)
+async def create_invite(
+    data: InviteIn,
+    request: Request,
+    user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    invite = InviteCode(
+        code=secrets.token_urlsafe(16),
+        email=data.email.lower() if data.email else None,
+        max_uses=data.max_uses,
+        expires_at=_now() + timedelta(days=data.expires_in_days),
+        created_by=user.id,
+    )
+    db.add(invite)
+    await record_audit(
+        db,
+        actor=user,
+        action="invite.create",
+        target_type="invite",
+        target_id=invite.code,
+        detail={"max_uses": data.max_uses},
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"id": invite.id, "code": invite.code, "expires_at": invite.expires_at.isoformat()}
+
+
+@router.delete("/invites/{invite_id}")
+async def revoke_invite(
+    invite_id: int,
+    request: Request,
+    user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    invite = await db.get(InviteCode, invite_id)
+    if invite is None:
+        raise HTTPException(status_code=404, detail="邀请码不存在")
+    invite.revoked_at = _now()
+    await record_audit(
+        db,
+        actor=user,
+        action="invite.revoke",
+        target_type="invite",
+        target_id=invite.id,
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------- 安全设置
+
+
+@router.get("/oauth-providers")
+async def list_oauth_providers(
+    user: User = Depends(require_super_admin), db: AsyncSession = Depends(get_session)
+) -> list[dict]:
+    rows = (
+        (await db.execute(select(OAuthProvider).order_by(OAuthProvider.id)))
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "key": row.key,
+            "display_name": row.display_name,
+            "client_id": row.client_id,
+            "client_secret_masked": mask_secret(row.client_secret),
+            "authorization_url": row.authorization_url,
+            "token_url": row.token_url,
+            "userinfo_url": row.userinfo_url,
+            "scopes": row.scopes,
+            "email_field": row.email_field,
+            "id_field": row.id_field,
+            "name_field": row.name_field,
+            "enabled": row.enabled,
+        }
+        for row in rows
+    ]
+
+
+class OAuthIn(BaseModel):
+    key: str = Field(min_length=1, max_length=64)
+    display_name: str = Field(min_length=1, max_length=128)
+    client_id: str = Field(min_length=1, max_length=255)
+    client_secret: str = Field(min_length=1, max_length=512)
+    authorization_url: str = ""
+    token_url: str = ""
+    userinfo_url: str = ""
+    scopes: str = ""
+    email_field: str = "email"
+    id_field: str = "id"
+    name_field: str = "name"
+    enabled: bool = True
+    use_github_preset: bool = False
+
+
+class OAuthPatch(BaseModel):
+    display_name: str | None = None
+    client_id: str | None = None
+    client_secret: str | None = None
+    authorization_url: str | None = None
+    token_url: str | None = None
+    userinfo_url: str | None = None
+    scopes: str | None = None
+    email_field: str | None = None
+    id_field: str | None = None
+    name_field: str | None = None
+    enabled: bool | None = None
+
+
+def _require_https(url: str) -> None:
+    if not (url.startswith("https://") or url.startswith("http://localhost") or url.startswith("http://127.0.0.1")):
+        raise HTTPException(status_code=400, detail="提供方 URL 必须为 https（本地开发可用 localhost）")
+
+
+@router.post("/oauth-providers", status_code=status.HTTP_201_CREATED)
+async def create_oauth_provider(
+    data: OAuthIn,
+    request: Request,
+    user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    settings: Settings = request.app.state.settings
+    payload = data.model_dump()
+    if data.use_github_preset and data.key == "github":
+        for key, value in GITHUB_PRESET.items():
+            if key not in ("key", "display_name") and not payload.get(key):
+                payload[key] = value
+    for field in ("authorization_url", "token_url", "userinfo_url"):
+        if not payload[field]:
+            raise HTTPException(status_code=400, detail=f"{field} 不能为空")
+        _require_https(payload[field])
+    exists = (
+        await db.execute(
+            select(OAuthProvider.id).where(OAuthProvider.key == data.key)
+        )
+    ).scalar_one_or_none()
+    if exists is not None:
+        raise HTTPException(status_code=409, detail="提供方已存在")
+    row = OAuthProvider(
+        key=data.key,
+        display_name=data.display_name,
+        client_id=data.client_id,
+        client_secret=encrypt_secret(data.client_secret, settings.app_secret_key),
+        authorization_url=payload["authorization_url"],
+        token_url=payload["token_url"],
+        userinfo_url=payload["userinfo_url"],
+        scopes=payload["scopes"],
+        email_field=payload["email_field"],
+        id_field=payload["id_field"],
+        name_field=payload["name_field"],
+        enabled=data.enabled,
+    )
+    db.add(row)
+    await record_audit(
+        db,
+        actor=user,
+        action="oauth.create",
+        target_type="oauth_provider",
+        target_id=row.key,
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"id": row.id, "key": row.key}
+
+
+@router.patch("/oauth-providers/{provider_id}")
+async def patch_oauth_provider(
+    provider_id: int,
+    data: OAuthPatch,
+    request: Request,
+    user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    settings: Settings = request.app.state.settings
+    row = await db.get(OAuthProvider, provider_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="提供方不存在")
+    payload = data.model_dump(exclude_unset=True)
+    if payload.get("client_secret"):
+        payload["client_secret"] = encrypt_secret(payload["client_secret"], settings.app_secret_key)
+    for field in ("authorization_url", "token_url", "userinfo_url"):
+        if payload.get(field):
+            _require_https(payload[field])
+    for key, value in payload.items():
+        setattr(row, key, value)
+    await record_audit(
+        db,
+        actor=user,
+        action="oauth.update",
+        target_type="oauth_provider",
+        target_id=row.key,
+        detail={"fields": sorted(k for k in payload if k != "client_secret")},
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"id": row.id}
+
+
+@router.delete("/oauth-providers/{provider_id}")
+async def delete_oauth_provider(
+    provider_id: int,
+    request: Request,
+    user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    row = await db.get(OAuthProvider, provider_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="提供方不存在")
+    key = row.key
+    await db.delete(row)
+    await record_audit(
+        db,
+        actor=user,
+        action="oauth.delete",
+        target_type="oauth_provider",
+        target_id=key,
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+@router.get("/settings")
+async def get_settings(
+    request: Request,
+    user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    settings: Settings = request.app.state.settings
+    row = await db.get(SystemSetting, "register_enabled")
+    value = (
+        row.value.strip().lower() in ("1", "true", "yes", "on")
+        if row is not None
+        else settings.register_enabled
+    )
+    return {
+        "register_enabled": value,
+        "register_enabled_source": "database" if row is not None else "env",
+        "env_default": settings.register_enabled,
+    }
+
+
+class SettingsPatch(BaseModel):
+    register_enabled: bool | None = None
+
+
+@router.patch("/settings")
+async def patch_settings(
+    data: SettingsPatch,
+    request: Request,
+    user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    if data.register_enabled is None:
+        return await get_settings(request, user, db)
+    row = await db.get(SystemSetting, "register_enabled")
+    value = "true" if data.register_enabled else "false"
+    if row is None:
+        db.add(SystemSetting(key="register_enabled", value=value))
+    else:
+        row.value = value
+    await record_audit(
+        db,
+        actor=user,
+        action="settings.update",
+        target_type="system_setting",
+        target_id="register_enabled",
+        detail={"value": value},
+        ip=_client_ip(request),
+    )
+    await db.commit()
+    return {"register_enabled": data.register_enabled}
+
+
+# ------------------------------------------------------------------------- 统计
+
+
+@router.get("/stats")
+async def get_stats(
+    user: User = Depends(current_user), db: AsyncSession = Depends(get_session)
+) -> dict:
+    now = _now()
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    scope_conditions = [] if is_super_admin(user) else [PushLog.owner_user_id == user.id]
+    total_today = (
+        await db.execute(
+            select(func.count())
+            .select_from(PushLog)
+            .where(*scope_conditions, PushLog.created_at >= start)
+        )
+    ).scalar_one()
+    success_today = (
+        await db.execute(
+            select(func.count())
+            .select_from(PushLog)
+            .where(
+                *scope_conditions,
+                PushLog.created_at >= start,
+                PushLog.status == "success",
+            )
+        )
+    ).scalar_one()
+    recent_failures = (
+        (
+            await db.execute(
+                select(PushLog)
+                .where(*scope_conditions, PushLog.status == "failed")
+                .order_by(PushLog.id.desc())
+                .limit(5)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_platform = (
+        await db.execute(
+            select(PushLog.platform, func.count())
+            .where(*scope_conditions, PushLog.created_at >= start)
+            .group_by(PushLog.platform)
+        )
+    ).all()
+
+    days: list[dict] = []
+    for offset in range(6, -1, -1):
+        day_start = start - timedelta(days=offset)
+        day_end = day_start + timedelta(days=1)
+        count = (
+            await db.execute(
+                select(func.count())
+                .select_from(PushLog)
+                .where(
+                    *scope_conditions,
+                    PushLog.created_at >= day_start,
+                    PushLog.created_at < day_end,
+                )
+            )
+        ).scalar_one()
+        days.append({"date": day_start.date().isoformat(), "count": int(count)})
+
+    return {
+        "scope": "all" if is_super_admin(user) else "mine",
+        "today": {"total": int(total_today), "success": int(success_today)},
+        "success_rate": round(success_today / total_today, 4) if total_today else 0.0,
+        "by_platform": [{"platform": p, "count": int(c)} for p, c in by_platform],
+        "trend": days,
+        "recent_failures": [
+            {
+                "id": row.id,
+                "platform": row.platform,
+                "target": row.target,
+                "error_code": row.error_code,
+                "error_message": row.error_message,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in recent_failures
+        ],
+    }

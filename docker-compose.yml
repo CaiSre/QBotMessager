@@ -1,0 +1,42 @@
+services:
+  db:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: qbotmessager
+      MYSQL_USER: qbotmessager
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 .env 中设置 MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  app:
+    image: qbotmessager:alpine
+    build:
+      context: .
+      args:
+        PYPI_MIRROR: ${PYPI_MIRROR:-https://pypi.org/simple}
+        NPM_MIRROR: ${NPM_MIRROR:-https://registry.npmjs.org}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      MYSQL_URL: mysql+asyncmy://qbotmessager:${MYSQL_PASSWORD}@db:3306/qbotmessager
+    ports:
+      - "${APP_PORT:-3000}:3000"
+
+volumes:
+  mysql-data:
