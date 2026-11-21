@@ -71,7 +71,8 @@ Next.js :3000  ──/api/*、/webhook/* 反代──▶  FastAPI :8000
 
 ### 前置条件
 
-- Docker 与 Docker Compose v2
+- Docker 与 Docker Compose v2（源码构建方式需要 Compose）
+- MySQL 8.4：使用预构建镜像时需自行提供；源码构建方式由 compose 自带
 
 ### 1. 准备配置
 
@@ -79,11 +80,9 @@ Next.js :3000  ──/api/*、/webhook/* 反代──▶  FastAPI :8000
 cp .env.example .env
 ```
 
-编辑 `.env`，至少设置以下项：
+编辑 `.env`，至少设置以下项（两种部署方式通用）：
 
 ```dotenv
-MYSQL_PASSWORD=请替换为强密码
-MYSQL_ROOT_PASSWORD=请替换为强密码
 APP_SECRET_KEY=请填入 Fernet 密钥
 BOOTSTRAP_ADMIN_EMAIL=admin@example.com
 BOOTSTRAP_ADMIN_PASSWORD=请替换为强密码
@@ -98,9 +97,46 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 ### 2. 启动
 
+#### 方式一：使用预构建镜像（推荐）
+
+镜像发布在 GitHub Container Registry：`latest` 对应 `main` 分支最新构建，`vX.Y.Z` 对应版本标签，`sha-<短哈希>` 对应具体提交。
+
+```bash
+docker pull ghcr.io/caisre/qbotmessger:latest
+```
+
+预构建镜像不内置数据库，需在 `.env` 中显式指定连接串：
+
+```dotenv
+MYSQL_URL=mysql+asyncmy://qbotmessager:<密码>@<MySQL 主机>:3306/qbotmessager
+```
+
+启动容器：
+
+```bash
+docker run -d --name qbotmessager --restart unless-stopped \
+  --env-file .env -p 3000:3000 \
+  ghcr.io/caisre/qbotmessger:latest
+```
+
+> 镜像仅提供 `linux/amd64`；首次启动会等待数据库就绪并自动完成迁移。MySQL 若也在 Docker 中，请让两个容器加入同一网络，并用服务名作为连接主机。
+
+#### 方式二：源码构建（compose 自带 MySQL）
+
+在 `.env` 中补充 MySQL 密码：
+
+```dotenv
+MYSQL_PASSWORD=请替换为强密码
+MYSQL_ROOT_PASSWORD=请替换为强密码
+```
+
+构建并启动：
+
 ```bash
 docker compose up -d --build
 ```
+
+> 国内网络可在 `.env` 中把 `PYPI_MIRROR`、`NPM_MIRROR` 改为镜像源后再构建。
 
 ### 3. 首次登录
 
@@ -110,13 +146,11 @@ docker compose up -d --build
 2. 若配置了 `QQ_APPID` / `QQ_APP_SECRET`，导入默认机器人、默认推送目标与钉钉 / 企业微信 / 飞书三条通道；
 3. 默认关闭注册入口，需要时在「安全设置」中开启，并在「用户管理」中生成邀请码。
 
-> 国内网络可在 `.env` 中把 `PYPI_MIRROR`、`NPM_MIRROR` 改为镜像源后再构建。
-
 ## 配置说明
 
 | 变量 | 说明 | 默认 |
 |---|---|---|
-| `MYSQL_URL` | 数据库连接串；compose 自动注入为 `qbotmessager` 库 | 空 |
+| `MYSQL_URL` | 数据库连接串；源码 compose 自动注入为 `db` 服务的 `qbotmessager` 库，预构建镜像需在 `.env` 中显式设置 | 空 |
 | `MYSQL_PASSWORD` / `MYSQL_ROOT_PASSWORD` | MySQL 业务账号与 root 密码（compose 必填） | 无 |
 | `APP_SECRET_KEY` | Fernet 主密钥，用于加密库内敏感字段 | 空（降级明文并告警） |
 | `PUBLIC_BASE_URL` | 对外访问地址，用于生成 Webhook URL 与 OAuth 回调 | 空（按请求头推导） |
@@ -131,7 +165,7 @@ docker compose up -d --build
 | `MAX_BODY_BYTES` | Webhook 请求体上限 | `65536` |
 | `RP_ID` / `RP_NAME` | WebAuthn 依赖方标识与名称 | `localhost` / 项目名 |
 | `LOG_LEVEL` | 日志级别 | `INFO` |
-| `APP_PORT` | 宿主机映射端口 | `3000` |
+| `APP_PORT` | 宿主机映射端口（源码 compose） | `3000` |
 | `PYPI_MIRROR` / `NPM_MIRROR` | 构建时使用的软件源 | 官方源 |
 
 ## 使用指南
@@ -216,6 +250,7 @@ uv run pytest
 
 ```text
 .
+├── .github/workflows/      构建并发布镜像到 GHCR
 ├── server/                 FastAPI 后端
 │   ├── api/                路由：auth / admin / webhook / health
 │   ├── auth/               会话、密码、OAuth2、WebAuthn
