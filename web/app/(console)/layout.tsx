@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
   BotIcon,
+  FlaskConicalIcon,
   LayoutDashboardIcon,
   ScrollTextIcon,
   Settings2Icon,
@@ -21,6 +22,7 @@ import { ROLE_LABELS, type Me } from "@/lib/types";
 const NAV = [
   { href: "/dashboard", label: "概览", icon: LayoutDashboardIcon },
   { href: "/bots", label: "机器人", icon: BotIcon },
+  { href: "/debug", label: "推送调试", icon: FlaskConicalIcon },
   { href: "/logs", label: "推送日志", icon: ScrollTextIcon },
   { href: "/env", label: "环境配置", icon: Settings2Icon },
   { href: "/security", label: "安全设置", icon: ShieldCheckIcon },
