@@ -12,29 +12,15 @@ import {
 } from "@/components/ui/card";
 import {
   ChartContainer,
-  ChartLegend,
-  ChartLegendContent,
   ChartTooltip,
   ChartTooltipContent,
   type ChartConfig,
 } from "@/components/ui/chart";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 
 export interface PushTrendPoint {
   date: string;
   count: number;
 }
-
-const RANGE_ITEMS = [
-  { value: "7d", label: "近 7 日", days: 7 },
-  { value: "3d", label: "近 3 日", days: 3 },
-];
 
 const chartConfig = {
   push: {
@@ -50,41 +36,21 @@ export function PushTrendChart({
   data: PushTrendPoint[];
   className?: string;
 }) {
-  const [range, setRange] = React.useState("7d");
   const gradientId = React.useId().replace(/[^a-zA-Z0-9]/g, "");
-  const days = RANGE_ITEMS.find((item) => item.value === range)?.days ?? 7;
 
   const chartData = React.useMemo(
     () =>
-      data.slice(-days).map((day) => ({
+      data.map((day) => ({
         date: day.date,
         push: day.count,
       })),
-    [data, days],
+    [data],
   );
 
   return (
     <Card className={className}>
-      <CardHeader className="flex items-center gap-2 space-y-0 border-b py-5 sm:flex-row">
-        <div className="grid flex-1 gap-1 text-center sm:text-left">
-          <CardTitle>近 7 日推送量</CardTitle>
-        </div>
-        <Select
-          items={RANGE_ITEMS}
-          value={range}
-          onValueChange={(value) => value && setRange(String(value))}
-        >
-          <SelectTrigger className="w-[110px] sm:ml-auto" aria-label="选择时间范围">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent alignItemWithTrigger={false}>
-            {RANGE_ITEMS.map((item) => (
-              <SelectItem key={item.value} value={item.value}>
-                {item.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+      <CardHeader>
+        <CardTitle>近 7 日推送量</CardTitle>
       </CardHeader>
       <CardContent className="px-2 pt-4 sm:px-6 sm:pt-6">
         {chartData.length === 0 ? (
@@ -94,7 +60,28 @@ export function PushTrendChart({
             config={chartConfig}
             className="aspect-auto h-[220px] w-full"
           >
-            <AreaChart data={chartData} margin={{ left: 12, right: 12 }}>
+            <AreaChart
+              accessibilityLayer
+              data={chartData}
+              margin={{ left: 12, right: 12 }}
+            >
+              <CartesianGrid vertical={false} />
+              <XAxis
+                dataKey="date"
+                tickLine={false}
+                axisLine={false}
+                tickMargin={8}
+                minTickGap={32}
+                tickFormatter={(value) => String(value).slice(5)}
+              />
+              <ChartTooltip
+                cursor={false}
+                content={
+                  <ChartTooltipContent
+                    labelFormatter={(value) => String(value)}
+                  />
+                }
+              />
               <defs>
                 <linearGradient
                   id={`fill-push-${gradientId}`}
@@ -115,31 +102,13 @@ export function PushTrendChart({
                   />
                 </linearGradient>
               </defs>
-              <CartesianGrid vertical={false} />
-              <XAxis
-                dataKey="date"
-                tickLine={false}
-                axisLine={false}
-                tickMargin={8}
-                minTickGap={32}
-                tickFormatter={(value) => String(value).slice(5)}
-              />
-              <ChartTooltip
-                cursor={false}
-                content={
-                  <ChartTooltipContent
-                    indicator="dot"
-                    labelFormatter={(value) => String(value)}
-                  />
-                }
-              />
               <Area
                 dataKey="push"
                 type="natural"
                 fill={`url(#fill-push-${gradientId})`}
+                fillOpacity={0.4}
                 stroke="var(--color-push)"
               />
-              <ChartLegend content={<ChartLegendContent />} />
             </AreaChart>
           </ChartContainer>
         )}
