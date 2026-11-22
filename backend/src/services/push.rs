@@ -27,8 +27,10 @@ const PREVIEW_CHARS: usize = 200;
 pub struct PushJob {
     /// 请求 ID（`uuid4` 的 32 位十六进制）。
     pub request_id: String,
-    /// 来源平台。
-    pub platform: String,
+    /// 钩子类型。
+    pub hook_type: String,
+    /// 推送来源（用户自填）。
+    pub push_source: String,
     /// 来源通道；通道删除后为 `None`。
     pub channel_id: Option<i64>,
     /// 机器人 ID。
@@ -41,7 +43,7 @@ pub struct PushJob {
     pub bot_appid: String,
     /// QQ AppSecret 密文（worker 用主密钥解密，避免明文进入队列）。
     pub app_secret_cipher: String,
-    /// 平台原始消息类型。
+    /// 钩子原始消息类型。
     pub source_msgtype: String,
     /// QQ 消息类型：0 纯文本 / 2 Markdown。
     pub msg_type: i32,
@@ -195,7 +197,8 @@ pub async fn execute_push(
                 owner_user_id: job.owner_user_id,
                 channel_id: job.channel_id,
                 bot_profile_id: Some(job.bot_id),
-                platform: &job.platform,
+                hook_type: &job.hook_type,
+                push_source: &job.push_source,
                 source_msgtype: &job.source_msgtype,
                 target: &target_label,
                 qq_msg_type: Some(job.msg_type),

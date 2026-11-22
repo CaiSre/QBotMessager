@@ -4,7 +4,7 @@
 //! - `GET/POST   /api/admin/bot-profiles`；`PATCH/DELETE /api/admin/bot-profiles/{id}`
 //! - `GET/POST   /api/admin/channels`；`PATCH/DELETE /api/admin/channels/{id}`；
 //!   `POST /api/admin/channels/{id}/rotate`
-//! - `GET  /api/admin/logs?page=&page_size=&platform=&status=&keyword=`；
+//! - `GET  /api/admin/logs?page=&page_size=&hook_type=&status=&keyword=`；
 //!   `GET /api/admin/logs/{log_id}`
 //! - `GET  /api/admin/users`；`PATCH /api/admin/users/{id}`
 //! - `GET/POST   /api/admin/invites`；`DELETE /api/admin/invites/{id}`
@@ -29,7 +29,7 @@ use sqlx::{MySql, QueryBuilder};
 use crate::auth::sessions;
 use crate::crypto::{encrypt_secret, mask_secret, random_token};
 use crate::db::models::{
-    BotProfile, Channel, PLATFORM_GITHUB, PLATFORMS, PushLog, STATUS_ACTIVE, User,
+    BotProfile, Channel, HOOK_TYPE_GITHUB, HOOK_TYPES, PushLog, STATUS_ACTIVE, User,
 };
 use crate::db::queries;
 use crate::db::queries::bots::NewBotProfile;
@@ -161,8 +161,10 @@ struct BotPatch {
 /// 新建通道。
 #[derive(Debug, Deserialize)]
 struct ChannelIn {
-    platform: String,
+    hook_type: String,
     bot_profile_id: i64,
+    #[serde(default)]
+    push_source: String,
     #[serde(default = "default_true")]
     enabled: bool,
     #[serde(default)]
@@ -502,11 +504,11 @@ fn webhook_base(req: &HttpRequest, settings: &RuntimeSettings) -> String {
 }
 
 /// 通道的对外 Webhook 地址。
-fn webhook_url(base: &str, platform: &str, token: &str) -> String {
-    if platform == PLATFORM_GITHUB {
+fn webhook_url(base: &str, hook_type: &str, token: &str) -> String {
+    if hook_type == HOOK_TYPE_GITHUB {
         format!("{base}/webhook/github/{token}")
     } else {
-        format!("{base}/webhook/{platform}")
+        format!("{base}/webhook/{hook_type}")
     }
 }
 
@@ -794,10 +796,11 @@ async fn list_channels(
             "id": channel.id,
             "owner_user_id": bot.owner_user_id,
             "owner_email": owner_email,
-            "platform": channel.platform,
+            "hook_type": channel.hook_type,
+            "push_source": channel.push_source,
             "bot_profile_id": channel.bot_profile_id,
             "webhook_token": channel.webhook_token,
-            "webhook_url": webhook_url(&base, &channel.platform, &channel.webhook_token),
+            "webhook_url": webhook_url(&base, &channel.hook_type, &channel.webhook_token),
             "has_secret": channel_has_secret(&channel),
             "enabled": channel.enabled,
         }));
@@ -813,14 +816,18 @@ async fn create_channel(
 ) -> Result<HttpResponse, AppError> {
     let actor = require_user(&state, &req).await?;
     let data = body.into_inner();
-    if !PLATFORMS.contains(&data.platform.as_str()) {
-        return Err(AppError::bad_request("平台不受支持"));
+    if !HOOK_TYPES.contains(&data.hook_type.as_str()) {
+        return Err(AppError::bad_request("钩子类型不受支持"));
+    }
+    let push_source = data.push_source.trim();
+    if push_source.chars().count() > 64 {
+        return Err(AppError::bad_request("推送来源最长为 64 个字符"));
     }
     owned_bot(&state, &actor, data.bot_profile_id).await?;
 
     let mut secret_plain: Option<String> = None;
     let mut extra: Option<Value> = None;
-    if data.platform == PLATFORM_GITHUB {
+    if data.hook_type == HOOK_TYPE_GITHUB {
         let secret = data.secret.as_deref().unwrap_or("").trim().to_string();
         let secret = if secret.is_empty() {
             random_token(32)
@@ -842,7 +849,8 @@ async fn create_channel(
         &mut *tx,
         &NewChannel {
             bot_profile_id: data.bot_profile_id,
-            platform: &data.platform,
+            hook_type: &data.hook_type,
+            push_source,
             webhook_token: &token,
             enabled: data.enabled,
             extra: extra.as_ref(),
@@ -856,7 +864,7 @@ async fn create_channel(
         "channel.create",
         "channel",
         Some(channel_id.to_string()),
-        Some(json!({"platform": data.platform})),
+        Some(json!({"hook_type": data.hook_type, "push_source": push_source})),
         ip.as_deref(),
     )
     .await?;
@@ -866,7 +874,7 @@ async fn create_channel(
     if let Some(secret) = secret_plain {
         let settings = state.settings().clone();
         let base = webhook_base(&req, &settings);
-        result["webhook_url"] = Value::String(webhook_url(&base, PLATFORM_GITHUB, &token));
+        result["webhook_url"] = Value::String(webhook_url(&base, HOOK_TYPE_GITHUB, &token));
         result["secret"] = Value::String(secret);
     }
     Ok(HttpResponse::Created().json(result))
@@ -938,7 +946,7 @@ async fn rotate_channel(
 
     let mut secret_plain: Option<String> = None;
     let mut extra: Option<Value> = channel.extra.clone();
-    if channel.platform == PLATFORM_GITHUB {
+    if channel.hook_type == HOOK_TYPE_GITHUB {
         // GitHub 不支持自定义请求头，URL token 与签名密钥需同时轮换。
         let secret = random_token(32);
         let mut object = match extra.take() {
@@ -958,7 +966,7 @@ async fn rotate_channel(
 
     let ip = state.client_ip(&req);
     let mut tx = state.pool.begin().await?;
-    if channel.platform == PLATFORM_GITHUB {
+    if channel.hook_type == HOOK_TYPE_GITHUB {
         sqlx::query("UPDATE channels SET webhook_token = ?, extra = ? WHERE id = ?")
             .bind(&token)
             .bind(extra.as_ref())
@@ -984,7 +992,7 @@ async fn rotate_channel(
     if let Some(secret) = secret_plain {
         let settings = state.settings().clone();
         let base = webhook_base(&req, &settings);
-        result["webhook_url"] = Value::String(webhook_url(&base, PLATFORM_GITHUB, &token));
+        result["webhook_url"] = Value::String(webhook_url(&base, HOOK_TYPE_GITHUB, &token));
         result["secret"] = Value::String(secret);
     }
     Ok(HttpResponse::Ok().json(result))
@@ -1034,7 +1042,7 @@ async fn list_logs(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpR
     }
     let (page_size, offset) = queries::normalize_pagination(page, page_size);
 
-    let platform = params.get("platform").filter(|value| !value.is_empty());
+    let hook_type = params.get("hook_type").filter(|value| !value.is_empty());
     let status = params.get("status").filter(|value| !value.is_empty());
     let keyword = params.get("keyword").filter(|value| !value.is_empty());
     let owner_user_id = if users::is_super_admin(&actor) {
@@ -1045,7 +1053,7 @@ async fn list_logs(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpR
 
     let filter = queries::push_logs::PushLogFilter {
         owner_user_id,
-        platform: platform.map(String::as_str),
+        hook_type: hook_type.map(String::as_str),
         status: status.map(String::as_str),
         keyword: keyword.map(String::as_str),
         since: None,
@@ -1091,7 +1099,8 @@ fn log_json(row: &PushLog, owner_email: Option<String>) -> Value {
         "id": row.id,
         "owner_user_id": row.owner_user_id,
         "owner_email": owner_email,
-        "platform": row.platform,
+        "hook_type": row.hook_type,
+        "push_source": row.push_source,
         "source_msgtype": row.source_msgtype,
         "target": row.target,
         "qq_msg_type": row.qq_msg_type,
@@ -1835,8 +1844,9 @@ async fn get_stats(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpR
             .await?;
     let recent_failures =
         queries::push_logs::recent_failures(&state.pool, owner_user_id, 5).await?;
-    let by_platform =
-        queries::push_logs::platform_counts_between(&state.pool, owner_user_id, start, end).await?;
+    let by_source =
+        queries::push_logs::push_source_counts_between(&state.pool, owner_user_id, start, end)
+            .await?;
 
     let mut trend = Vec::with_capacity(7);
     for offset in (0..7).rev() {
@@ -1857,16 +1867,17 @@ async fn get_stats(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpR
     } else {
         0.0
     };
-    let platforms: Vec<Value> = by_platform
+    let sources: Vec<Value> = by_source
         .into_iter()
-        .map(|(platform, count)| json!({"platform": platform, "count": count}))
+        .map(|(source, count)| json!({"source": source, "count": count}))
         .collect();
     let failures: Vec<Value> = recent_failures
         .into_iter()
         .map(|row| {
             json!({
                 "id": row.id,
-                "platform": row.platform,
+                "hook_type": row.hook_type,
+                "push_source": row.push_source,
                 "target": row.target,
                 "error_code": row.error_code,
                 "error_message": row.error_message,
@@ -1879,7 +1890,7 @@ async fn get_stats(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpR
         "scope": if super_admin { "all" } else { "mine" },
         "today": {"total": total_today, "success": success_today},
         "success_rate": success_rate,
-        "by_platform": platforms,
+        "by_source": sources,
         "trend": trend,
         "recent_failures": failures,
     })))

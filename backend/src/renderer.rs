@@ -4,7 +4,7 @@
 //! - msg_type=0 纯文本（content），msg_type=2 Markdown（markdown.content）
 //! - 两者互斥：传 markdown 时 content 必须为空字符串
 //!
-//! 统一消息 → 目标平台文案渲染。
+//! 统一消息 → 目标钩子类型文案渲染。
 
 use serde::Serialize;
 
@@ -27,7 +27,7 @@ pub const DEFAULT_TEXT_MAX_LEN: usize = 2000;
 
 const EMPTY_PLACEHOLDER: &str = "（消息内容为空）";
 
-/// 平台负载归一后的附件。
+/// 钩子负载归一后的附件。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Attachment {
     /// 附件类型：image / file / voice / link。
@@ -36,11 +36,11 @@ pub struct Attachment {
     pub url: Option<String>,
     /// 附件标题。
     pub title: Option<String>,
-    /// 平台侧媒体 ID。
+    /// 钩子侧媒体 ID。
     pub media_id: Option<String>,
 }
 
-/// 平台负载归一后的统一消息。
+/// 钩子负载归一后的统一消息。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnifiedMessage {
     /// 消息格式：`text` 或 `markdown`。
@@ -53,9 +53,9 @@ pub struct UnifiedMessage {
     pub mentions: Vec<String>,
     /// 附件。
     pub attachments: Vec<Attachment>,
-    /// 平台原始消息类型。
+    /// 钩子原始消息类型。
     pub source_msgtype: String,
-    /// 平台原始附加信息。
+    /// 钩子原始附加信息。
     pub meta: serde_json::Map<String, serde_json::Value>,
 }
 

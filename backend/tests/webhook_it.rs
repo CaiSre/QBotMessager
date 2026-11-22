@@ -1,6 +1,6 @@
 //! Webhook / Markdown 渲染 / 消息体转换集成测试。
 //!
-//! 覆盖范围：通道鉴权与投递去重、四平台适配器解析、Markdown 清洗与
+//! 覆盖范围：通道鉴权与投递去重、四类钩子适配器解析、Markdown 清洗与
 //! 渲染降级、推送日志写入与频控。
 //!
 //! 驱动方式：`actix_web::test::init_service` + `TestRequest`，数据库为真实 MySQL。
@@ -456,10 +456,10 @@ async fn make_bot(
 async fn make_channel(
     fixture: &Fixture,
     bot_id: i64,
-    platform: &str,
+    hook_type: &str,
 ) -> (i64, String, Option<String>) {
     let token = uuid::Uuid::new_v4().simple().to_string();
-    let (extra, secret) = if platform == "github" {
+    let (extra, secret) = if hook_type == "github" {
         let plain = uuid::Uuid::new_v4().simple().to_string();
         let cipher = encrypt_secret(&plain, Some(&fixture.fernet_key));
         (Some(json!({"secret_cipher": cipher})), Some(plain))
@@ -467,11 +467,11 @@ async fn make_channel(
         (None, None)
     };
     let id = sqlx::query(
-        "INSERT INTO channels (bot_profile_id, platform, webhook_token, enabled, extra, created_at) \
-         VALUES (?, ?, ?, TRUE, ?, ?)",
+        "INSERT INTO channels (bot_profile_id, hook_type, push_source, webhook_token, enabled, \
+         extra, created_at) VALUES (?, ?, '集成测试', ?, TRUE, ?, ?)",
     )
     .bind(bot_id)
-    .bind(platform)
+    .bind(hook_type)
     .bind(&token)
     .bind(extra)
     .bind(Utc::now().naive_utc())
@@ -528,11 +528,50 @@ async fn text_pushes_to_default_openid() {
         calls[0].body,
         json!({
             "msg_type": 0,
-            "content": "磁盘告警",
+            "content": "「消息来源」集成测试\n磁盘告警",
             "msg_id": "",
             "msg_seq": 1,
         })
     );
+}
+
+#[actix_web::test]
+async fn debug_header_marks_push_source() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let owner = make_user(&fixture).await;
+    let bot_id = make_bot(&fixture, owner, &["u-default"], None).await;
+    let (_channel_id, token, _) = make_channel(&fixture, bot_id, "dingtalk").await;
+
+    let reply = send!(
+        app,
+        webhook_request(
+            "/webhook/dingtalk",
+            &json!({"msgtype": "text", "text": {"content": "调试消息"}}),
+            &token,
+        )
+        .insert_header(("X-QBot-Debug", "1"))
+    );
+    assert_status!(reply, StatusCode::OK);
+
+    let calls = fixture.mock.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].body["content"],
+        json!("「消息来源」推送调试\n调试消息")
+    );
+
+    let (source, preview): (String, String) = sqlx::query_as(
+        "SELECT push_source, content_preview FROM push_logs WHERE owner_user_id = ? \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(owner)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("查询推送日志失败");
+    assert_eq!(source, "推送调试");
+    assert!(preview.starts_with("「消息来源」推送调试"), "{preview}");
 }
 
 #[actix_web::test]
@@ -557,8 +596,18 @@ async fn markdown_uses_msg_type_2() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].target, "group:g-default");
     assert_eq!(calls[0].body["msg_type"], json!(2));
+    let markdown = calls[0].body["markdown"]["content"]
+        .as_str()
+        .expect("Markdown 消息缺少正文");
+    assert!(
+        markdown.starts_with("# 「消息来源」集成测试"),
+        "Markdown 应在头部标注推送来源：{markdown}"
+    );
     assert_eq!(calls[0].body["content"], json!(""));
-    assert_eq!(calls[0].body["markdown"]["content"], json!("**服务** 异常"));
+    assert_eq!(
+        calls[0].body["markdown"]["content"],
+        json!("# 「消息来源」集成测试\n\n**服务** 异常")
+    );
 }
 
 #[actix_web::test]
@@ -615,19 +664,25 @@ async fn push_logs_recorded() {
         json!({"code": 0, "msg": "success", "data": {}})
     );
 
-    let row: (String, String, String, String, i64) = sqlx::query_as(
-        "SELECT platform, status, target, content_preview, owner_user_id FROM push_logs \
-         WHERE owner_user_id = ? ORDER BY id DESC LIMIT 1",
+    let row: (String, String, String, String, String, i64) = sqlx::query_as(
+        "SELECT hook_type, push_source, status, target, content_preview, owner_user_id \
+         FROM push_logs WHERE owner_user_id = ? ORDER BY id DESC LIMIT 1",
     )
     .bind(owner)
     .fetch_one(&fixture.pool)
     .await
     .expect("查询推送日志失败");
     assert_eq!(row.0, "feishu");
-    assert_eq!(row.1, "success");
-    assert_eq!(row.2, "user:u-default");
-    assert!(row.3.contains("上线通知"), "{}", row.3);
-    assert_eq!(row.4, owner);
+    assert_eq!(row.1, "集成测试");
+    assert_eq!(row.2, "success");
+    assert_eq!(row.3, "user:u-default");
+    assert!(
+        row.4.starts_with("「消息来源」集成测试\n"),
+        "纯文本应在头部标注推送来源：{}",
+        row.4
+    );
+    assert!(row.4.contains("上线通知"), "{}", row.4);
+    assert_eq!(row.5, owner);
 }
 
 #[actix_web::test]
@@ -651,7 +706,7 @@ async fn failure_returns_502_and_logs_error() {
         )
     );
     let reply = assert_status!(reply, StatusCode::BAD_GATEWAY);
-    // 对外文案固定为通用失败提示，平台细节只进日志。
+    // 对外文案固定为通用失败提示，钩子细节只进日志。
     assert!(
         reply.json()["errmsg"]
             .as_str()
@@ -672,7 +727,7 @@ async fn failure_returns_502_and_logs_error() {
 }
 
 #[actix_web::test]
-async fn rejects_bad_token_platform_and_body() {
+async fn rejects_bad_token_hook_type_and_body() {
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -690,8 +745,8 @@ async fn rejects_bad_token_platform_and_body() {
     );
     assert_status!(bad_token, StatusCode::UNAUTHORIZED);
 
-    let unknown_platform = send!(app, webhook_request("/webhook/unknown", &json!({}), "x"));
-    assert_status!(unknown_platform, StatusCode::NOT_FOUND);
+    let unknown_hook_type = send!(app, webhook_request("/webhook/unknown", &json!({}), "x"));
+    assert_status!(unknown_hook_type, StatusCode::NOT_FOUND);
 
     let not_json = send!(
         app,
@@ -848,6 +903,13 @@ async fn github_signed_ping_pushes_and_logs() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].target, "group:g-default");
     assert_eq!(calls[0].body["msg_type"], json!(2));
+    let markdown = calls[0].body["markdown"]["content"]
+        .as_str()
+        .expect("Markdown 消息缺少正文");
+    assert!(
+        markdown.starts_with("# 「消息来源」集成测试"),
+        "Markdown 应在头部标注推送来源：{markdown}"
+    );
 
     let source: String = sqlx::query_scalar(
         "SELECT source_msgtype FROM push_logs WHERE owner_user_id = ? \
@@ -1039,7 +1101,8 @@ async fn queue_accepts_before_any_send() {
     assert_eq!(rows.len(), 1);
     let job: PushJob = serde_json::from_slice(&rows[0].0).expect("队列任务必须是 PushJob");
     assert_eq!(job.bot_id, bot_id);
-    assert_eq!(job.content, "入队即确认");
+    assert_eq!(job.content, "「消息来源」集成测试\n入队即确认");
+    assert_eq!(job.push_source, "集成测试");
     let key = rows[0].1.clone().expect("队列任务缺少 idempotency_key");
     assert_eq!(key.len(), 36);
     assert!(
@@ -1106,7 +1169,7 @@ async fn queue_dedupe_key_is_scoped_per_channel() {
     let app = app!(fixture.state.clone());
     let owner = make_user(&fixture).await;
     let bot_id = make_bot(&fixture, owner, &["u-default"], None).await;
-    // 同一机器人挂两个相同平台的通道：平台的投递 ID 相同也不互相压制。
+    // 同一机器人挂两个相同钩子类型的通道：钩子类型的投递 ID 相同也不互相压制。
     let (channel_a, token_a, _) = make_channel(&fixture, bot_id, "dingtalk").await;
     let (channel_b, token_b, _) = make_channel(&fixture, bot_id, "dingtalk").await;
     let msgid = format!("{}-cross", fixture.prefix);
@@ -1313,23 +1376,23 @@ fn truncation_limits() {
     assert_eq!(payload.markdown.as_ref().unwrap().chars().count(), 100);
 }
 
-// ------------------------------------------------------------------ 平台适配器
+// ------------------------------------------------------------------ 钩子适配器
 
-fn parse_platform(platform: &str, payload: &Value) -> Result<UnifiedMessage, AdapterError> {
-    parse_event(platform, "", payload)
+fn parse_hook_type(hook_type: &str, payload: &Value) -> Result<UnifiedMessage, AdapterError> {
+    parse_event(hook_type, "", payload)
 }
 
 fn parse_event(
-    platform: &str,
+    hook_type: &str,
     event: &str,
     payload: &Value,
 ) -> Result<UnifiedMessage, AdapterError> {
-    match platform {
+    match hook_type {
         "dingtalk" => DingTalkAdapter::new().parse(payload, event),
         "wecom" => WeComAdapter::new().parse(payload, event),
         "feishu" => FeishuAdapter::new().parse(payload, event),
         "github" => GitHubAdapter::new().parse(payload, event),
-        other => panic!("未知测试平台：{other}"),
+        other => panic!("未知测试钩子类型：{other}"),
     }
 }
 
@@ -1353,7 +1416,7 @@ fn assert_ignored(result: Result<UnifiedMessage, AdapterError>) {
 
 #[test]
 fn dingtalk_text_with_mentions() {
-    let message = parse_platform(
+    let message = parse_hook_type(
         "dingtalk",
         &json!({
             "msgtype": "text",
@@ -1370,7 +1433,7 @@ fn dingtalk_text_with_mentions() {
 
 #[test]
 fn dingtalk_markdown_keeps_title_separate() {
-    let message = parse_platform(
+    let message = parse_hook_type(
         "dingtalk",
         &json!({
             "msgtype": "markdown",
@@ -1388,7 +1451,7 @@ fn dingtalk_markdown_keeps_title_separate() {
 
 #[test]
 fn dingtalk_link_and_action_card() {
-    let link = parse_platform(
+    let link = parse_hook_type(
         "dingtalk",
         &json!({
             "msgtype": "link",
@@ -1406,7 +1469,7 @@ fn dingtalk_link_and_action_card() {
     assert!(link.body.contains("[查看详情](https://ci.example.com/12)"));
     assert_eq!(link.attachments[0].kind, "image");
 
-    let card = parse_platform(
+    let card = parse_hook_type(
         "dingtalk",
         &json!({
             "msgtype": "actionCard",
@@ -1425,7 +1488,7 @@ fn dingtalk_link_and_action_card() {
 
 #[test]
 fn dingtalk_feed_card_and_unknown_type() {
-    let feed = parse_platform(
+    let feed = parse_hook_type(
         "dingtalk",
         &json!({
             "msgtype": "feedCard",
@@ -1436,7 +1499,7 @@ fn dingtalk_feed_card_and_unknown_type() {
     assert_eq!(feed.fmt, FMT_MARKDOWN);
     assert_eq!(feed.body, "- [a](https://a.example.com)");
 
-    assert_payload_error(parse_platform(
+    assert_payload_error(parse_hook_type(
         "dingtalk",
         &json!({"msgtype": "video", "video": {}}),
     ));
@@ -1446,7 +1509,7 @@ fn dingtalk_feed_card_and_unknown_type() {
 
 #[test]
 fn wecom_text_strips_mention_tags() {
-    let message = parse_platform(
+    let message = parse_hook_type(
         "wecom",
         &json!({
             "msgtype": "text",
@@ -1470,7 +1533,7 @@ fn wecom_text_strips_mention_tags() {
 
 #[test]
 fn wecom_markdown_v2_degrades_tables() {
-    let message = parse_platform(
+    let message = parse_hook_type(
         "wecom",
         &json!({
             "msgtype": "markdown_v2",
@@ -1484,7 +1547,7 @@ fn wecom_markdown_v2_degrades_tables() {
 
 #[test]
 fn wecom_news_image_and_template_card() {
-    let news = parse_platform(
+    let news = parse_hook_type(
         "wecom",
         &json!({
             "msgtype": "news",
@@ -1498,7 +1561,7 @@ fn wecom_news_image_and_template_card() {
     .expect("解析成功");
     assert!(news.body.contains("- [n1](https://n1.example.com)"));
 
-    let image = parse_platform(
+    let image = parse_hook_type(
         "wecom",
         &json!({"msgtype": "image", "image": {"media_id": "m-1", "content": ""}}),
     )
@@ -1507,7 +1570,7 @@ fn wecom_news_image_and_template_card() {
     assert_eq!(image.body, "[图片]");
     assert_eq!(image.attachments[0].media_id.as_deref(), Some("m-1"));
 
-    let card = parse_platform(
+    let card = parse_hook_type(
         "wecom",
         &json!({
             "msgtype": "template_card",
@@ -1526,7 +1589,7 @@ fn wecom_news_image_and_template_card() {
 
 #[test]
 fn wecom_unknown_type() {
-    assert_payload_error(parse_platform(
+    assert_payload_error(parse_hook_type(
         "wecom",
         &json!({"msgtype": "video", "video": {"media_id": "x"}}),
     ));
@@ -1536,7 +1599,7 @@ fn wecom_unknown_type() {
 
 #[test]
 fn feishu_text_replaces_at_tags() {
-    let message = parse_platform(
+    let message = parse_hook_type(
         "feishu",
         &json!({"msg_type": "text", "content": {"text": "hi <at user_id=\"ou_1\">张三</at>"}}),
     )
@@ -1548,7 +1611,7 @@ fn feishu_text_replaces_at_tags() {
 
 #[test]
 fn feishu_post_renders_inline_elements() {
-    let message = parse_platform(
+    let message = parse_hook_type(
         "feishu",
         &json!({
             "msg_type": "post",
@@ -1583,7 +1646,7 @@ fn feishu_post_renders_inline_elements() {
 
 #[test]
 fn feishu_interactive_card() {
-    let message = parse_platform(
+    let message = parse_hook_type(
         "feishu",
         &json!({
             "msg_type": "interactive",
@@ -1602,14 +1665,14 @@ fn feishu_interactive_card() {
 
 #[test]
 fn feishu_share_chat_and_post_media_tags() {
-    let share = parse_platform(
+    let share = parse_hook_type(
         "feishu",
         &json!({"msg_type": "share_chat", "content": {"share_chat_id": "oc_1"}}),
     )
     .expect("解析成功");
     assert_eq!(share.body, "[群聊分享] oc_1");
 
-    let post = parse_platform(
+    let post = parse_hook_type(
         "feishu",
         &json!({
             "msg_type": "post",
@@ -1634,7 +1697,7 @@ fn feishu_share_chat_and_post_media_tags() {
 
 #[test]
 fn feishu_unknown_type() {
-    assert_payload_error(parse_platform(
+    assert_payload_error(parse_hook_type(
         "feishu",
         &json!({"msg_type": "audio", "content": {}}),
     ));
@@ -1927,5 +1990,5 @@ fn github_generic_event_and_missing_header() {
     assert!(unknown.body.contains("octocat"));
     assert_eq!(unknown.source_msgtype, "future_event.happened");
 
-    assert_payload_error(parse_platform("github", &github_payload()));
+    assert_payload_error(parse_hook_type("github", &github_payload()));
 }

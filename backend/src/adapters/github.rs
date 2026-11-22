@@ -226,7 +226,7 @@ impl GitHubAdapter {
 }
 
 impl Adapter for GitHubAdapter {
-    fn platform(&self) -> &'static str {
+    fn hook_type(&self) -> &'static str {
         "github"
     }
 

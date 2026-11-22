@@ -1,7 +1,7 @@
 //! 管理端集成测试。
 //!
 //! 覆盖范围：
-//! - 统计接口（时区、平台分布）
+//! - 统计接口（时区、钩子类型分布）
 //! - 通道与机器人的 QQ 主机白名单、通道凭据轮换
 //! - 系统设置目录导出、持久化、校验与即时生效
 //! - 用户管理（角色与状态保护、邀请码）与资源隔离
@@ -351,10 +351,12 @@ fn find_setting<'a>(payload: &'a Value, key: &str) -> &'a Value {
 }
 
 /// 插入一条推送日志，返回主键。
+#[allow(clippy::too_many_arguments)]
 async fn insert_push_log(
     fixture: &Fixture,
     owner_id: i64,
-    platform: &str,
+    hook_type: &str,
+    push_source: &str,
     status: &str,
     content_preview: &str,
     request_id: &str,
@@ -366,12 +368,13 @@ async fn insert_push_log(
         (None, None)
     };
     sqlx::query(
-        "INSERT INTO push_logs (owner_user_id, platform, source_msgtype, target, \
+        "INSERT INTO push_logs (owner_user_id, hook_type, push_source, source_msgtype, target, \
          content_preview, content_len, status, error_code, error_message, duration_ms, \
-         request_id, created_at) VALUES (?, ?, 'text', ?, ?, ?, ?, ?, ?, 12.5, ?, ?)",
+         request_id, created_at) VALUES (?, ?, ?, 'text', ?, ?, ?, ?, ?, ?, 12.5, ?, ?)",
     )
     .bind(owner_id)
-    .bind(platform)
+    .bind(hook_type)
+    .bind(push_source)
     .bind(format!("user:{request_id}"))
     .bind(content_preview)
     .bind(content_preview.chars().count() as i32)
@@ -888,7 +891,7 @@ async fn channel_crud_rotate_and_secret() {
         app,
         post_json_with(
             "/api/admin/channels",
-            &json!({"platform": "dingtalk", "bot_profile_id": bot_id}),
+            &json!({"hook_type": "dingtalk", "push_source": "订单系统", "bot_profile_id": bot_id}),
             &auth
         )
     );
@@ -902,7 +905,8 @@ async fn channel_crud_rotate_and_secret() {
     let list = assert_status!(list, StatusCode::OK);
     let item = &list.json()[0];
     assert_eq!(item["id"], json!(dingtalk_id));
-    assert_eq!(item["platform"], json!("dingtalk"));
+    assert_eq!(item["hook_type"], json!("dingtalk"));
+    assert_eq!(item["push_source"], json!("订单系统"));
     assert_eq!(item["bot_profile_id"], json!(bot_id));
     assert_eq!(item["webhook_token"], json!(dingtalk_token));
     assert_eq!(item["has_secret"], json!(false));
@@ -943,7 +947,7 @@ async fn channel_crud_rotate_and_secret() {
         app,
         post_json_with(
             "/api/admin/channels",
-            &json!({"platform": "github", "bot_profile_id": bot_id}),
+            &json!({"hook_type": "github", "bot_profile_id": bot_id}),
             &auth
         )
     );
@@ -983,17 +987,32 @@ async fn channel_crud_rotate_and_secret() {
     );
     assert_ne!(github_rotated["secret"].as_str().unwrap(), github_secret);
 
-    // 非法平台与越权操作。
-    let bad_platform = send!(
+    // 非法钩子类型与越权操作。
+    let bad_hook_type = send!(
         app,
         post_json_with(
             "/api/admin/channels",
-            &json!({"platform": "slack", "bot_profile_id": bot_id}),
+            &json!({"hook_type": "slack", "bot_profile_id": bot_id}),
             &auth
         )
     );
-    let bad_platform = assert_status!(bad_platform, StatusCode::BAD_REQUEST);
-    assert_eq!(bad_platform.detail(), "平台不受支持");
+    let bad_hook_type = assert_status!(bad_hook_type, StatusCode::BAD_REQUEST);
+    assert_eq!(bad_hook_type.detail(), "钩子类型不受支持");
+
+    let too_long_source = send!(
+        app,
+        post_json_with(
+            "/api/admin/channels",
+            &json!({
+                "hook_type": "dingtalk",
+                "push_source": "x".repeat(65),
+                "bot_profile_id": bot_id
+            }),
+            &auth
+        )
+    );
+    let too_long_source = assert_status!(too_long_source, StatusCode::BAD_REQUEST);
+    assert_eq!(too_long_source.detail(), "推送来源最长为 64 个字符");
 
     let (_other, other_token) = make_user(&fixture, "channelother").await;
     let other_auth = cookies(&other_token);
@@ -1001,7 +1020,7 @@ async fn channel_crud_rotate_and_secret() {
         app,
         post_json_with(
             "/api/admin/channels",
-            &json!({"platform": "dingtalk", "bot_profile_id": bot_id}),
+            &json!({"hook_type": "dingtalk", "bot_profile_id": bot_id}),
             &other_auth
         )
     );
@@ -1053,7 +1072,12 @@ async fn logs_pagination_and_filters() {
     let now = Utc::now().naive_utc();
     let mut ids = Vec::new();
     for index in 0..25 {
-        let platform = if index % 2 == 0 { "dingtalk" } else { "wecom" };
+        let hook_type = if index % 2 == 0 { "dingtalk" } else { "wecom" };
+        let push_source = if index % 2 == 0 {
+            "订单系统"
+        } else {
+            "监控告警"
+        };
         let status = if index % 2 == 0 { "success" } else { "failed" };
         let preview = if index % 5 == 0 {
             format!("{keyword}-{index}")
@@ -1065,7 +1089,8 @@ async fn logs_pagination_and_filters() {
             insert_push_log(
                 &fixture,
                 owner.id,
-                platform,
+                hook_type,
+                push_source,
                 status,
                 &preview,
                 &request_id,
@@ -1084,7 +1109,8 @@ async fn logs_pagination_and_filters() {
     assert_eq!(first["items"].as_array().unwrap().len(), 20);
     let first_item = &first["items"][0];
     assert_eq!(first_item["owner_email"], json!(owner.email));
-    assert_eq!(first_item["platform"], json!("dingtalk"));
+    assert_eq!(first_item["hook_type"], json!("dingtalk"));
+    assert_eq!(first_item["push_source"], json!("订单系统"));
     assert_eq!(first_item["status"], json!("success"));
     assert_eq!(
         first_item["target"],
@@ -1103,8 +1129,8 @@ async fn logs_pagination_and_filters() {
     let page_three = assert_status!(page_three, StatusCode::OK).json();
     assert_eq!(page_three["items"].as_array().unwrap().len(), 5);
 
-    // 平台、状态、关键词过滤。
-    let dingtalk = send!(app, get_with("/api/admin/logs?platform=dingtalk", &auth));
+    // 钩子类型、状态、关键词过滤。
+    let dingtalk = send!(app, get_with("/api/admin/logs?hook_type=dingtalk", &auth));
     let dingtalk = assert_status!(dingtalk, StatusCode::OK).json();
     assert_eq!(dingtalk["total"], json!(13));
     assert!(
@@ -1112,7 +1138,7 @@ async fn logs_pagination_and_filters() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|row| row["platform"] == json!("dingtalk"))
+            .all(|row| row["hook_type"] == json!("dingtalk"))
     );
 
     let failed = send!(app, get_with("/api/admin/logs?status=failed", &auth));
@@ -1129,7 +1155,7 @@ async fn logs_pagination_and_filters() {
 
     let combined = send!(
         app,
-        get_with("/api/admin/logs?platform=wecom&status=failed", &auth)
+        get_with("/api/admin/logs?hook_type=wecom&status=failed", &auth)
     );
     let combined = assert_status!(combined, StatusCode::OK).json();
     assert_eq!(combined["total"], json!(12));
@@ -1192,6 +1218,7 @@ async fn logs_pagination_and_filters() {
         &fixture,
         other.id,
         "feishu",
+        "集成测试",
         "success",
         &format!("{}-other", fixture.prefix),
         &format!("{}-other-log", fixture.prefix),
@@ -1942,7 +1969,7 @@ async fn settings_public_base_url_applies_immediately() {
         app,
         post_json_with(
             "/api/admin/channels",
-            &json!({"platform": "dingtalk", "bot_profile_id": bot_id}),
+            &json!({"hook_type": "dingtalk", "bot_profile_id": bot_id}),
             &user_auth
         )
     );
@@ -1951,7 +1978,7 @@ async fn settings_public_base_url_applies_immediately() {
         app,
         post_json_with(
             "/api/admin/channels",
-            &json!({"platform": "github", "bot_profile_id": bot_id}),
+            &json!({"hook_type": "github", "bot_profile_id": bot_id}),
             &user_auth
         )
     );
@@ -1964,7 +1991,7 @@ async fn settings_public_base_url_applies_immediately() {
     assert_eq!(rows.len(), 2);
     let dingtalk_row = rows
         .iter()
-        .find(|row| row["platform"] == json!("dingtalk"))
+        .find(|row| row["hook_type"] == json!("dingtalk"))
         .unwrap();
     assert_eq!(
         dingtalk_row["webhook_url"],
@@ -1972,7 +1999,7 @@ async fn settings_public_base_url_applies_immediately() {
     );
     let github_row = rows
         .iter()
-        .find(|row| row["platform"] == json!("github"))
+        .find(|row| row["hook_type"] == json!("github"))
         .unwrap();
     assert_eq!(
         github_row["webhook_url"],
@@ -2058,6 +2085,7 @@ async fn stats_today_follows_timezone_and_trend() {
         &fixture,
         owner.id,
         "dingtalk",
+        "订单系统",
         "success",
         "本地昨天",
         &format!("{}-before", fixture.prefix),
@@ -2068,6 +2096,7 @@ async fn stats_today_follows_timezone_and_trend() {
         &fixture,
         owner.id,
         "dingtalk",
+        "订单系统",
         "success",
         "本地今天成功",
         &format!("{}-after-ok", fixture.prefix),
@@ -2078,6 +2107,7 @@ async fn stats_today_follows_timezone_and_trend() {
         &fixture,
         owner.id,
         "wecom",
+        "监控告警",
         "failed",
         "本地今天失败",
         &format!("{}-after-fail", fixture.prefix),
@@ -2089,6 +2119,7 @@ async fn stats_today_follows_timezone_and_trend() {
         &fixture,
         other.id,
         "feishu",
+        "订单系统",
         "success",
         "别人的今天",
         &format!("{}-other", fixture.prefix),
@@ -2103,31 +2134,32 @@ async fn stats_today_follows_timezone_and_trend() {
     assert_eq!(stats["today"]["success"], json!(1));
     assert_eq!(stats["success_rate"], json!(0.5));
 
-    let platforms = stats["by_platform"]
+    let sources = stats["by_source"]
         .as_array()
         .unwrap()
         .iter()
         .map(|row| {
             (
-                row["platform"].as_str().unwrap().to_string(),
+                row["source"].as_str().unwrap().to_string(),
                 row["count"].as_i64().unwrap(),
             )
         })
         .collect::<Vec<_>>();
     assert!(
-        platforms.contains(&("dingtalk".to_string(), 1)),
-        "{platforms:?}"
+        sources.contains(&("订单系统".to_string(), 1)),
+        "{sources:?}"
     );
     assert!(
-        platforms.contains(&("wecom".to_string(), 1)),
-        "{platforms:?}"
+        sources.contains(&("监控告警".to_string(), 1)),
+        "{sources:?}"
     );
-    assert_eq!(platforms.len(), 2);
+    assert_eq!(sources.len(), 2);
 
     let failures = stats["recent_failures"].as_array().unwrap();
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0]["id"], json!(after_failed));
-    assert_eq!(failures[0]["platform"], json!("wecom"));
+    assert_eq!(failures[0]["hook_type"], json!("wecom"));
+    assert_eq!(failures[0]["push_source"], json!("监控告警"));
     assert_eq!(failures[0]["error_code"], json!("50012"));
     assert_eq!(failures[0]["error_message"], json!("机器人已被移除"));
 

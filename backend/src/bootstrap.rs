@@ -14,7 +14,7 @@ use crate::auth::passwords::hash_password_async;
 use crate::config::Config;
 use crate::crypto::{encrypt_secret, random_token};
 use crate::db::models::{
-    PLATFORM_DINGTALK, PLATFORM_FEISHU, PLATFORM_WECOM, ROLE_SUPER_ADMIN, STATUS_ACTIVE, User,
+    HOOK_TYPE_DINGTALK, HOOK_TYPE_FEISHU, HOOK_TYPE_WECOM, ROLE_SUPER_ADMIN, STATUS_ACTIVE, User,
 };
 use crate::db::queries;
 use crate::db::queries::bots::NewBotProfile;
@@ -126,13 +126,14 @@ pub async fn run(
             },
         )
         .await?;
-        for platform in [PLATFORM_DINGTALK, PLATFORM_WECOM, PLATFORM_FEISHU] {
+        for hook_type in [HOOK_TYPE_DINGTALK, HOOK_TYPE_WECOM, HOOK_TYPE_FEISHU] {
             let token = random_token(24);
             queries::channels::insert(
                 &mut *tx,
                 &NewChannel {
                     bot_profile_id: bot_id,
-                    platform,
+                    hook_type,
+                    push_source: "",
                     webhook_token: &token,
                     enabled: true,
                     extra: None,

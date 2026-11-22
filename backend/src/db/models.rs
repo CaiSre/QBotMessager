@@ -14,16 +14,16 @@ pub const ROLES: [&str; 2] = [ROLE_SUPER_ADMIN, ROLE_USER];
 pub const STATUS_ACTIVE: &str = "active";
 pub const STATUS_DISABLED: &str = "disabled";
 
-pub const PLATFORM_DINGTALK: &str = "dingtalk";
-pub const PLATFORM_WECOM: &str = "wecom";
-pub const PLATFORM_FEISHU: &str = "feishu";
-pub const PLATFORM_GITHUB: &str = "github";
-/// 全部合法平台。
-pub const PLATFORMS: [&str; 4] = [
-    PLATFORM_DINGTALK,
-    PLATFORM_WECOM,
-    PLATFORM_FEISHU,
-    PLATFORM_GITHUB,
+pub const HOOK_TYPE_DINGTALK: &str = "dingtalk";
+pub const HOOK_TYPE_WECOM: &str = "wecom";
+pub const HOOK_TYPE_FEISHU: &str = "feishu";
+pub const HOOK_TYPE_GITHUB: &str = "github";
+/// 全部合法钩子类型。
+pub const HOOK_TYPES: [&str; 4] = [
+    HOOK_TYPE_DINGTALK,
+    HOOK_TYPE_WECOM,
+    HOOK_TYPE_FEISHU,
+    HOOK_TYPE_GITHUB,
 ];
 
 /// 账号。
@@ -162,20 +162,22 @@ pub struct BotProfile {
     pub created_at: NaiveDateTime,
 }
 
-/// 平台接入通道；webhook_token 用于反查所属机器人。
+/// 钩子类型接入通道；webhook_token 用于反查所属机器人。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Channel {
     /// 主键。
     pub id: i64,
     /// 所属机器人。
     pub bot_profile_id: i64,
-    /// 平台标识。
-    pub platform: String,
+    /// 钩子类型。
+    pub hook_type: String,
+    /// 推送来源（用户自填）。
+    pub push_source: String,
     /// Webhook 凭据（唯一）。
     pub webhook_token: String,
     /// 是否启用。
     pub enabled: bool,
-    /// 平台附加配置（JSON）。
+    /// 钩子附加配置（JSON）。
     pub extra: Option<Value>,
     /// 创建时间。
     pub created_at: NaiveDateTime,
@@ -192,9 +194,11 @@ pub struct PushLog {
     pub channel_id: Option<i64>,
     /// 机器人（删除机器人后置空）。
     pub bot_profile_id: Option<i64>,
-    /// 平台标识。
-    pub platform: String,
-    /// 平台原始消息类型。
+    /// 钩子类型。
+    pub hook_type: String,
+    /// 推送来源（用户自填）。
+    pub push_source: String,
+    /// 钩子原始消息类型。
     pub source_msgtype: String,
     /// 推送目标。
     pub target: String,
@@ -320,11 +324,11 @@ mod tests {
         assert_eq!(ROLE_USER, "user");
         assert_eq!(STATUS_ACTIVE, "active");
         assert_eq!(STATUS_DISABLED, "disabled");
-        assert_eq!(PLATFORM_DINGTALK, "dingtalk");
-        assert_eq!(PLATFORM_WECOM, "wecom");
-        assert_eq!(PLATFORM_FEISHU, "feishu");
-        assert_eq!(PLATFORM_GITHUB, "github");
+        assert_eq!(HOOK_TYPE_DINGTALK, "dingtalk");
+        assert_eq!(HOOK_TYPE_WECOM, "wecom");
+        assert_eq!(HOOK_TYPE_FEISHU, "feishu");
+        assert_eq!(HOOK_TYPE_GITHUB, "github");
         assert_eq!(ROLES.len(), 2);
-        assert_eq!(PLATFORMS.len(), 4);
+        assert_eq!(HOOK_TYPES.len(), 4);
     }
 }

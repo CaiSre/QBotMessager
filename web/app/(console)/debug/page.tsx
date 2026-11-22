@@ -29,7 +29,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { CopyButton, EmptyHint, ErrorAlert, PageHeader } from "@/components/ui";
 import { messageOf } from "@/lib/api";
 import { useApi } from "@/lib/hooks";
-import { PLATFORM_LABELS, type Channel, type Platform } from "@/lib/types";
+import { HOOK_TYPE_LABELS, type Channel, type HookType } from "@/lib/types";
 
 interface MsgTypeDef {
   value: string;
@@ -43,7 +43,7 @@ interface MsgTypeDef {
   urlLabel?: string;
 }
 
-const MSG_TYPES: Record<Platform, MsgTypeDef[]> = {
+const MSG_TYPES: Record<HookType, MsgTypeDef[]> = {
   dingtalk: [
     { value: "text", label: "文本 text", showAtAll: true },
     { value: "markdown", label: "Markdown", showTitle: true, showAtAll: true },
@@ -90,14 +90,14 @@ const MSG_TYPES: Record<Platform, MsgTypeDef[]> = {
   github: [],
 };
 
-const PLATFORMS: Platform[] = ["dingtalk", "wecom", "feishu"];
+const HOOK_TYPES: HookType[] = ["dingtalk", "wecom", "feishu"];
 
 // GitHub 不参与调试页，其消息类型列表为空；兜底常量保证取默认类型时不会越界。
 const FALLBACK_MSG_TYPE: MsgTypeDef = { value: "text", label: "文本 text" };
 
-/** 取该平台的默认消息类型（各平台列表的首项）。 */
-function defaultMsgType(platform: Platform): MsgTypeDef {
-  return MSG_TYPES[platform].at(0) ?? FALLBACK_MSG_TYPE;
+/** 取该钩子类型的默认消息类型（各列表的首项）。 */
+function defaultMsgType(hookType: HookType): MsgTypeDef {
+  return MSG_TYPES[hookType].at(0) ?? FALLBACK_MSG_TYPE;
 }
 
 const TARGET_OPTIONS = [
@@ -125,7 +125,7 @@ function prettyBody(text: string): string {
 }
 
 function buildPayload(form: {
-  platform: Platform;
+  hookType: HookType;
   msgType: string;
   title: string;
   content: string;
@@ -136,7 +136,7 @@ function buildPayload(form: {
   const content = form.content.trim();
   const url = form.url.trim();
   const at = form.atAll ? { at: { isAtAll: true } } : {};
-  const key = `${form.platform}:${form.msgType}`;
+  const key = `${form.hookType}:${form.msgType}`;
 
   switch (key) {
     case "dingtalk:text":
@@ -186,7 +186,7 @@ export default function DebugPage() {
   const channels = useApi<Channel[]>("/api/admin/channels");
   const channelList = channels.data ?? [];
 
-  const [platform, setPlatform] = useState<Platform>("dingtalk");
+  const [hookType, setHookType] = useState<HookType>("dingtalk");
   const [channelId, setChannelId] = useState("");
   const [token, setToken] = useState("");
   const [msgType, setMsgType] = useState("text");
@@ -213,22 +213,22 @@ export default function DebugPage() {
   useEffect(() => {
     if (initialized.current) return;
     const first =
-      channelList.find((item) => PLATFORMS.includes(item.platform) && item.enabled) ??
-      channelList.find((item) => PLATFORMS.includes(item.platform));
+      channelList.find((item) => HOOK_TYPES.includes(item.hook_type) && item.enabled) ??
+      channelList.find((item) => HOOK_TYPES.includes(item.hook_type));
     if (!first) return;
     initialized.current = true;
-    setPlatform(first.platform);
+    setHookType(first.hook_type);
     setChannelId(String(first.id));
     setToken(first.webhook_token);
-    setMsgType(defaultMsgType(first.platform).value);
+    setMsgType(defaultMsgType(first.hook_type).value);
   }, [channelList]);
 
-  const platformChannels = channelList.filter((item) => item.platform === platform);
+  const hookTypeChannels = channelList.filter((item) => item.hook_type === hookType);
   const typeDef =
-    MSG_TYPES[platform].find((item) => item.value === msgType) ?? defaultMsgType(platform);
+    MSG_TYPES[hookType].find((item) => item.value === msgType) ?? defaultMsgType(hookType);
 
-  function changePlatform(next: Platform) {
-    setPlatform(next);
+  function changeHookType(next: HookType) {
+    setHookType(next);
     if (!MSG_TYPES[next].some((item) => item.value === msgType)) {
       setMsgType(defaultMsgType(next).value);
     }
@@ -241,16 +241,16 @@ export default function DebugPage() {
     setChannelId(next);
     const channel = channelList.find((item) => String(item.id) === next);
     if (!channel) return;
-    setPlatform(channel.platform);
-    if (!MSG_TYPES[channel.platform].some((item) => item.value === msgType)) {
-      setMsgType(defaultMsgType(channel.platform).value);
+    setHookType(channel.hook_type);
+    if (!MSG_TYPES[channel.hook_type].some((item) => item.value === msgType)) {
+      setMsgType(defaultMsgType(channel.hook_type).value);
     }
     setToken(channel.webhook_token);
     setResult(null);
     setError(null);
   }
 
-  const payload = buildPayload({ platform, msgType, title, content, url, atAll });
+  const payload = buildPayload({ hookType, msgType, title, content, url, atAll });
   if (targetKind === "group" && targetValue.trim()) {
     payload.group_openid = targetValue.trim();
   }
@@ -258,7 +258,7 @@ export default function DebugPage() {
     payload.openid = targetValue.trim();
   }
 
-  const endpoint = `${origin}/webhook/${platform}`;
+  const endpoint = `${origin}/webhook/${hookType}`;
   const tokenText = token.trim() || "<YOUR_TOKEN>";
   const payloadJson = JSON.stringify(payload, null, 2);
 
@@ -302,7 +302,7 @@ export default function DebugPage() {
   function validate(): string | null {
     if (!token.trim()) return "请选择通道或填写 Webhook Token";
     if (typeDef.showContent !== false && !content.trim()) return "请填写消息内容";
-    if (platform === "dingtalk" && msgType === "feedCard") {
+    if (hookType === "dingtalk" && msgType === "feedCard") {
       if (!title.trim()) return "feedCard 需要填写标题";
       if (!url.trim()) return "feedCard 需要填写链接";
     }
@@ -321,11 +321,12 @@ export default function DebugPage() {
     setResult(null);
     const started = performance.now();
     try {
-      const response = await fetch(`/webhook/${platform}`, {
+      const response = await fetch(`/webhook/${hookType}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token.trim()}`,
+          "X-QBot-Debug": "1",
         },
         body: JSON.stringify(payload),
       });
@@ -348,13 +349,13 @@ export default function DebugPage() {
     }
   }
 
-  const platformItems = PLATFORMS.map((item) => ({
-    label: PLATFORM_LABELS[item],
+  const hookTypeItems = HOOK_TYPES.map((item) => ({
+    label: HOOK_TYPE_LABELS[item],
     value: item,
   }));
-  const typeItems = MSG_TYPES[platform].map((item) => ({ label: item.label, value: item.value }));
-  const channelItems = platformChannels.map((item) => ({
-    label: `${PLATFORM_LABELS[item.platform]} #${item.id}${item.enabled ? "" : "（停用）"}`,
+  const typeItems = MSG_TYPES[hookType].map((item) => ({ label: item.label, value: item.value }));
+  const channelItems = hookTypeChannels.map((item) => ({
+    label: `${HOOK_TYPE_LABELS[item.hook_type]} #${item.id}${item.enabled ? "" : "（停用）"}`,
     value: String(item.id),
   }));
   const targetItems = TARGET_OPTIONS.map((item) => ({ label: item.label, value: item.value }));
@@ -363,7 +364,7 @@ export default function DebugPage() {
     <div>
       <PageHeader
         title="推送调试"
-        description="按平台填写参数，右侧实时生成推送代码，并可直接向 QQ 试发一条消息"
+        description="按钩子类型填写参数，右侧实时生成推送代码，并可直接向 QQ 试发一条消息"
       />
       <ErrorAlert message={error ?? channels.error} />
 
@@ -378,18 +379,18 @@ export default function DebugPage() {
             <div className="flex flex-col gap-4">
               <div className="grid gap-4 sm:grid-cols-2">
                 <div className="flex flex-col gap-2">
-                  <Label>来源平台</Label>
+                  <Label>钩子类型</Label>
                   <Select
-                    items={platformItems}
-                    value={platform}
-                    onValueChange={(value) => changePlatform(String(value) as Platform)}
+                    items={hookTypeItems}
+                    value={hookType}
+                    onValueChange={(value) => changeHookType(String(value) as HookType)}
                   >
                     <SelectTrigger className="w-full">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent alignItemWithTrigger={false}>
                       <SelectGroup>
-                        {platformItems.map((item) => (
+                        {hookTypeItems.map((item) => (
                           <SelectItem key={item.value} value={item.value}>
                             {item.label}
                           </SelectItem>
@@ -445,7 +446,7 @@ export default function DebugPage() {
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">
-                  当前平台还没有通道？先到「机器人」页面新增。
+                  当前钩子类型还没有通道？先到「机器人」页面新增。
                 </p>
               </div>
 
@@ -484,7 +485,7 @@ export default function DebugPage() {
                     onChange={(event) => setContent(event.target.value)}
                   />
                   <p className="text-xs text-muted-foreground">
-                    支持 Markdown；实际渲染取决于平台适配器与 QQ 消息限制。
+                    支持 Markdown；实际渲染取决于钩子适配器与 QQ 消息限制。
                   </p>
                 </div>
               ) : null}

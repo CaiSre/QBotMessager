@@ -1,11 +1,11 @@
 //! Webhook 接收端点（`/webhook`）。
 //!
 //! 端点清单：
-//! - `POST /webhook/{platform}` —— `platform ∈ {dingtalk,wecom,feishu,github}`
+//! - `POST /webhook/{hook_type}` —— `hook_type ∈ {dingtalk,wecom,feishu,github}`
 //! - `POST /webhook/github/{token}` —— GitHub 专用（token 在路径）
 //!
 //! 行为要点：请求体上限、token 提取顺序、
-//! GitHub 签名校验、平台响应体形状、队列优先与同步降级。
+//! GitHub 签名校验、钩子响应体形状、队列优先与同步降级。
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -25,10 +25,11 @@ use crate::adapters::{
     WeComAdapter,
 };
 use crate::crypto::decrypt_secret;
-use crate::db::models::{BotProfile, Channel, PLATFORM_GITHUB, PLATFORMS};
+use crate::db::models::{BotProfile, Channel, HOOK_TYPE_GITHUB, HOOK_TYPES};
 use crate::db::queries;
 use crate::error::AppError;
-use crate::renderer::render_qq_with_limits;
+use crate::markdown::truncate;
+use crate::renderer::{MSG_TYPE_MARKDOWN, QqPayload, render_qq_with_limits};
 use crate::services::push::{PushJob, execute_push};
 use crate::services::qq::QqTarget;
 use crate::services::queue::{QueueError, dedupe_key};
@@ -38,52 +39,56 @@ use crate::state::AppState;
 const MAX_FANOUT: usize = 50;
 /// 单个目标 openid 长度上限。
 const MAX_TARGET_LEN: usize = 128;
-/// 平台事件头。
+/// 钩子事件头。
 const GITHUB_EVENT_HEADER: &str = "X-GitHub-Event";
-/// 平台投递 ID 头。
+/// 钩子投递 ID 头。
 const GITHUB_DELIVERY_HEADER: &str = "X-GitHub-Delivery";
 /// GitHub 签名头。
 const GITHUB_SIGNATURE_HEADER: &str = "X-Hub-Signature-256";
 /// Webhook 凭据头。
 const WEBHOOK_TOKEN_HEADER: &str = "X-Webhook-Token";
+/// 推送调试标记头：存在时来源标注固定为「推送调试」。
+const DEBUG_PUSH_HEADER: &str = "X-QBot-Debug";
+/// 推送调试的来源标注。
+const DEBUG_PUSH_SOURCE: &str = "推送调试";
 
 /// 注册 Webhook 路由。
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/webhook")
             .route("/github/{token}", web::post().to(github_webhook))
-            .route("/{platform}", web::post().to(receive_webhook)),
+            .route("/{hook_type}", web::post().to(receive_webhook)),
     );
 }
 
 // --------------------------------------------------------------------- 处理器
 
-/// `POST /webhook/{platform}`
+/// `POST /webhook/{hook_type}`
 async fn receive_webhook(
     path: web::Path<String>,
     req: HttpRequest,
     state: web::Data<AppState>,
     body: web::Payload,
 ) -> Result<HttpResponse, AppError> {
-    let platform = path.into_inner();
-    if !PLATFORMS.contains(&platform.as_str()) {
+    let hook_type = path.into_inner();
+    if !HOOK_TYPES.contains(&hook_type.as_str()) {
         // 路径段来自外部输入，不回显以避免反射型注入。
-        return Ok(platform_response(
-            &platform,
+        return Ok(hook_type_response(
+            &hook_type,
             StatusCode::NOT_FOUND,
             404,
-            "未知平台",
+            "未知钩子类型",
         ));
     }
-    if platform == PLATFORM_GITHUB {
-        return Ok(platform_response(
-            &platform,
+    if hook_type == HOOK_TYPE_GITHUB {
+        return Ok(hook_type_response(
+            &hook_type,
             StatusCode::NOT_FOUND,
             404,
             "GitHub 通道请使用 /webhook/github/{token}",
         ));
     }
-    receive(&req, &state, body, &platform, None).await
+    receive(&req, &state, body, &hook_type, None).await
 }
 
 /// `POST /webhook/github/{token}`
@@ -94,7 +99,7 @@ async fn github_webhook(
     body: web::Payload,
 ) -> Result<HttpResponse, AppError> {
     let token = path.into_inner();
-    receive(&req, &state, body, PLATFORM_GITHUB, Some(&token)).await
+    receive(&req, &state, body, HOOK_TYPE_GITHUB, Some(&token)).await
 }
 
 // ------------------------------------------------------------------ 核心流程
@@ -104,11 +109,11 @@ async fn receive(
     req: &HttpRequest,
     state: &AppState,
     body: web::Payload,
-    platform: &str,
+    hook_type: &str,
     path_token: Option<&str>,
 ) -> Result<HttpResponse, AppError> {
     let settings = state.settings().clone();
-    let limit = if platform == PLATFORM_GITHUB {
+    let limit = if hook_type == HOOK_TYPE_GITHUB {
         settings.github_max_body_bytes()
     } else {
         settings.max_body_bytes()
@@ -118,8 +123,8 @@ async fn receive(
     // GitHub 的签名校验依赖原始请求体，仍保持在读体之后。
     let token = extract_token(req, path_token, settings.webhook_allow_query_token());
     if token.is_empty() {
-        return Ok(platform_response(
-            platform,
+        return Ok(hook_type_response(
+            hook_type,
             StatusCode::UNAUTHORIZED,
             401,
             "缺少 webhook token",
@@ -127,10 +132,10 @@ async fn receive(
     }
 
     let Some(channel) =
-        queries::channels::find_enabled_for_platform(&state.pool, platform, &token).await?
+        queries::channels::find_enabled_for_hook_type(&state.pool, hook_type, &token).await?
     else {
-        return Ok(platform_response(
-            platform,
+        return Ok(hook_type_response(
+            hook_type,
             StatusCode::UNAUTHORIZED,
             401,
             "token 无效或通道已停用",
@@ -147,8 +152,8 @@ async fn receive(
             .parse::<u64>()
             .is_ok_and(|length| length > limit as u64)
     {
-        return Ok(platform_response(
-            platform,
+        return Ok(hook_type_response(
+            hook_type,
             StatusCode::PAYLOAD_TOO_LARGE,
             413,
             "请求体过大",
@@ -158,16 +163,16 @@ async fn receive(
     let raw = match body.to_bytes_limited(limit).await {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(_)) => {
-            return Ok(platform_response(
-                platform,
+            return Ok(hook_type_response(
+                hook_type,
                 StatusCode::BAD_REQUEST,
                 400,
                 "请求体读取失败",
             ));
         }
         Err(_) => {
-            return Ok(platform_response(
-                platform,
+            return Ok(hook_type_response(
+                hook_type,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 413,
                 "请求体过大",
@@ -175,23 +180,23 @@ async fn receive(
         }
     };
 
-    if platform == PLATFORM_GITHUB
+    if hook_type == HOOK_TYPE_GITHUB
         && let Some((status, message)) =
             verify_github_signature(&channel, req, &raw, state.config.app_secret_key.as_deref())
     {
-        return Ok(platform_response(
-            platform,
+        return Ok(hook_type_response(
+            hook_type,
             status,
             status.as_u16(),
             message,
         ));
     }
 
-    if platform == PLATFORM_GITHUB
+    if hook_type == HOOK_TYPE_GITHUB
         && let Some((status, message)) = reject_replayed_delivery(&channel, req)
     {
-        return Ok(platform_response(
-            platform,
+        return Ok(hook_type_response(
+            hook_type,
             status,
             status.as_u16(),
             message,
@@ -204,8 +209,8 @@ async fn receive(
         match serde_json::from_slice(&raw) {
             Ok(payload) => payload,
             Err(_) => {
-                return Ok(platform_response(
-                    platform,
+                return Ok(hook_type_response(
+                    hook_type,
                     StatusCode::BAD_REQUEST,
                     400,
                     "请求体不是合法 JSON",
@@ -216,15 +221,15 @@ async fn receive(
 
     let Some(bot) = queries::bots::find_enabled_by_id(&state.pool, channel.bot_profile_id).await?
     else {
-        return Ok(platform_response(
-            platform,
+        return Ok(hook_type_response(
+            hook_type,
             StatusCode::BAD_GATEWAY,
             502,
             "机器人配置不可用",
         ));
     };
 
-    let event = if platform == PLATFORM_GITHUB {
+    let event = if hook_type == HOOK_TYPE_GITHUB {
         req.headers()
             .get(GITHUB_EVENT_HEADER)
             .and_then(|value| value.to_str().ok())
@@ -232,20 +237,20 @@ async fn receive(
     } else {
         ""
     };
-    let message = match parse_message(platform, &payload, event) {
+    let message = match parse_message(hook_type, &payload, event) {
         Ok(message) => message,
         Err(AdapterError::Ignored(reason)) => {
-            // 未订阅的事件按成功确认，避免平台判定投递失败并重试。
-            return Ok(platform_response(
-                platform,
+            // 未订阅的事件按成功确认，避免钩子判定投递失败并重试。
+            return Ok(hook_type_response(
+                hook_type,
                 StatusCode::OK,
                 0,
                 reason.0.as_str(),
             ));
         }
         Err(AdapterError::Payload(reason)) => {
-            return Ok(platform_response(
-                platform,
+            return Ok(hook_type_response(
+                hook_type,
                 StatusCode::BAD_REQUEST,
                 400,
                 reason.0.as_str(),
@@ -255,8 +260,8 @@ async fn receive(
 
     let targets = resolve_targets(&payload, &bot);
     if targets.is_empty() {
-        return Ok(platform_response(
-            platform,
+        return Ok(hook_type_response(
+            hook_type,
             StatusCode::BAD_REQUEST,
             400,
             "未指定推送目标且机器人未配置默认目标",
@@ -264,8 +269,8 @@ async fn receive(
     }
 
     if decrypt_secret(&bot.qq_app_secret, state.config.app_secret_key.as_deref()).is_err() {
-        return Ok(platform_response(
-            platform,
+        return Ok(hook_type_response(
+            hook_type,
             StatusCode::BAD_GATEWAY,
             502,
             "机器人密钥无法解密，请检查 APP_SECRET_KEY",
@@ -273,11 +278,15 @@ async fn receive(
     }
 
     let request_id = Uuid::new_v4().simple().to_string();
-    let qq_payload = render_qq_with_limits(
-        &message,
-        settings.markdown_max_len(),
-        settings.text_max_len(),
-    );
+    let push_source = if req.headers().contains_key(DEBUG_PUSH_HEADER) {
+        DEBUG_PUSH_SOURCE.to_string()
+    } else {
+        channel.push_source.clone()
+    };
+    let markdown_max_len = settings.markdown_max_len();
+    let text_max_len = settings.text_max_len();
+    let qq_payload = render_qq_with_limits(&message, markdown_max_len, text_max_len);
+    let qq_payload = with_push_source(qq_payload, &push_source, markdown_max_len, text_max_len);
     let source_msgtype = if message.source_msgtype.is_empty() {
         "unknown".to_string()
     } else {
@@ -285,7 +294,8 @@ async fn receive(
     };
     let job = PushJob {
         request_id: request_id.clone(),
-        platform: channel.platform.clone(),
+        hook_type: channel.hook_type.clone(),
+        push_source,
         channel_id: Some(channel.id),
         bot_id: bot.id,
         owner_user_id: bot.owner_user_id,
@@ -300,29 +310,29 @@ async fn receive(
     };
 
     if let Some(queue) = state.queue.as_ref() {
-        let delivery = delivery_id(platform, req, &payload);
-        // 通道并入去重键：同一条平台投递可配置到多个通道，各通道独立计数。
-        let job_id = dedupe_key(platform, channel.id, delivery.as_deref(), &request_id);
+        let delivery = delivery_id(hook_type, req, &payload);
+        // 通道并入去重键：同一条钩子投递可配置到多个通道，各通道独立计数。
+        let job_id = dedupe_key(hook_type, channel.id, delivery.as_deref(), &request_id);
         match queue.enqueue(job.clone(), &job_id).await {
             Ok(false) => {
-                return Ok(platform_response(
-                    platform,
+                return Ok(hook_type_response(
+                    hook_type,
                     StatusCode::OK,
                     0,
                     "重复投递，已忽略",
                 ));
             }
-            Ok(true) => return Ok(platform_response(platform, StatusCode::OK, 0, "ok")),
+            Ok(true) => return Ok(hook_type_response(hook_type, StatusCode::OK, 0, "ok")),
             Err(QueueError::Full(_)) => {
                 tracing::warn!(
-                    platform,
+                    hook_type,
                     request_id = %request_id,
                     "推送队列积压，拒绝入队"
                 );
-                // 其他平台会重试失败投递；GitHub 不会，改走同步发送避免事件丢失。
-                if platform != PLATFORM_GITHUB {
-                    return Ok(platform_response(
-                        platform,
+                // 其他钩子类型会重试失败投递；GitHub 不会，改走同步发送避免事件丢失。
+                if hook_type != HOOK_TYPE_GITHUB {
+                    return Ok(hook_type_response(
+                        hook_type,
                         StatusCode::SERVICE_UNAVAILABLE,
                         503,
                         "推送队列繁忙，请稍后重试",
@@ -332,7 +342,7 @@ async fn receive(
             Err(err) => {
                 tracing::warn!(
                     error = %err,
-                    platform,
+                    hook_type,
                     request_id = %request_id,
                     "推送队列不可用，改为同步发送"
                 );
@@ -354,7 +364,7 @@ async fn receive(
     .await;
     let failures = outcome.failed();
     if failures.is_empty() {
-        return Ok(platform_response(platform, StatusCode::OK, 0, "ok"));
+        return Ok(hook_type_response(hook_type, StatusCode::OK, 0, "ok"));
     }
     // 具体失败原因只进日志与 push_logs（execute_push 已落库），对外固定文案。
     tracing::warn!(failures = ?failures, request_id = %request_id, "同步推送存在失败");
@@ -363,8 +373,8 @@ async fn receive(
     } else {
         "部分目标推送失败"
     };
-    Ok(platform_response(
-        platform,
+    Ok(hook_type_response(
+        hook_type,
         StatusCode::BAD_GATEWAY,
         502,
         message,
@@ -373,20 +383,53 @@ async fn receive(
 
 // ------------------------------------------------------------------ 辅助函数
 
-/// 平台响应体。
-fn platform_response(
-    platform: &str,
+/// 在转换后的消息头部标注推送来源：Markdown 用一级标题，纯文本用普通一行。
+fn with_push_source(
+    payload: QqPayload,
+    push_source: &str,
+    markdown_max_len: usize,
+    text_max_len: usize,
+) -> QqPayload {
+    // 来源为用户自填，压平换行避免破坏头部结构。
+    let source = push_source.replace(['\r', '\n'], " ");
+    let source = source.trim();
+    if source.is_empty() {
+        return payload;
+    }
+    if payload.msg_type == MSG_TYPE_MARKDOWN {
+        let body = payload.markdown.as_deref().unwrap_or_default();
+        let markdown = truncate(
+            &format!("# 「消息来源」{source}\n\n{body}"),
+            Some(markdown_max_len),
+        );
+        return QqPayload {
+            markdown: Some(markdown),
+            ..payload
+        };
+    }
+    QqPayload {
+        content: truncate(
+            &format!("「消息来源」{source}\n{}", payload.content),
+            Some(text_max_len),
+        ),
+        ..payload
+    }
+}
+
+/// 钩子类型响应体。
+fn hook_type_response(
+    hook_type: &str,
     status: StatusCode,
     errcode: u16,
     errmsg: &str,
 ) -> HttpResponse {
-    let body = if platform == PLATFORM_GITHUB {
+    let body = if hook_type == HOOK_TYPE_GITHUB {
         if errcode == 0 {
             json!({"ok": true})
         } else {
             json!({"ok": false, "error": errmsg})
         }
-    } else if platform == "feishu" {
+    } else if hook_type == "feishu" {
         if errcode == 0 {
             json!({"code": 0, "msg": "success", "data": {}})
         } else {
@@ -501,18 +544,18 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// 按平台构造适配器并解析负载。
+/// 按钩子类型构造适配器并解析负载。
 fn parse_message(
-    platform: &str,
+    hook_type: &str,
     payload: &Value,
     event: &str,
 ) -> Result<UnifiedMessage, AdapterError> {
-    match platform {
+    match hook_type {
         "dingtalk" => DingTalkAdapter::new().parse(payload, event),
         "wecom" => WeComAdapter::new().parse(payload, event),
         "feishu" => FeishuAdapter::new().parse(payload, event),
-        PLATFORM_GITHUB => GitHubAdapter::new().parse(payload, event),
-        _ => Err(AdapterError::payload(format!("未知平台：{platform}"))),
+        HOOK_TYPE_GITHUB => GitHubAdapter::new().parse(payload, event),
+        _ => Err(AdapterError::payload(format!("未知钩子类型：{hook_type}"))),
     }
 }
 
@@ -563,9 +606,9 @@ fn resolve_targets(payload: &Value, bot: &BotProfile) -> Vec<QqTarget> {
         .unwrap_or_default()
 }
 
-/// 平台投递 ID，用于队列去重与防重放。
-fn delivery_id(platform: &str, req: &HttpRequest, payload: &Value) -> Option<String> {
-    if platform == PLATFORM_GITHUB {
+/// 钩子投递 ID，用于队列去重与防重放。
+fn delivery_id(hook_type: &str, req: &HttpRequest, payload: &Value) -> Option<String> {
+    if hook_type == HOOK_TYPE_GITHUB {
         return req
             .headers()
             .get(GITHUB_DELIVERY_HEADER)
@@ -573,7 +616,7 @@ fn delivery_id(platform: &str, req: &HttpRequest, payload: &Value) -> Option<Str
             .filter(|value| !value.is_empty())
             .map(str::to_string);
     }
-    if platform == "feishu" {
+    if hook_type == "feishu" {
         return payload
             .get("header")
             .and_then(|header| header.get("event_id"))

@@ -25,7 +25,7 @@ impl WeComAdapter {
 }
 
 impl Adapter for WeComAdapter {
-    fn platform(&self) -> &'static str {
+    fn hook_type(&self) -> &'static str {
         "wecom"
     }
 

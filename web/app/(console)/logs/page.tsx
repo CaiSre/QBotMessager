@@ -48,16 +48,16 @@ import { EmptyHint, ErrorAlert, PageHeader } from "@/components/ui";
 import { STATUS_LABELS, formatDateTime, truncate } from "@/lib/format";
 import { useApi } from "@/lib/hooks";
 import { isSuperAdmin, useMe } from "@/lib/me";
-import { PLATFORM_LABELS, type LogPage, type Platform, type PushLog } from "@/lib/types";
+import { HOOK_TYPE_LABELS, type LogPage, type HookType, type PushLog } from "@/lib/types";
 
 const PAGE_SIZE = 20;
 
-const PLATFORM_OPTIONS: { id: string; label: string }[] = [
-  { id: "all", label: "全部平台" },
-  { id: "dingtalk", label: PLATFORM_LABELS.dingtalk },
-  { id: "wecom", label: PLATFORM_LABELS.wecom },
-  { id: "feishu", label: PLATFORM_LABELS.feishu },
-  { id: "github", label: PLATFORM_LABELS.github },
+const HOOK_TYPE_OPTIONS: { id: string; label: string }[] = [
+  { id: "all", label: "全部钩子类型" },
+  { id: "dingtalk", label: HOOK_TYPE_LABELS.dingtalk },
+  { id: "wecom", label: HOOK_TYPE_LABELS.wecom },
+  { id: "feishu", label: HOOK_TYPE_LABELS.feishu },
+  { id: "github", label: HOOK_TYPE_LABELS.github },
 ];
 
 const STATUS_OPTIONS = [
@@ -126,7 +126,7 @@ function pageWindow(current: number, total: number): (number | "gap-start" | "ga
 export default function LogsPage() {
   const me = useMe();
   const superAdmin = isSuperAdmin(me.role);
-  const [platform, setPlatform] = useState("all");
+  const [hookType, setHookType] = useState("all");
   const [status, setStatus] = useState("all");
   const [keyword, setKeyword] = useState("");
   const [appliedKeyword, setAppliedKeyword] = useState("");
@@ -135,11 +135,11 @@ export default function LogsPage() {
 
   const query = useMemo(() => {
     const params = new URLSearchParams({ page: String(page), page_size: String(PAGE_SIZE) });
-    if (platform !== "all") params.set("platform", platform);
+    if (hookType !== "all") params.set("hook_type", hookType);
     if (status !== "all") params.set("status", status);
     if (appliedKeyword) params.set("keyword", appliedKeyword);
     return `/api/admin/logs?${params.toString()}`;
-  }, [page, platform, status, appliedKeyword]);
+  }, [page, hookType, status, appliedKeyword]);
 
   const { data, error, loading } = useApi<LogPage>(query);
 
@@ -166,11 +166,11 @@ export default function LogsPage() {
           <div className="flex flex-row flex-wrap items-end gap-4">
             <div className="w-44">
               <FilterSelect
-                label="平台"
-                options={PLATFORM_OPTIONS}
-                value={platform}
+                label="钩子类型"
+                options={HOOK_TYPE_OPTIONS}
+                value={hookType}
                 onChange={(value) => {
-                  setPlatform(value);
+                  setHookType(value);
                   setPage(1);
                 }}
               />
@@ -225,7 +225,8 @@ export default function LogsPage() {
                   <TableRow>
                     <TableHead>时间</TableHead>
                     {superAdmin ? <TableHead>所属用户</TableHead> : null}
-                    <TableHead>平台</TableHead>
+                    <TableHead>钩子类型</TableHead>
+                    <TableHead>推送来源</TableHead>
                     <TableHead>状态</TableHead>
                     <TableHead>目标</TableHead>
                     <TableHead>内容</TableHead>
@@ -242,7 +243,10 @@ export default function LogsPage() {
                         </TableCell>
                       ) : null}
                       <TableCell>
-                        {PLATFORM_LABELS[row.platform as Platform] ?? row.platform}
+                        {HOOK_TYPE_LABELS[row.hook_type as HookType] ?? row.hook_type}
+                      </TableCell>
+                      <TableCell>
+                        <span className="text-xs">{row.push_source || "—"}</span>
                       </TableCell>
                       <TableCell>
                         <Badge variant={STATUS_VARIANTS[row.status] ?? "outline"}>
@@ -340,8 +344,10 @@ export default function LogsPage() {
               <dl className="grid grid-cols-[7rem_minmax(0,1fr)] gap-y-3 text-sm">
                 <dt className="text-muted-foreground">时间</dt>
                 <dd>{formatDateTime(detail.created_at)}</dd>
-                <dt className="text-muted-foreground">平台</dt>
-                <dd>{PLATFORM_LABELS[detail.platform] ?? detail.platform}</dd>
+                <dt className="text-muted-foreground">钩子类型</dt>
+                <dd>{HOOK_TYPE_LABELS[detail.hook_type] ?? detail.hook_type}</dd>
+                <dt className="text-muted-foreground">推送来源</dt>
+                <dd>{detail.push_source || "—"}</dd>
                 <dt className="text-muted-foreground">来源类型</dt>
                 <dd>{detail.source_msgtype ?? "—"}</dd>
                 <dt className="text-muted-foreground">状态</dt>

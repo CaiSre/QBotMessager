@@ -23,8 +23,8 @@ use qbotmessager::bootstrap;
 use qbotmessager::config::Config;
 use qbotmessager::crypto::decrypt_secret;
 use qbotmessager::db::models::{
-    PLATFORM_DINGTALK, PLATFORM_FEISHU, PLATFORM_WECOM, ROLE_SUPER_ADMIN, ROLE_USER, STATUS_ACTIVE,
-    STATUS_DISABLED,
+    HOOK_TYPE_DINGTALK, HOOK_TYPE_FEISHU, HOOK_TYPE_WECOM, ROLE_SUPER_ADMIN, ROLE_USER,
+    STATUS_ACTIVE, STATUS_DISABLED,
 };
 use qbotmessager::db::queries;
 use qbotmessager::db::queries::users::NewUser;
@@ -222,11 +222,11 @@ async fn creates_admin_bot_and_channels() {
         .await
         .expect("查询通道失败");
     assert_eq!(channels.len(), 3);
-    let mut platforms: Vec<&str> = channels.iter().map(|c| c.platform.as_str()).collect();
-    platforms.sort_unstable();
-    let mut expected = vec![PLATFORM_DINGTALK, PLATFORM_FEISHU, PLATFORM_WECOM];
+    let mut hook_types: Vec<&str> = channels.iter().map(|c| c.hook_type.as_str()).collect();
+    hook_types.sort_unstable();
+    let mut expected = vec![HOOK_TYPE_DINGTALK, HOOK_TYPE_FEISHU, HOOK_TYPE_WECOM];
     expected.sort_unstable();
-    assert_eq!(platforms, expected);
+    assert_eq!(hook_types, expected);
     let tokens: HashSet<&str> = channels.iter().map(|c| c.webhook_token.as_str()).collect();
     assert_eq!(tokens.len(), 3, "通道凭据必须互不相同");
     for channel in &channels {
@@ -236,6 +236,7 @@ async fn creates_admin_bot_and_channels() {
             "24 字节 token 应为 32 字符"
         );
         assert!(channel.enabled);
+        assert_eq!(channel.push_source, "", "默认通道的推送来源应为空");
     }
 }
 

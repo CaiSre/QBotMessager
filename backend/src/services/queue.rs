@@ -309,18 +309,18 @@ fn guard_expiry(now: NaiveDateTime, ttl_seconds: u64) -> NaiveDateTime {
 
 /// 计算可放进 `jobs.idempotency_key`（`varchar(36)`）的去重键。
 ///
-/// 语义为 `push:<platform>:<channel_id>:<delivery_id>`：键含通道维度，同平台
+/// 语义为 `push:<hook_type>:<channel_id>:<delivery_id>`：键含通道维度，同钩子类型
 /// 同投递 ID 落到不同通道时各自独立去重；无 delivery_id 时以 request_id 顶替。
 /// MySQL 列只有 36 字符，这里保留完整 SHA-256 的语义，取十六进制摘要前 36 位。
 pub fn dedupe_key(
-    platform: &str,
+    hook_type: &str,
     channel_id: i64,
     delivery_id: Option<&str>,
     request_id: &str,
 ) -> String {
     let raw = match delivery_id {
-        Some(delivery_id) => format!("push:{platform}:{channel_id}:{delivery_id}"),
-        None => format!("push:{platform}:{channel_id}:{request_id}"),
+        Some(delivery_id) => format!("push:{hook_type}:{channel_id}:{delivery_id}"),
+        None => format!("push:{hook_type}:{channel_id}:{request_id}"),
     };
     let digest = Sha256::digest(raw.as_bytes());
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -354,15 +354,15 @@ mod tests {
     fn dedupe_key_is_stable_and_fits_column() {
         let key = dedupe_key("github", 7, Some("delivery-1"), "request-a");
         assert_eq!(key.len(), DEDUPE_KEY_MAX_LEN);
-        // 相同的平台、通道与投递 ID 必须得到同一个键，与 request_id 无关
-        //（平台会重投同一条消息，但 request_id 每次请求都变）。
+        // 相同的钩子类型、通道与投递 ID 必须得到同一个键，与 request_id 无关
+        //（钩子会重投同一条消息，但 request_id 每次请求都变）。
         assert_eq!(
             key,
             dedupe_key("github", 7, Some("delivery-1"), "request-b")
         );
         // 硬编码值锁定摘要算法：sha256("push:github:7:delivery-1") 的前 36 位。
         assert_eq!(key, "0b0acf5805f67e583ce7eb9a1d2cdd897174");
-        // 不同通道各自独立去重：同平台同投递 ID 落到不同通道时不能互相压制。
+        // 不同通道各自独立去重：同钩子类型同投递 ID 落到不同通道时不能互相压制。
         assert_ne!(
             key,
             dedupe_key("github", 8, Some("delivery-1"), "request-a")
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_key_distinguishes_platform_and_delivery() {
+    fn dedupe_key_distinguishes_hook_type_and_delivery() {
         assert_ne!(
             dedupe_key("github", 7, Some("same"), "r"),
             dedupe_key("feishu", 7, Some("same"), "r")

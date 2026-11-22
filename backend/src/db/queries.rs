@@ -597,7 +597,7 @@ pub mod bots {
     }
 }
 
-/// 平台通道。
+/// 钩子类型通道。
 pub mod channels {
     use super::*;
 
@@ -606,13 +606,15 @@ pub mod channels {
     pub struct NewChannel<'a> {
         /// 所属机器人。
         pub bot_profile_id: i64,
-        /// 平台标识。
-        pub platform: &'a str,
+        /// 钩子类型。
+        pub hook_type: &'a str,
+        /// 推送来源（用户自填）。
+        pub push_source: &'a str,
         /// Webhook 凭据。
         pub webhook_token: &'a str,
         /// 是否启用。
         pub enabled: bool,
-        /// 平台附加配置（JSON）。
+        /// 钩子附加配置（JSON）。
         pub extra: Option<&'a Value>,
         /// 创建时间。
         pub created_at: NaiveDateTime,
@@ -624,7 +626,7 @@ pub mod channels {
         E: Executor<'e, Database = MySql>,
     {
         sqlx::query_as::<_, Channel>(
-            "SELECT id, bot_profile_id, platform, webhook_token, enabled, extra, created_at \
+            "SELECT id, bot_profile_id, hook_type, push_source, webhook_token, enabled, extra, created_at \
              FROM channels WHERE id = ?",
         )
         .bind(id)
@@ -632,21 +634,21 @@ pub mod channels {
         .await
     }
 
-    /// 按 webhook token + 平台查询启用中的通道（Webhook 鉴权用）。
-    pub async fn find_enabled_for_platform<'e, E>(
+    /// 按 webhook token + 钩子类型查询启用中的通道（Webhook 鉴权用）。
+    pub async fn find_enabled_for_hook_type<'e, E>(
         executor: E,
-        platform: &str,
+        hook_type: &str,
         webhook_token: &str,
     ) -> Result<Option<Channel>, sqlx::Error>
     where
         E: Executor<'e, Database = MySql>,
     {
         sqlx::query_as::<_, Channel>(
-            "SELECT id, bot_profile_id, platform, webhook_token, enabled, extra, created_at \
-             FROM channels WHERE webhook_token = ? AND platform = ? AND enabled = TRUE",
+            "SELECT id, bot_profile_id, hook_type, push_source, webhook_token, enabled, extra, created_at \
+             FROM channels WHERE webhook_token = ? AND hook_type = ? AND enabled = TRUE",
         )
         .bind(webhook_token)
-        .bind(platform)
+        .bind(hook_type)
         .fetch_optional(executor)
         .await
     }
@@ -660,7 +662,7 @@ pub mod channels {
         E: Executor<'e, Database = MySql>,
     {
         sqlx::query_as::<_, Channel>(
-            "SELECT id, bot_profile_id, platform, webhook_token, enabled, extra, created_at \
+            "SELECT id, bot_profile_id, hook_type, push_source, webhook_token, enabled, extra, created_at \
              FROM channels WHERE bot_profile_id = ? ORDER BY id",
         )
         .bind(bot_profile_id)
@@ -680,7 +682,8 @@ pub mod channels {
             Some(owner_user_id) => {
                 sqlx::query(
                     "SELECT c.id AS c_id, c.bot_profile_id AS c_bot_profile_id, \
-                     c.platform AS c_platform, c.webhook_token AS c_webhook_token, \
+                     c.hook_type AS c_hook_type, c.push_source AS c_push_source, \
+                     c.webhook_token AS c_webhook_token, \
                      c.enabled AS c_enabled, c.extra AS c_extra, c.created_at AS c_created_at, \
                      b.id AS b_id, b.owner_user_id AS b_owner_user_id, b.name AS b_name, \
                      b.qq_appid AS b_qq_appid, b.qq_app_secret AS b_qq_app_secret, \
@@ -697,7 +700,8 @@ pub mod channels {
             None => {
                 sqlx::query(
                     "SELECT c.id AS c_id, c.bot_profile_id AS c_bot_profile_id, \
-                     c.platform AS c_platform, c.webhook_token AS c_webhook_token, \
+                     c.hook_type AS c_hook_type, c.push_source AS c_push_source, \
+                     c.webhook_token AS c_webhook_token, \
                      c.enabled AS c_enabled, c.extra AS c_extra, c.created_at AS c_created_at, \
                      b.id AS b_id, b.owner_user_id AS b_owner_user_id, b.name AS b_name, \
                      b.qq_appid AS b_qq_appid, b.qq_app_secret AS b_qq_app_secret, \
@@ -715,7 +719,8 @@ pub mod channels {
             let channel = Channel {
                 id: row.try_get("c_id")?,
                 bot_profile_id: row.try_get("c_bot_profile_id")?,
-                platform: row.try_get("c_platform")?,
+                hook_type: row.try_get("c_hook_type")?,
+                push_source: row.try_get("c_push_source")?,
                 webhook_token: row.try_get("c_webhook_token")?,
                 enabled: row.try_get("c_enabled")?,
                 extra: row.try_get("c_extra")?,
@@ -744,11 +749,12 @@ pub mod channels {
         E: Executor<'e, Database = MySql>,
     {
         let result = sqlx::query(
-            "INSERT INTO channels (bot_profile_id, platform, webhook_token, enabled, extra, \
-             created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO channels (bot_profile_id, hook_type, push_source, webhook_token, \
+             enabled, extra, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(channel.bot_profile_id)
-        .bind(channel.platform)
+        .bind(channel.hook_type)
+        .bind(channel.push_source)
         .bind(channel.webhook_token)
         .bind(channel.enabled)
         .bind(channel.extra)
@@ -1302,9 +1308,11 @@ pub mod push_logs {
         pub channel_id: Option<i64>,
         /// 机器人。
         pub bot_profile_id: Option<i64>,
-        /// 平台。
-        pub platform: &'a str,
-        /// 平台原始消息类型。
+        /// 钩子类型。
+        pub hook_type: &'a str,
+        /// 推送来源（用户自填）。
+        pub push_source: &'a str,
+        /// 钩子原始消息类型。
         pub source_msgtype: &'a str,
         /// 推送目标。
         pub target: &'a str,
@@ -1333,8 +1341,8 @@ pub mod push_logs {
     pub struct PushLogFilter<'a> {
         /// 归属用户；`None` 表示不限（超管视角）。
         pub owner_user_id: Option<i64>,
-        /// 平台精确匹配。
-        pub platform: Option<&'a str>,
+        /// 钩子类型精确匹配。
+        pub hook_type: Option<&'a str>,
         /// 状态精确匹配。
         pub status: Option<&'a str>,
         /// 内容关键词。
@@ -1351,15 +1359,16 @@ pub mod push_logs {
         E: Executor<'e, Database = MySql>,
     {
         let result = sqlx::query(
-            "INSERT INTO push_logs (owner_user_id, channel_id, bot_profile_id, platform, \
-             source_msgtype, target, qq_msg_type, content_preview, content_len, status, \
-             error_code, error_message, duration_ms, request_id, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO push_logs (owner_user_id, channel_id, bot_profile_id, hook_type, \
+             push_source, source_msgtype, target, qq_msg_type, content_preview, content_len, \
+             status, error_code, error_message, duration_ms, request_id, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(log.owner_user_id)
         .bind(log.channel_id)
         .bind(log.bot_profile_id)
-        .bind(log.platform)
+        .bind(log.hook_type)
+        .bind(log.push_source)
         .bind(log.source_msgtype)
         .bind(log.target)
         .bind(log.qq_msg_type)
@@ -1382,8 +1391,8 @@ pub mod push_logs {
         if let Some(owner_user_id) = filter.owner_user_id {
             qb.push(" AND p.owner_user_id = ").push_bind(owner_user_id);
         }
-        if let Some(platform) = filter.platform {
-            qb.push(" AND p.platform = ").push_bind(platform);
+        if let Some(hook_type) = filter.hook_type {
+            qb.push(" AND p.hook_type = ").push_bind(hook_type);
         }
         if let Some(status) = filter.status {
             qb.push(" AND p.status = ").push_bind(status);
@@ -1421,7 +1430,8 @@ pub mod push_logs {
         E: Executor<'e, Database = MySql>,
     {
         let mut qb = QueryBuilder::<MySql>::new(
-            "SELECT p.id, p.owner_user_id, p.channel_id, p.bot_profile_id, p.platform, \
+            "SELECT p.id, p.owner_user_id, p.channel_id, p.bot_profile_id, p.hook_type, \
+             p.push_source, \
              p.source_msgtype, p.target, p.qq_msg_type, p.content_preview, p.content_len, \
              p.status, p.error_code, p.error_message, p.duration_ms, p.request_id, p.created_at, \
              u.email FROM push_logs p JOIN users u ON u.id = p.owner_user_id",
@@ -1447,9 +1457,9 @@ pub mod push_logs {
         E: Executor<'e, Database = MySql>,
     {
         sqlx::query_as::<_, PushLog>(
-            "SELECT id, owner_user_id, channel_id, bot_profile_id, platform, source_msgtype, \
-             target, qq_msg_type, content_preview, content_len, status, error_code, \
-             error_message, duration_ms, request_id, created_at \
+            "SELECT id, owner_user_id, channel_id, bot_profile_id, hook_type, push_source, \
+             source_msgtype, target, qq_msg_type, content_preview, content_len, status, \
+             error_code, error_message, duration_ms, request_id, created_at \
              FROM push_logs WHERE id = ?",
         )
         .bind(id)
@@ -1483,8 +1493,8 @@ pub mod push_logs {
         qb.build_query_scalar::<i64>().fetch_one(executor).await
     }
 
-    /// 按平台统计时间区间内的日志数。
-    pub async fn platform_counts_between<'e, E>(
+    /// 按推送来源统计时间区间内的日志数。
+    pub async fn push_source_counts_between<'e, E>(
         executor: E,
         owner_user_id: Option<i64>,
         start: NaiveDateTime,
@@ -1494,7 +1504,7 @@ pub mod push_logs {
         E: Executor<'e, Database = MySql>,
     {
         let mut qb = QueryBuilder::<MySql>::new(
-            "SELECT p.platform, CAST(COUNT(*) AS SIGNED) FROM push_logs p \
+            "SELECT p.push_source, CAST(COUNT(*) AS SIGNED) FROM push_logs p \
              WHERE p.created_at >= ",
         );
         qb.push_bind(start)
@@ -1503,7 +1513,7 @@ pub mod push_logs {
         if let Some(owner_user_id) = owner_user_id {
             qb.push(" AND p.owner_user_id = ").push_bind(owner_user_id);
         }
-        qb.push(" GROUP BY p.platform");
+        qb.push(" GROUP BY p.push_source ORDER BY COUNT(*) DESC");
         qb.build_query_as::<(String, i64)>()
             .fetch_all(executor)
             .await
@@ -1519,7 +1529,8 @@ pub mod push_logs {
         E: Executor<'e, Database = MySql>,
     {
         let mut qb = QueryBuilder::<MySql>::new(
-            "SELECT p.id, p.owner_user_id, p.channel_id, p.bot_profile_id, p.platform, \
+            "SELECT p.id, p.owner_user_id, p.channel_id, p.bot_profile_id, p.hook_type, \
+             p.push_source, \
              p.source_msgtype, p.target, p.qq_msg_type, p.content_preview, p.content_len, \
              p.status, p.error_code, p.error_message, p.duration_ms, p.request_id, p.created_at \
              FROM push_logs p WHERE p.status = 'failed'",
@@ -1682,13 +1693,13 @@ pub mod email_codes {
 pub mod webhooks {
     use super::*;
 
-    /// 按平台与 token 查询启用的通道。
+    /// 按钩子类型与 token 查询启用的通道。
     pub async fn find_enabled_channel(
         pool: &MySqlPool,
-        platform: &str,
+        hook_type: &str,
         webhook_token: &str,
     ) -> Result<Option<Channel>, sqlx::Error> {
-        channels::find_enabled_for_platform(pool, platform, webhook_token).await
+        channels::find_enabled_for_hook_type(pool, hook_type, webhook_token).await
     }
 
     /// 按机器人主键查询启用的机器人配置。
@@ -1702,10 +1713,10 @@ pub mod webhooks {
     /// 一次解析出启用的通道与其机器人；任一不可用时返回 `None`。
     pub async fn resolve_enabled(
         pool: &MySqlPool,
-        platform: &str,
+        hook_type: &str,
         webhook_token: &str,
     ) -> Result<Option<(Channel, BotProfile)>, sqlx::Error> {
-        let Some(channel) = find_enabled_channel(pool, platform, webhook_token).await? else {
+        let Some(channel) = find_enabled_channel(pool, hook_type, webhook_token).await? else {
             return Ok(None);
         };
         let bot = find_enabled_bot(pool, channel.bot_profile_id).await?;

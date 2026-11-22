@@ -1,6 +1,6 @@
-//! 平台适配器：负载 → 统一消息模型。
+//! 钩子适配器：负载 → 统一消息模型。
 //!
-//! 四个平台（钉钉 / 企业微信 / 飞书 / GitHub）的适配器在后续阶段实现本模块的
+//! 四个钩子类型（钉钉 / 企业微信 / 飞书 / GitHub）的适配器在后续阶段实现本模块的
 //! [`Adapter`] trait。统一消息结构复用 `renderer` 中的定义，避免两份模型漂移。
 
 pub use crate::renderer::{Attachment, FMT_MARKDOWN, FMT_TEXT, UnifiedMessage};
@@ -59,13 +59,13 @@ impl AdapterError {
     }
 }
 
-/// 平台适配器。
+/// 钩子适配器。
 ///
-/// `parse` 读取平台原始 webhook JSON，返回统一消息；`event` 为平台事件类型
-/// （GitHub 用 `X-GitHub-Event`，其余平台传空串）。
+/// `parse` 读取钩子原始 webhook JSON，返回统一消息；`event` 为钩子事件类型
+/// （GitHub 用 `X-GitHub-Event`，其余钩子类型传空串）。
 pub trait Adapter: Send + Sync {
-    /// 平台标识（`dingtalk` / `wecom` / `feishu` / `github`）。
-    fn platform(&self) -> &'static str;
+    /// 钩子类型标识（`dingtalk` / `wecom` / `feishu` / `github`）。
+    fn hook_type(&self) -> &'static str;
 
     /// 解析原始负载。
     fn parse(&self, payload: &Value, event: &str) -> Result<UnifiedMessage, AdapterError>;

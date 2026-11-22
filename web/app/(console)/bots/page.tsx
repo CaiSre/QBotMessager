@@ -44,13 +44,13 @@ import { api, messageOf } from "@/lib/api";
 import { useApi } from "@/lib/hooks";
 import { isSuperAdmin, useMe } from "@/lib/me";
 import {
-  PLATFORM_LABELS,
+  HOOK_TYPE_LABELS,
   type BotProfile,
   type Channel,
-  type Platform,
+  type HookType,
 } from "@/lib/types";
 
-const PLATFORMS: Platform[] = ["dingtalk", "wecom", "feishu", "github"];
+const HOOK_TYPES: HookType[] = ["dingtalk", "wecom", "feishu", "github"];
 
 interface BotForm {
   name: string;
@@ -101,7 +101,8 @@ export default function BotsPage() {
   const [botErrors, setBotErrors] = useState<{ name?: string; appid?: string; secret?: string }>({});
 
   const [channelOpen, setChannelOpen] = useState(false);
-  const [channelPlatform, setChannelPlatform] = useState<Platform>("dingtalk");
+  const [channelHookType, setChannelHookType] = useState<HookType>("dingtalk");
+  const [channelPushSource, setChannelPushSource] = useState("");
   const [channelBotId, setChannelBotId] = useState<string>("");
   const [channelEnabled, setChannelEnabled] = useState(true);
   const [channelSecret, setChannelSecret] = useState("");
@@ -208,10 +209,11 @@ export default function BotsPage() {
         {
           method: "POST",
           body: {
-            platform: channelPlatform,
+            hook_type: channelHookType,
+            push_source: channelPushSource.trim(),
             bot_profile_id: Number(channelBotId),
             enabled: channelEnabled,
-            ...(channelPlatform === "github" && channelSecret.trim()
+            ...(channelHookType === "github" && channelSecret.trim()
               ? { secret: channelSecret.trim() }
               : {}),
           },
@@ -270,9 +272,9 @@ export default function BotsPage() {
     return botList.find((item) => item.id === id)?.name ?? `#${id}`;
   }
 
-  const platformItems = PLATFORMS.map((platform) => ({
-    label: PLATFORM_LABELS[platform],
-    value: platform,
+  const hookTypeItems = HOOK_TYPES.map((hookType) => ({
+    label: HOOK_TYPE_LABELS[hookType],
+    value: hookType,
   }));
   const botItems = botList.map((bot) => ({ label: bot.name, value: String(bot.id) }));
 
@@ -389,7 +391,7 @@ export default function BotsPage() {
           <CardHeader>
             <CardTitle>Webhook 通道</CardTitle>
             <CardDescription>
-              按平台接入：钉钉 /webhook/dingtalk、企业微信 /webhook/wecom、飞书
+              按钩子类型接入：钉钉 /webhook/dingtalk、企业微信 /webhook/wecom、飞书
               /webhook/feishu；GitHub 使用 /webhook/github/{"{token}"}，token 已包含在 Payload URL
               中，并需在 GitHub 侧配置 Secret
             </CardDescription>
@@ -398,7 +400,8 @@ export default function BotsPage() {
                 disabled={botList.length === 0}
                 size="sm"
                 onClick={() => {
-                  setChannelPlatform("dingtalk");
+                  setChannelHookType("dingtalk");
+                  setChannelPushSource("");
                   setChannelBotId(botList[0] ? String(botList[0].id) : "");
                   setChannelEnabled(true);
                   setChannelSecret("");
@@ -419,7 +422,8 @@ export default function BotsPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>平台</TableHead>
+                    <TableHead>钩子类型</TableHead>
+                    <TableHead>推送来源</TableHead>
                     <TableHead>机器人</TableHead>
                     <TableHead>Token</TableHead>
                     <TableHead>Webhook 地址</TableHead>
@@ -431,7 +435,10 @@ export default function BotsPage() {
                 <TableBody>
                   {(channels.data ?? []).map((channel) => (
                     <TableRow key={channel.id}>
-                      <TableCell>{PLATFORM_LABELS[channel.platform]}</TableCell>
+                      <TableCell>{HOOK_TYPE_LABELS[channel.hook_type]}</TableCell>
+                      <TableCell>
+                        <span className="text-xs">{channel.push_source || "—"}</span>
+                      </TableCell>
                       <TableCell>{botName(channel.bot_profile_id)}</TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1">
@@ -498,7 +505,7 @@ export default function BotsPage() {
                             onClick={() =>
                               setConfirm({
                                 title: "删除通道",
-                                description: "删除后该平台的推送会立即失败。",
+                                description: "删除后该钩子类型的推送会立即失败。",
                                 action: async () => {
                                   await api(`/api/admin/channels/${channel.id}`, {
                                     method: "DELETE",
@@ -636,18 +643,18 @@ export default function BotsPage() {
           <form onSubmit={createChannel}>
             <FieldGroup className="gap-4">
               <div className="flex flex-col gap-2">
-                <Label>来源平台</Label>
+                <Label>钩子类型</Label>
                 <Select
-                  items={platformItems}
-                  value={channelPlatform}
-                  onValueChange={(value) => setChannelPlatform(String(value) as Platform)}
+                  items={hookTypeItems}
+                  value={channelHookType}
+                  onValueChange={(value) => setChannelHookType(String(value) as HookType)}
                 >
                   <SelectTrigger className="w-full">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent alignItemWithTrigger={false}>
                     <SelectGroup>
-                      {platformItems.map((item) => (
+                      {hookTypeItems.map((item) => (
                         <SelectItem key={item.value} value={item.value}>
                           {item.label}
                         </SelectItem>
@@ -656,6 +663,17 @@ export default function BotsPage() {
                   </SelectContent>
                 </Select>
               </div>
+              <Field>
+                <FieldLabel htmlFor="channel-push-source">推送来源</FieldLabel>
+                <Input
+                  id="channel-push-source"
+                  maxLength={64}
+                  placeholder="例如：订单系统 / 监控告警"
+                  value={channelPushSource}
+                  onChange={(event) => setChannelPushSource(event.target.value)}
+                />
+                <FieldDescription>用于区分该 Webhook 的使用位置，可留空。</FieldDescription>
+              </Field>
               <div className="flex flex-col gap-2">
                 <Label>推送目标机器人</Label>
                 <Select
@@ -677,7 +695,7 @@ export default function BotsPage() {
                   </SelectContent>
                 </Select>
               </div>
-              {channelPlatform === "github" ? (
+              {channelHookType === "github" ? (
                 <Field>
                   <FieldLabel htmlFor="channel-secret">签名密钥 Secret</FieldLabel>
                   <Input

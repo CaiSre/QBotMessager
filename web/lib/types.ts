@@ -1,13 +1,13 @@
 export type Role = "super_admin" | "user";
 export type AccountStatus = "active" | "disabled";
-export type Platform = "dingtalk" | "wecom" | "feishu" | "github";
+export type HookType = "dingtalk" | "wecom" | "feishu" | "github";
 
 export const ROLE_LABELS: Record<Role, string> = {
   super_admin: "超级管理员",
   user: "普通用户",
 };
 
-export const PLATFORM_LABELS: Record<Platform, string> = {
+export const HOOK_TYPE_LABELS: Record<HookType, string> = {
   dingtalk: "钉钉",
   wecom: "企业微信",
   feishu: "飞书",
@@ -56,7 +56,8 @@ export interface Channel {
   id: number;
   owner_user_id: number;
   owner_email: string;
-  platform: Platform;
+  hook_type: HookType;
+  push_source: string;
   bot_profile_id: number;
   webhook_token: string;
   webhook_url: string;
@@ -68,7 +69,8 @@ export interface PushLog {
   id: number;
   owner_user_id: number | null;
   owner_email: string | null;
-  platform: Platform;
+  hook_type: HookType;
+  push_source: string;
   source_msgtype: string | null;
   target: string | null;
   qq_msg_type: number | null;
@@ -179,11 +181,12 @@ export interface Stats {
   scope: "mine" | "all";
   today: { total: number; success: number };
   success_rate: number;
-  by_platform: { platform: Platform; count: number }[];
+  by_source: { source: string; count: number }[];
   trend: { date: string; count: number }[];
   recent_failures: {
     id: number;
-    platform: Platform;
+    hook_type: HookType;
+    push_source: string;
     target: string | null;
     error_code: string | null;
     error_message: string | null;

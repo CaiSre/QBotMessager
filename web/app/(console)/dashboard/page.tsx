@@ -23,7 +23,7 @@ import { EmptyHint, ErrorAlert, PageHeader } from "@/components/ui";
 import { formatDateTime, formatPercent, truncate } from "@/lib/format";
 import { useApi } from "@/lib/hooks";
 import { useMe } from "@/lib/me";
-import { PLATFORM_LABELS, type Stats } from "@/lib/types";
+import { HOOK_TYPE_LABELS, type Stats } from "@/lib/types";
 
 function Metric({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
@@ -69,18 +69,16 @@ export default function DashboardPage() {
 
             <Card className="lg:col-span-2">
               <CardHeader>
-                <CardTitle>今日来源平台</CardTitle>
+                <CardTitle>今日推送来源</CardTitle>
               </CardHeader>
               <CardContent>
-                {data.by_platform.length === 0 ? (
+                {data.by_source.length === 0 ? (
                   <EmptyHint>今日暂无推送</EmptyHint>
                 ) : (
                   <ul className="flex flex-col gap-3">
-                    {data.by_platform.map((row) => (
-                      <li className="flex items-center justify-between" key={row.platform}>
-                        <span className="text-sm">
-                          {PLATFORM_LABELS[row.platform] ?? row.platform}
-                        </span>
+                    {data.by_source.map((row) => (
+                      <li className="flex items-center justify-between" key={row.source}>
+                        <span className="text-sm">{row.source || "未设置"}</span>
                         <Badge variant="secondary">{row.count}</Badge>
                       </li>
                     ))}
@@ -108,7 +106,7 @@ export default function DashboardPage() {
                   <TableHeader>
                     <TableRow>
                       <TableHead>时间</TableHead>
-                      <TableHead>平台</TableHead>
+                      <TableHead>钩子类型</TableHead>
                       <TableHead>目标</TableHead>
                       <TableHead>错误码</TableHead>
                       <TableHead>错误信息</TableHead>
@@ -119,7 +117,7 @@ export default function DashboardPage() {
                       <TableRow key={row.id}>
                         <TableCell>{formatDateTime(row.created_at)}</TableCell>
                         <TableCell>
-                          {PLATFORM_LABELS[row.platform] ?? row.platform}
+                          {HOOK_TYPE_LABELS[row.hook_type] ?? row.hook_type}
                         </TableCell>
                         <TableCell>{row.target ?? "—"}</TableCell>
                         <TableCell>{row.error_code ?? "—"}</TableCell>

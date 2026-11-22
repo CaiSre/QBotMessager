@@ -20,7 +20,7 @@ impl DingTalkAdapter {
 }
 
 impl Adapter for DingTalkAdapter {
-    fn platform(&self) -> &'static str {
+    fn hook_type(&self) -> &'static str {
         "dingtalk"
     }
 

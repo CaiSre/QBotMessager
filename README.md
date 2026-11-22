@@ -32,21 +32,21 @@
 
 ## 功能特性
 
-- **多平台入站**：`POST /webhook/dingtalk`、`/webhook/wecom`、`/webhook/feishu` 直接接受三个平台的原始消息参数；GitHub 使用 `POST /webhook/github/{token}`，并校验 `X-Hub-Signature-256` 签名。
+- **多钩子类型入站**：`POST /webhook/dingtalk`、`/webhook/wecom`、`/webhook/feishu` 直接接受三个钩子类型的原始消息参数；GitHub 使用 `POST /webhook/github/{token}`，并校验 `X-Hub-Signature-256` 签名。
 - **消息转换**：
   - 钉钉：text / markdown / link / actionCard / feedCard
   - 企业微信：text / markdown / markdown_v2 / news / image / file / voice / template_card
   - 飞书：text / post / image / share_chat / interactive
   - GitHub：全部事件类型；ping / push / pull_request / issues / release / workflow_run / workflow_job 使用专门格式，其余事件使用通用格式
 - **QQ 推送**：支持 `msg_type=0` 纯文本与 `msg_type=2` Markdown，支持用户与群目标、账号级频控、401 自动刷新、5xx 与超频退避重试。
-- **推送队列**：队列与业务库内嵌在同一 MySQL（apalis），Webhook 入队即确认，进程内 worker 按频控节奏发送，推送方不会因等待 QQ 响应而超时重投；重复投递按平台投递 ID 去重。
+- **推送队列**：队列与业务库内嵌在同一 MySQL（apalis），Webhook 入队即确认，进程内 worker 按频控节奏发送，推送方不会因等待 QQ 响应而超时重投；重复投递按钩子类型投递 ID 去重。
 - **轻量单进程**：全 Rust 原生实现，单二进制同时提供 API、Webhook 与 Next.js 静态导出产物；无需 Node、Redis 或 supervisord，Alpine 运行时内存占用低，启动即就绪。
 - **多用户隔离**：每个用户独立管理自己的机器人、通道与推送日志，数据按 `owner_user_id` 隔离。
 - **明暗主题**：默认跟随系统，控制台侧边栏与登录页可手动切换，并记住选择。
 - **超级管理员**：可见并管理全部用户的资源；用户账号、邀请码、注册开关与 OAuth2 提供方仅超管可操作。
 - **多种登录方式**：用户名或邮箱密码、OAuth2 授权码、通行密钥（WebAuthn），服务端会话 Cookie。
 - **邮箱验证码**：配置 SMTP 后，注册、找回密码与 OAuth 账号首次设置密码需邮箱验证码；验证码邮件与站点风格一致。
-- **推送审计**：记录平台、来源类型、目标、状态、错误码、耗时与请求 ID，支持分页与筛选。
+- **推送审计**：记录钩子类型、推送来源、来源类型、目标、状态、错误码、耗时与请求 ID，支持分页与筛选。
 - **敏感数据加密**：QQ AppSecret、OAuth Client Secret 以 Fernet 密文入库。
 
 ## 技术栈
@@ -71,7 +71,7 @@
 Rust (Actix Web) :3000
   ├─ /            静态产物（Next.js 静态导出，SPA 回退）
   ├─ /api/*       认证与管理接口
-  ├─ /webhook/*   平台入站
+  ├─ /webhook/*   钩子类型入站
   └─ 进程内 worker ──▶ QQ 机器人
       │
       ▼
@@ -211,12 +211,12 @@ docker compose up -d --build
 ### 创建机器人与通道
 
 1. 在「机器人」页新增机器人，填写 AppID、AppSecret 与默认接收方（openid 或群 openid）。
-2. 在同一页新增通道，选择平台后即生成 `webhook_token` 与完整 Webhook 地址，可直接复制。GitHub 的 Webhook 设置中没有单独的 token 字段：token 已包含在 `/webhook/github/{token}` 地址中，填入 Payload URL 即可；创建时还会生成 Secret，需填到 GitHub 的 Secret 字段。
+2. 在同一页新增通道，选择钩子类型并填写推送来源（可选，用于区分 Webhook 的使用位置）后即生成 `webhook_token` 与完整 Webhook 地址，可直接复制。GitHub 的 Webhook 设置中没有单独的 token 字段：token 已包含在 `/webhook/github/{token}` 地址中，填入 Payload URL 即可；创建时还会生成 Secret，需填到 GitHub 的 Secret 字段。
 3. 通道可在「轮换」后立即失效旧 token，也可停用而不删除；GitHub 通道轮换会同时更换签名密钥，需要同步更新 GitHub 配置。
 
 ### 发送 Webhook
 
-按对应平台的原始格式 POST。钉钉 / 企业微信 / 飞书的鉴权支持两种方式（优先级从高到低）：`X-Webhook-Token` 请求头、`Authorization: Bearer <token>` 请求头。查询参数 `?token=` 默认关闭（凭据会落进访问日志），需要时在「系统设置」中开启：
+按对应钩子类型的原始格式 POST。钉钉 / 企业微信 / 飞书的鉴权支持两种方式（优先级从高到低）：`X-Webhook-Token` 请求头、`Authorization: Bearer <token>` 请求头。查询参数 `?token=` 默认关闭（凭据会落进访问日志），需要时在「系统设置」中开启：
 
 ```bash
 curl -X POST http://localhost:3000/webhook/dingtalk \
@@ -247,7 +247,7 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 | 分组 | 路径 | 说明 |
 |---|---|---|
 | 健康检查 | `GET /healthz`、`GET /readyz` | 存活与就绪探针（含数据库连通性） |
-| 数据面 | `POST /webhook/{platform}` | `dingtalk` / `wecom` / `feishu` |
+| 数据面 | `POST /webhook/{hook_type}` | `dingtalk` / `wecom` / `feishu` |
 | | `POST /webhook/github/{token}` | GitHub Webhook，校验 `X-Hub-Signature-256` |
 | 认证 | `GET /api/auth/providers` | 注册开关、可用登录方式与邮件验证码开关（公开） |
 | | `POST /api/auth/login`、`/logout`、`/register` | 用户名或邮箱密码登录、退出、邀请码注册（配置 SMTP 后需邮箱验证码） |
@@ -340,7 +340,7 @@ bun run build
 - 附件（图片 / 文件 / 语音）不会下发到 QQ：需要先调用 QQ 富媒体上传接口，当前未实现。
 - 飞书新版 schema 2.0 卡片的 `card.body.elements` 未解析（旧版 `card.elements` 正常）。
 - 钉钉 `audio` / `file` / `picture` 类型未支持。
-- 除 GitHub 外，入站使用自建 token（`X-Webhook-Token` 或 `Authorization: Bearer`），不校验平台签名（钉钉 sign、飞书 sign / verification token）；适合由用户侧将平台格式请求转发到本服务。
+- 除 GitHub 外，入站使用自建 token（`X-Webhook-Token` 或 `Authorization: Bearer`），不校验钩子签名（钉钉 sign、飞书 sign / verification token）；适合由用户侧将钩子格式请求转发到本服务。
 - GitHub 通道仅接受 `application/json` 投递，且不支持在「推送调试」页构造事件；调试请直接使用 GitHub 的 Webhook 测试投递。
 - 真实 QQ 推送与 OAuth2 第三方登录需要有效凭据，自动化测试仅覆盖到打桩层。
 - 前端静态导出后，`bun run dev` 仅用于界面调试，接口需由 Rust 服务提供。

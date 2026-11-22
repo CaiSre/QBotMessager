@@ -23,7 +23,7 @@ impl FeishuAdapter {
 }
 
 impl Adapter for FeishuAdapter {
-    fn platform(&self) -> &'static str {
+    fn hook_type(&self) -> &'static str {
         "feishu"
     }
 
