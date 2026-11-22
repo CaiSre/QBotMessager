@@ -315,7 +315,7 @@ fn prune(state: &mut LimiterState, now: Instant) {
     }
 }
 
-/// 清理某个键下过期���失败记录；桶空了就把键删掉。
+/// 清理某个键下过期的失败记录；桶空了就把键删掉。
 fn prune_bucket(state: &mut AttemptState, key: &str, now: Instant) -> VecDeque<Instant> {
     let Some(bucket) = state.failures.get_mut(key) else {
         return VecDeque::new();

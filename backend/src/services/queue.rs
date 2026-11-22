@@ -100,7 +100,12 @@ impl PushQueue {
 
     /// 入队；返回 `false` 表示同一投递仍在队列中（重复投递）。
     pub async fn enqueue(&self, job: PushJob, job_id: &str) -> Result<bool, QueueError> {
-        // SAQ 没有排队过期机制：停机后重新拉起时，过旧的推送已无意义，直接丢弃。
+        // 入队的检查（过期清理、积压计数、同键结束行清理）与写入全程在
+        // storage 锁内串行，check-then-act 之间无并发窗口：单进程单副本，
+        // 临界区内做数据库查询只延迟本进程的其余入队，低频路径可接受。
+        // 停机后重新拉起时，过旧的推送已无意义，先清掉再计数。
+        let mut storage = self.storage.lock().await;
+
         purge_expired_pending(&self.pool)
             .await
             .map_err(|err| QueueError::Backend(err.to_string()))?;
@@ -109,7 +114,7 @@ impl PushQueue {
             return Err(QueueError::Full(self.max_pending));
         }
 
-        // 旧 SAQ 的 key 只约束「排队中/执行中」的任务：推送完成后的重复投递会重新入队，
+        // 幂等键只约束「排队中/执行中」的任务：推送完成后的重复投递会重新入队，
         // 再由 SentGuard 跳过已成功的目标。MySQL 的 (job_type, idempotency_key) 唯一索引
         // 会把已结束的任务也算进去，所以这里先清掉同一键下已结束的行。
         sqlx::query(
@@ -129,7 +134,6 @@ impl PushQueue {
             .max_attempts(1)
             .build();
 
-        let mut storage = self.storage.lock().await;
         match storage.push_task(task).await {
             Ok(()) => Ok(true),
             // 并发入队时唯一索引冲突：同一投递已经在队列里。
@@ -151,6 +155,24 @@ pub async fn purge_expired_pending(pool: &MySqlPool) -> Result<u64, sqlx::Error>
     )
     .bind(QUEUE_NAME)
     .bind(cutoff)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// 清理已终结的任务行，返回删除数量。
+///
+/// 语义对齐 apalis 的 vacuum：`Done`、`Killed`，以及尝试次数已耗尽的 `Failed`
+/// 行都不再需要；这里限定 `job_type` 只清理本队列。终态行清掉后，
+/// `(job_type, idempotency_key)` 上的唯一索引记录也随之消失，但不影响重复
+/// 投递检测：入队方先删同键终态行再插入，已完成投递的幂等语义由
+/// `sent_guards` 负责，jobs 的去重只约束「排队中/执行中」。
+pub async fn vacuum_finished(pool: &MySqlPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM jobs WHERE job_type = ? AND (status = 'Done' OR status = 'Killed' \
+         OR (status = 'Failed' AND attempts >= max_attempts))",
+    )
+    .bind(QUEUE_NAME)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -287,13 +309,18 @@ fn guard_expiry(now: NaiveDateTime, ttl_seconds: u64) -> NaiveDateTime {
 
 /// 计算可放进 `jobs.idempotency_key`（`varchar(36)`）的去重键。
 ///
-/// 语义为 `push:<sha256(platform:delivery_id)>`；
+/// 语义为 `push:<platform>:<channel_id>:<delivery_id>`：键含通道维度，同平台
+/// 同投递 ID 落到不同通道时各自独立去重；无 delivery_id 时以 request_id 顶替。
 /// MySQL 列只有 36 字符，这里保留完整 SHA-256 的语义，取十六进制摘要前 36 位。
-/// 无 delivery_id 时退化为 `sha256("push:" + request_id)`。
-pub fn dedupe_key(platform: &str, delivery_id: Option<&str>, request_id: &str) -> String {
+pub fn dedupe_key(
+    platform: &str,
+    channel_id: i64,
+    delivery_id: Option<&str>,
+    request_id: &str,
+) -> String {
     let raw = match delivery_id {
-        Some(delivery_id) => format!("push:{platform}:{delivery_id}"),
-        None => format!("push:{request_id}"),
+        Some(delivery_id) => format!("push:{platform}:{channel_id}:{delivery_id}"),
+        None => format!("push:{platform}:{channel_id}:{request_id}"),
     };
     let digest = Sha256::digest(raw.as_bytes());
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -325,32 +352,43 @@ mod tests {
 
     #[test]
     fn dedupe_key_is_stable_and_fits_column() {
-        let key = dedupe_key("github", Some("delivery-1"), "request-a");
+        let key = dedupe_key("github", 7, Some("delivery-1"), "request-a");
         assert_eq!(key.len(), DEDUPE_KEY_MAX_LEN);
-        // 相同的平台与投递 ID 必须得到同一个键，与 request_id 无关（平台会重投同一条消息）。
-        assert_eq!(key, dedupe_key("github", Some("delivery-1"), "request-b"));
-        // 硬编码值锁定摘要算法：sha256("push:github:delivery-1") 的前 36 位。
-        assert_eq!(key, "b53f51f012003193e020f3fd7a18e608e2fd");
+        // 相同的平台、通道与投递 ID 必须得到同一个键，与 request_id 无关
+        //（平台会重投同一条消息，但 request_id 每次请求都变）。
+        assert_eq!(
+            key,
+            dedupe_key("github", 7, Some("delivery-1"), "request-b")
+        );
+        // 硬编码值锁定摘要算法：sha256("push:github:7:delivery-1") 的前 36 位。
+        assert_eq!(key, "0b0acf5805f67e583ce7eb9a1d2cdd897174");
+        // 不同通道各自独立去重：同平台同投递 ID 落到不同通道时不能互相压制。
+        assert_ne!(
+            key,
+            dedupe_key("github", 8, Some("delivery-1"), "request-a")
+        );
     }
 
     #[test]
     fn dedupe_key_distinguishes_platform_and_delivery() {
         assert_ne!(
-            dedupe_key("github", Some("same"), "r"),
-            dedupe_key("feishu", Some("same"), "r")
+            dedupe_key("github", 7, Some("same"), "r"),
+            dedupe_key("feishu", 7, Some("same"), "r")
         );
         assert_ne!(
-            dedupe_key("github", Some("a"), "r"),
-            dedupe_key("github", Some("b"), "r")
+            dedupe_key("github", 7, Some("a"), "r"),
+            dedupe_key("github", 7, Some("b"), "r")
         );
     }
 
     #[test]
     fn dedupe_key_falls_back_to_request_id() {
-        let key = dedupe_key("dingtalk", None, "request-1");
+        let key = dedupe_key("dingtalk", 9, None, "request-1");
         assert_eq!(key.len(), DEDUPE_KEY_MAX_LEN);
-        assert_eq!(key, dedupe_key("dingtalk", None, "request-1"));
-        assert_ne!(key, dedupe_key("dingtalk", None, "request-2"));
+        // 硬编码值锁定摘要算法：sha256("push:dingtalk:9:request-1") 的前 36 位。
+        assert_eq!(key, "1294d46df1a8e8653f4c44165abab585aab8");
+        assert_eq!(key, dedupe_key("dingtalk", 9, None, "request-1"));
+        assert_ne!(key, dedupe_key("dingtalk", 9, None, "request-2"));
     }
 
     #[test]

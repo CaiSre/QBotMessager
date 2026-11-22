@@ -5,7 +5,7 @@
 //! 设计要点：
 //! - 任务超时 180s、重试 2 次（最多 3 次尝试）、固定 5s 重试间隔；
 //! - 每分钟同步一次库内设置，让频控参数在 worker 内生效；
-//! - 定期清理 `sent_guards` 过期行。
+//! - 定期清理 `sent_guards` 过期行与 jobs 表终态行。
 //! - 启动时回收崩溃残留的 worker 注册行与在跑任务。
 
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use crate::error::AppError;
 use crate::services::push::{PushJob, execute_push};
 use crate::services::queue::{
     JOB_RETRIES, QUEUE_NAME, job_retry_delay, job_timeout, purge_expired_pending,
-    recover_worker_registration,
+    recover_worker_registration, vacuum_finished,
 };
 use crate::state::AppState;
 
@@ -30,6 +30,8 @@ pub const WORKER_CONCURRENCY: usize = 8;
 pub const SETTINGS_REFRESH_SECONDS: u64 = 60;
 /// 过期守卫清理间隔（秒）。
 pub const SENT_GUARD_CLEANUP_SECONDS: u64 = 300;
+/// 已终结任务行（Done/Killed/Failed）清理间隔（秒）。
+pub const VACUUM_INTERVAL_SECONDS: u64 = 3600;
 /// worker 名称。
 pub const WORKER_NAME: &str = "push-worker";
 
@@ -119,6 +121,7 @@ pub async fn run(state: Arc<AppState>) -> Result<(), AppError> {
 
     let settings_task = spawn_settings_refresh(state.clone());
     let cleanup_task = spawn_sent_guard_cleanup(state.clone());
+    let vacuum_task = spawn_jobs_vacuum(state.clone());
 
     // 顺序即层级：concurrency 最外层、retry 居中、timeout 最内层，
     // 这样每次尝试各自享有 180 秒上限，且重试不会额外占用并发槽。
@@ -142,6 +145,7 @@ pub async fn run(state: Arc<AppState>) -> Result<(), AppError> {
     // worker 进入优雅停止后会等待在跑任务完成；定时任务没有收尾动作，直接取消。
     settings_task.abort();
     cleanup_task.abort();
+    vacuum_task.abort();
 
     result.map_err(|err| AppError::internal(format!("推送 worker 异常退出：{err}")))
 }
@@ -208,6 +212,20 @@ pub async fn cleanup_sent_guards(state: WorkerData) -> Result<(), WorkerError> {
     Ok(())
 }
 
+/// 清理已终结的队列任务行（Done/Killed/耗尽重试的 Failed）。
+pub async fn vacuum_finished_jobs(state: WorkerData) -> Result<(), WorkerError> {
+    let state = state.0.clone();
+    let removed = vacuum_finished(&state.pool)
+        .await
+        .map_err(|err| format!("清理终态队列任务失败：{err}"))?;
+    if removed > 0 {
+        tracing::info!(removed, "已清理终态的推送任务行");
+    } else {
+        tracing::debug!("终态推送任务行清理：无可清理行");
+    }
+    Ok(())
+}
+
 /// 启动设置刷新定时任务（首个 tick 立即执行一次）。
 fn spawn_settings_refresh(state: Arc<AppState>) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -233,6 +251,21 @@ fn spawn_sent_guard_cleanup(state: Arc<AppState>) -> JoinHandle<()> {
             ticker.tick().await;
             if let Err(err) = cleanup_sent_guards(data.clone()).await {
                 tracing::warn!(error = %err, "worker 清理过期推送守卫失败");
+            }
+        }
+    })
+}
+
+/// 启动终态任务行清理定时任务（首个 tick 立即执行一次）。
+fn spawn_jobs_vacuum(state: Arc<AppState>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let data = Data(state);
+        let mut ticker = tokio::time::interval(Duration::from_secs(VACUUM_INTERVAL_SECONDS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if let Err(err) = vacuum_finished_jobs(data.clone()).await {
+                tracing::warn!(error = %err, "worker 清理终态推送任务失败");
             }
         }
     })

@@ -3,6 +3,7 @@
 //! 启动顺序：dotenvy → tracing（读 `RUST_LOG`）→ 安装 rustls ring
 //! provider → `Config::from_env` → MySQL 连接池 → `sqlx::migrate!` → 运行期设置
 //! → `AppState` → Actix 绑定 `0.0.0.0:${PORT:-3000}` → SIGTERM/SIGINT 优雅关停。
+//! worker 退出即进程退出（由容器编排拉起），HTTP 不在无 worker 的状态下独活。
 //!
 //! `rustls::crypto::ring::default_provider().install_default()` 必须在创建任何
 //! HTTP 客户端（reqwest / lettre）之前执行：依赖用的是 reqwest 的
@@ -103,6 +104,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 任何绑定之前拉起 worker；它自行监听关停信号并等待在跑任务完成。
     let worker_handle = tokio::spawn(qbotmessager::worker::run(state.clone()));
 
+    // worker 退出即进程退出：监督任务持有其 JoinHandle，异常返回（初始化失败、
+    // panic、被取消）时记 error 并以非零码退出，交给容器编排
+    //（restart: unless-stopped）拉起新进程重连 MySQL 与队列，避免 HTTP 只听
+    // 不发、且无日志可观测的半死状态。worker 结束时先经 oneshot 通知关停
+    // 等待方，超时与否都不影响这里的退出决策。
+    let (worker_done_tx, worker_done_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let outcome = worker_handle.await;
+        let _ = worker_done_tx.send(());
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "推送 worker 已退出，进程跟随退出");
+                std::process::exit(1);
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "推送 worker 任务终止，进程跟随退出");
+                std::process::exit(1);
+            }
+        }
+    });
+
     let shared = web::Data::from(state.clone());
     let server = HttpServer::new(move || {
         let shared = shared.clone();
@@ -127,11 +150,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     server.await?;
 
-    // docker stop_grace_period 为 30s，留 5s 余量等待 worker 收尾。
-    match tokio::time::timeout(Duration::from_secs(25), worker_handle).await {
-        Ok(Ok(Ok(()))) => tracing::info!("推送 worker 已停止"),
-        Ok(Ok(Err(err))) => tracing::warn!(error = %err, "推送 worker 异常退出"),
-        Ok(Err(err)) => tracing::warn!(error = %err, "等待推送 worker 收尾失败"),
+    // docker stop_grace_period 为 30s，留 5s 余量等待 worker 收尾：
+    // HTTP 已停止收尾后，在这里等监督任务发出 worker 结束通知。
+    let mut worker_done_rx = worker_done_rx;
+    match tokio::time::timeout(Duration::from_secs(25), &mut worker_done_rx).await {
+        Ok(Ok(())) => tracing::info!("推送 worker 已停止"),
+        Ok(Err(_lost)) => tracing::warn!("worker 结束通知通道已关闭"),
         Err(_) => tracing::warn!("等待推送 worker 收尾超时（25s），直接退出"),
     }
 
