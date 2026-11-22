@@ -72,6 +72,20 @@ const EMPTY_BOT: BotForm = {
   enabled: true,
 };
 
+function CopyField({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="text-sm font-medium">{label}</p>
+      <div className="flex min-w-0 items-center gap-2 rounded-2xl bg-muted py-1.5 pr-1.5 pl-4">
+        <code className="min-w-0 flex-1 overflow-hidden font-mono text-sm whitespace-nowrap [mask-image:linear-gradient(to_right,black_80%,transparent)]">
+          {value}
+        </code>
+        <CopyButton value={value} />
+      </div>
+    </div>
+  );
+}
+
 export default function BotsPage() {
   const me = useMe();
   const superAdmin = isSuperAdmin(me.role);
@@ -719,24 +733,11 @@ export default function BotsPage() {
               请在 GitHub 仓库 Settings → Webhooks → Add webhook 中填写以下两项，Content type
               选择 application/json，SSL verification 保持启用，再选择要订阅的事件。
             </p>
-            <Field className="min-w-0 gap-1.5">
-              <FieldLabel>Payload URL（token 已包含在地址中）</FieldLabel>
-              <div className="flex min-w-0 items-center gap-2">
-                <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded bg-muted px-2 py-1 font-mono text-xs">
-                  {channelResult?.webhookUrl}
-                </code>
-                <CopyButton value={channelResult?.webhookUrl ?? ""} />
-              </div>
-            </Field>
-            <Field className="min-w-0 gap-1.5">
-              <FieldLabel>Secret</FieldLabel>
-              <div className="flex min-w-0 items-center gap-2">
-                <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded bg-muted px-2 py-1 font-mono text-xs">
-                  {channelResult?.secret}
-                </code>
-                <CopyButton value={channelResult?.secret ?? ""} />
-              </div>
-            </Field>
+            <CopyField
+              label="Payload URL（token 已包含在地址中）"
+              value={channelResult?.webhookUrl ?? ""}
+            />
+            <CopyField label="Secret" value={channelResult?.secret ?? ""} />
             <FieldDescription>
               密钥只显示这一次，关闭后无法再次查看；如需更换请使用通道列表中的「轮换」。
             </FieldDescription>
