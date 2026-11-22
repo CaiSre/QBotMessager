@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 
+import { PushTrendChart } from "@/components/charts/push-trend-chart";
 import { Badge } from "@/components/ui/badge";
 import {
   Card,
@@ -43,7 +44,6 @@ export default function DashboardPage() {
   // 后端异常响应可能缺 trend，兜底避免渲染时 TypeError 白屏。
   const trend = data?.trend ?? [];
   const weekTotal = trend.reduce((sum, day) => sum + day.count, 0);
-  const maxTrend = Math.max(1, ...trend.map((day) => day.count));
 
   return (
     <div>
@@ -65,27 +65,7 @@ export default function DashboardPage() {
           </div>
 
           <div className="grid gap-4 lg:grid-cols-5">
-            <Card className="lg:col-span-3">
-              <CardHeader>
-                <CardTitle>近 7 日推送量</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="flex h-44 items-end gap-2">
-                  {trend.map((day) => (
-                    <div key={day.date} className="flex flex-1 flex-col items-center gap-2">
-                      <span className="text-xs tabular-nums text-muted-foreground">{day.count}</span>
-                      <div className="flex w-full flex-1 items-end">
-                        <div
-                          className="w-full rounded-t-lg bg-primary/80"
-                          style={{ height: `${Math.max(2, (day.count / maxTrend) * 100)}%` }}
-                        />
-                      </div>
-                      <span className="text-[11px] text-muted-foreground">{day.date.slice(5)}</span>
-                    </div>
-                  ))}
-                </div>
-              </CardContent>
-            </Card>
+            <PushTrendChart className="lg:col-span-3" data={trend} />
 
             <Card className="lg:col-span-2">
               <CardHeader>
