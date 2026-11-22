@@ -30,10 +30,44 @@ WORKDIR /build/backend
 COPY backend/Cargo.toml backend/Cargo.lock ./
 COPY backend/migrations ./migrations
 
-# 依赖预编译层：先用空实现编译一遍，源码改动时只重编本 crate
+# 依赖预热层：空壳 lib 显式引用所有依赖，cargo 的 unused_dependencies lint
+# 不会因空实现误报；源码改动时本层缓存命中不变，只重编本 crate
+COPY <<'EOF' src/lib.rs
+pub mod placeholder {
+    pub use actix_files;
+    pub use actix_web;
+    pub use apalis;
+    pub use apalis_mysql;
+    pub use base64;
+    pub use chrono;
+    pub use dashmap;
+    pub use dotenvy;
+    pub use fernet;
+    pub use hmac;
+    pub use lettre;
+    pub use pbkdf2;
+    pub use rand;
+    pub use regex;
+    pub use reqwest;
+    pub use rustls;
+    pub use serde;
+    pub use serde_cbor_2;
+    pub use serde_json;
+    pub use sha2;
+    pub use sqlx;
+    pub use subtle;
+    pub use thiserror;
+    pub use tokio;
+    pub use tower;
+    pub use tracing;
+    pub use tracing_subscriber;
+    pub use url;
+    pub use uuid;
+    pub use webauthn_rs_core;
+}
+EOF
 RUN mkdir -p src \
  && printf 'fn main() {}\n' > src/main.rs \
- && : > src/lib.rs \
  && cargo build --release --locked
 
 COPY backend/src ./src
