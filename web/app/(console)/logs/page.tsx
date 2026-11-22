@@ -262,7 +262,7 @@ export default function LogsPage() {
                         </Button>
                       </TableCell>
                       <TableCell>
-                        {row.duration_ms != null ? `${row.duration_ms} ms` : "—"}
+                        {row.duration_ms != null ? `${row.duration_ms.toFixed(1)} ms` : "—"}
                       </TableCell>
                     </TableRow>
                   ))}
@@ -353,7 +353,7 @@ export default function LogsPage() {
                 <dt className="text-muted-foreground">内容长度</dt>
                 <dd>{detail.content_len ?? "—"}</dd>
                 <dt className="text-muted-foreground">耗时</dt>
-                <dd>{detail.duration_ms != null ? `${detail.duration_ms} ms` : "—"}</dd>
+                <dd>{detail.duration_ms != null ? `${detail.duration_ms.toFixed(1)} ms` : "—"}</dd>
                 <dt className="text-muted-foreground">错误码</dt>
                 <dd>{detail.error_code ?? "—"}</dd>
                 <dt className="text-muted-foreground">错误信息</dt>
