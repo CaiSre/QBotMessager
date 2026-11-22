@@ -651,11 +651,12 @@ async fn failure_returns_502_and_logs_error() {
         )
     );
     let reply = assert_status!(reply, StatusCode::BAD_GATEWAY);
+    // 对外文案固定为通用失败提示，平台细节只进日志。
     assert!(
         reply.json()["errmsg"]
             .as_str()
             .unwrap_or_default()
-            .contains("机器人已被移除")
+            .contains("推送失败")
     );
 
     let (status, error_code): (String, Option<String>) = sqlx::query_as(
@@ -1016,7 +1017,7 @@ async fn queue_accepts_before_any_send() {
     let app = app!(fixture.state.clone());
     let owner = make_user(&fixture).await;
     let bot_id = make_bot(&fixture, owner, &["u-default"], None).await;
-    let (_channel_id, token, _) = make_channel(&fixture, bot_id, "dingtalk").await;
+    let (channel_id, token, _) = make_channel(&fixture, bot_id, "dingtalk").await;
 
     let reply = send!(
         app,
@@ -1045,7 +1046,10 @@ async fn queue_accepts_before_any_send() {
         key.chars()
             .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
     );
-    assert_eq!(key, dedupe_key("dingtalk", None, &job.request_id));
+    assert_eq!(
+        key,
+        dedupe_key("dingtalk", channel_id, None, &job.request_id)
+    );
 
     clear_push_jobs(&fixture.pool).await;
 }
@@ -1058,7 +1062,7 @@ async fn queue_duplicate_delivery_is_acked() {
     let app = app!(fixture.state.clone());
     let owner = make_user(&fixture).await;
     let bot_id = make_bot(&fixture, owner, &["u-default"], None).await;
-    let (_channel_id, token, _) = make_channel(&fixture, bot_id, "dingtalk").await;
+    let (channel_id, token, _) = make_channel(&fixture, bot_id, "dingtalk").await;
     let msgid = format!("{}-dup", fixture.prefix);
     let body = json!({
         "msgtype": "text",
@@ -1080,7 +1084,7 @@ async fn queue_duplicate_delivery_is_acked() {
     );
     assert!(fixture.mock.calls().is_empty());
 
-    let key = dedupe_key("dingtalk", Some(&msgid), "request-id-ignored");
+    let key = dedupe_key("dingtalk", channel_id, Some(&msgid), "request-id-ignored");
     let count: i64 = sqlx::query_scalar(
         "SELECT CAST(COUNT(*) AS SIGNED) FROM jobs \
          WHERE job_type = 'push' AND idempotency_key = ?",
@@ -1090,6 +1094,54 @@ async fn queue_duplicate_delivery_is_acked() {
     .await
     .expect("统计队列任务失败");
     assert_eq!(count, 1);
+
+    clear_push_jobs(&fixture.pool).await;
+}
+
+#[actix_web::test]
+async fn queue_dedupe_key_is_scoped_per_channel() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup_with_queue(Some(20)).await;
+    clear_push_jobs(&fixture.pool).await;
+    let app = app!(fixture.state.clone());
+    let owner = make_user(&fixture).await;
+    let bot_id = make_bot(&fixture, owner, &["u-default"], None).await;
+    // 同一机器人挂两个相同平台的通道：平台的投递 ID 相同也不互相压制。
+    let (channel_a, token_a, _) = make_channel(&fixture, bot_id, "dingtalk").await;
+    let (channel_b, token_b, _) = make_channel(&fixture, bot_id, "dingtalk").await;
+    let msgid = format!("{}-cross", fixture.prefix);
+    let body = json!({
+        "msgtype": "text",
+        "text": {"content": "跨通道去重"},
+        "msgid": msgid,
+    });
+
+    let first = send!(app, webhook_request("/webhook/dingtalk", &body, &token_a));
+    assert_status!(first, StatusCode::OK);
+    let second = send!(app, webhook_request("/webhook/dingtalk", &body, &token_b));
+    let second = assert_status!(second, StatusCode::OK);
+    // 第二条若被误判为重复会返回「重复投递，已忽略」。
+    assert_eq!(second.json()["errmsg"], json!("ok"));
+    assert!(fixture.mock.calls().is_empty());
+
+    let mut keys: Vec<String> = sqlx::query_scalar(
+        "SELECT idempotency_key FROM jobs \
+         WHERE job_type = 'push' AND status = 'Pending'",
+    )
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("查询队列任务失败")
+    .into_iter()
+    .map(|key: Option<String>| key.expect("队列任务缺少 idempotency_key"))
+    .collect();
+    assert_eq!(keys.len(), 2, "两个通道的相同投递 ID 应各自入队");
+    let key_a = dedupe_key("dingtalk", channel_a, Some(&msgid), "r");
+    let key_b = dedupe_key("dingtalk", channel_b, Some(&msgid), "r");
+    assert_ne!(key_a, key_b, "跨通道的幂等键必须包含通道维度");
+    keys.sort();
+    let mut expected = vec![key_a, key_b];
+    expected.sort();
+    assert_eq!(keys, expected);
 
     clear_push_jobs(&fixture.pool).await;
 }

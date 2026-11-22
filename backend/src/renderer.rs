@@ -8,7 +8,7 @@
 
 use serde::Serialize;
 
-use crate::markdown::{sanitize_markdown, sanitize_text};
+use crate::markdown::{sanitize_markdown, sanitize_text, sanitize_title, truncate};
 
 /// 纯文本格式。
 pub const FMT_TEXT: &str = "text";
@@ -170,17 +170,18 @@ pub fn render_qq(message: &UnifiedMessage) -> QqPayload {
 }
 
 /// 把统一消息渲染为 QQ 消息体。
+///
+/// 标题参与整体长度预算：清洗后与正文合并，再按目标上限统一截断，
+/// 避免超长标题借道 Markdown 标题行绕过长度约束。
 pub fn render_qq_with_limits(
     message: &UnifiedMessage,
     markdown_max_len: usize,
     text_max_len: usize,
 ) -> QqPayload {
-    let title = message
-        .title
-        .as_deref()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let title = sanitize_title(
+        message.title.as_deref().unwrap_or_default(),
+        markdown_max_len.max(text_max_len),
+    );
     let body = message.body.as_str();
 
     if message.fmt == FMT_MARKDOWN {
@@ -192,7 +193,7 @@ pub fn render_qq_with_limits(
         if !cleaned.is_empty() {
             parts.push(cleaned);
         }
-        let markdown = parts.join("\n\n").trim().to_string();
+        let markdown = truncate(&parts.join("\n\n").trim(), Some(markdown_max_len));
         if !markdown.is_empty() {
             return QqPayload {
                 msg_type: MSG_TYPE_MARKDOWN,
@@ -226,6 +227,7 @@ pub fn render_qq_with_limits(
         } else {
             format!("{title}\n{cleaned_text}").trim().to_string()
         };
+        cleaned_text = truncate(&cleaned_text, Some(text_max_len));
     }
     QqPayload {
         msg_type: MSG_TYPE_TEXT,
@@ -302,5 +304,37 @@ mod tests {
     fn markdown_without_title_has_no_heading() {
         let payload = render_qq(&UnifiedMessage::markdown("正文"));
         assert_eq!(payload.markdown.as_deref(), Some("正文"));
+    }
+
+    #[test]
+    fn long_title_counts_toward_markdown_limit() {
+        let payload = render_qq_with_limits(
+            &UnifiedMessage::markdown("正文正文").with_title("题".repeat(200)),
+            100,
+            DEFAULT_TEXT_MAX_LEN,
+        );
+        let markdown = payload.markdown.expect("标题非空，Markdown 分支不回退");
+        assert!(markdown.chars().count() <= 100, "{markdown}");
+        assert!(markdown.starts_with("### 题"), "{markdown}");
+    }
+
+    #[test]
+    fn long_title_counts_toward_text_limit() {
+        let payload = render_qq_with_limits(
+            &UnifiedMessage::text("正文正文").with_title("题".repeat(200)),
+            DEFAULT_MARKDOWN_MAX_LEN,
+            100,
+        );
+        assert!(
+            payload.content.chars().count() <= 100,
+            "{}",
+            payload.content
+        );
+    }
+
+    #[test]
+    fn title_control_chars_are_stripped() {
+        let payload = render_qq(&UnifiedMessage::text("内容").with_title("标\x00题"));
+        assert_eq!(payload.content, "标题\n内容");
     }
 }

@@ -243,7 +243,7 @@ impl QqClient {
             key.to_string(),
             CachedToken {
                 token: token.clone(),
-                expires_at: Instant::now() + Duration::from_secs(ttl as u64),
+                expires_at: expires_at_from_now(Duration::from_secs(ttl as u64)),
             },
         );
         Ok(token)
@@ -358,7 +358,7 @@ impl QqClient {
     }
 }
 
-/// `expires_in` 秒数；缺失、为零或非法时回退 7200。
+/// `expires_in` 秒数；缺失、为零或非法时回退 7200，超过一天时按一天封顶。
 fn token_ttl(data: &Value) -> i64 {
     let seconds = match data.get("expires_in") {
         Some(Value::Number(number)) => number
@@ -368,7 +368,16 @@ fn token_ttl(data: &Value) -> i64 {
         _ => None,
     }
     .unwrap_or(7200);
-    if seconds == 0 { 7200 } else { seconds }
+    if seconds == 0 {
+        7200
+    } else {
+        seconds.min(86_400)
+    }
+}
+
+/// 相对当前的过期时刻；`Instant` 加法溢出时按立即过期处理，下轮刷新重建。
+fn expires_at_from_now(ttl: Duration) -> Instant {
+    Instant::now().checked_add(ttl).unwrap_or_else(Instant::now)
 }
 
 /// 退避时长；负值按 0 处理，避免 `Duration` 构造 panic。
@@ -402,13 +411,12 @@ fn retry_after_value(raw: Option<&str>) -> Option<f64> {
 ///
 /// 接口返回非字符串消息时回退到 `http_{status}`：
 /// `null`、`0`、空串与空容器都视为没有错误码。
+/// 首键为假值时继续尝试后续键，避免吞掉有序在后面的真实错误码。
 fn extract_code(body: &Value) -> Option<String> {
-    for key in ["code", "err_code", "errcode"] {
-        if let Some(value) = body.get(key) {
-            return truthy_code(value);
-        }
-    }
-    None
+    ["code", "err_code", "errcode"]
+        .iter()
+        .filter_map(|key| body.get(key))
+        .find_map(truthy_code)
 }
 
 /// 把 JSON 值转成错误码字符串；假值返回 `None`。
@@ -488,6 +496,12 @@ mod tests {
             (token_ttl(&serde_json::json!({ "expires_in": 30 })) - TOKEN_REFRESH_AHEAD).max(1),
             1
         );
+        // 超过一天时按一天封顶，避免异常响应把缓存期限拉得过长。
+        assert_eq!(
+            token_ttl(&serde_json::json!({ "expires_in": 999_999 })),
+            86_400
+        );
+        assert_eq!(token_ttl(&serde_json::json!({ "expires_in": -5 })), -5);
     }
 
     #[test]
@@ -513,6 +527,10 @@ mod tests {
         assert_eq!(
             extract_code(&serde_json::json!({ "errcode": "x" })),
             Some("x".to_string())
+        );
+        assert_eq!(
+            extract_code(&serde_json::json!({ "code": 0, "err_code": 40034100 })),
+            Some("40034100".to_string())
         );
         assert_eq!(extract_code(&serde_json::json!({ "code": 0 })), None);
         assert_eq!(extract_code(&serde_json::json!({ "code": null })), None);

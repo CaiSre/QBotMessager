@@ -7,9 +7,13 @@
 //! 行为要点：请求体上限、token 提取顺序、
 //! GitHub 签名校验、平台响应体形状、队列优先与同步降级。
 
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
 use actix_web::http::StatusCode;
 use actix_web::http::header::{AUTHORIZATION, CONTENT_LENGTH};
 use actix_web::{HttpRequest, HttpResponse, web};
+use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
 use sha2::Sha256;
@@ -63,11 +67,12 @@ async fn receive_webhook(
 ) -> Result<HttpResponse, AppError> {
     let platform = path.into_inner();
     if !PLATFORMS.contains(&platform.as_str()) {
+        // 路径段来自外部输入，不回显以避免反射型注入。
         return Ok(platform_response(
             &platform,
             StatusCode::NOT_FOUND,
             404,
-            &format!("未知平台：{platform}"),
+            "未知平台",
         ));
     }
     if platform == PLATFORM_GITHUB {
@@ -109,6 +114,29 @@ async fn receive(
         settings.max_body_bytes()
     };
 
+    // 鉴权先于读体：缺乏凭据的请求在消耗内存读体之前就被拒绝；
+    // GitHub 的签名校验依赖原始请求体，仍保持在读体之后。
+    let token = extract_token(req, path_token, settings.webhook_allow_query_token());
+    if token.is_empty() {
+        return Ok(platform_response(
+            platform,
+            StatusCode::UNAUTHORIZED,
+            401,
+            "缺少 webhook token",
+        ));
+    }
+
+    let Some(channel) =
+        queries::channels::find_enabled_for_platform(&state.pool, platform, &token).await?
+    else {
+        return Ok(platform_response(
+            platform,
+            StatusCode::UNAUTHORIZED,
+            401,
+            "token 无效或通道已停用",
+        ));
+    };
+
     // 先看 Content-Length，避免把明显超限的请求体读进内存。
     if let Some(declared) = req
         .headers()
@@ -147,30 +175,20 @@ async fn receive(
         }
     };
 
-    let token = extract_token(req, path_token, settings.webhook_allow_query_token());
-    if token.is_empty() {
-        return Ok(platform_response(
-            platform,
-            StatusCode::UNAUTHORIZED,
-            401,
-            "缺少 webhook token",
-        ));
-    }
-
-    let Some(channel) =
-        queries::channels::find_enabled_for_platform(&state.pool, platform, &token).await?
-    else {
-        return Ok(platform_response(
-            platform,
-            StatusCode::UNAUTHORIZED,
-            401,
-            "token 无效或通道已停用",
-        ));
-    };
-
     if platform == PLATFORM_GITHUB
         && let Some((status, message)) =
             verify_github_signature(&channel, req, &raw, state.config.app_secret_key.as_deref())
+    {
+        return Ok(platform_response(
+            platform,
+            status,
+            status.as_u16(),
+            message,
+        ));
+    }
+
+    if platform == PLATFORM_GITHUB
+        && let Some((status, message)) = reject_replayed_delivery(&channel, req)
     {
         return Ok(platform_response(
             platform,
@@ -283,7 +301,8 @@ async fn receive(
 
     if let Some(queue) = state.queue.as_ref() {
         let delivery = delivery_id(platform, req, &payload);
-        let job_id = dedupe_key(platform, delivery.as_deref(), &request_id);
+        // 通道并入去重键：同一条平台投递可配置到多个通道，各通道独立计数。
+        let job_id = dedupe_key(platform, channel.id, delivery.as_deref(), &request_id);
         match queue.enqueue(job.clone(), &job_id).await {
             Ok(false) => {
                 return Ok(platform_response(
@@ -321,23 +340,34 @@ async fn receive(
         }
     }
 
-    // 未配置队列（或队列不可用）时同步发送。
+    // 未配置队列（或队列不可用）时同步发送；同样启用幂等守卫，
+    // 队列重投与同步回退共用同一套 `request_id:target` 完成标记。
     let limiter = state.limiters.get(&format!("bot:{}", job.bot_id));
-    let outcome = execute_push(&state.pool, &job, &settings, &state.qq, &limiter, None).await;
+    let outcome = execute_push(
+        &state.pool,
+        &job,
+        &settings,
+        &state.qq,
+        &limiter,
+        Some(&state.sent_guard),
+    )
+    .await;
     let failures = outcome.failed();
     if failures.is_empty() {
         return Ok(platform_response(platform, StatusCode::OK, 0, "ok"));
     }
+    // 具体失败原因只进日志与 push_logs（execute_push 已落库），对外固定文案。
+    tracing::warn!(failures = ?failures, request_id = %request_id, "同步推送存在失败");
     let message = if failures.len() == outcome.errors.len() {
-        failures[0].to_string()
+        "推送失败，请稍后重试"
     } else {
-        format!("部分目标推送失败：{}", failures[0])
+        "部分目标推送失败"
     };
     Ok(platform_response(
         platform,
         StatusCode::BAD_GATEWAY,
         502,
-        &message,
+        message,
     ))
 }
 
@@ -533,7 +563,7 @@ fn resolve_targets(payload: &Value, bot: &BotProfile) -> Vec<QqTarget> {
         .unwrap_or_default()
 }
 
-/// 平台投递 ID，用于队列去重。
+/// 平台投递 ID，用于队列去重与防重放。
 fn delivery_id(platform: &str, req: &HttpRequest, payload: &Value) -> Option<String> {
     if platform == PLATFORM_GITHUB {
         return req
@@ -556,6 +586,60 @@ fn delivery_id(platform: &str, req: &HttpRequest, payload: &Value) -> Option<Str
             && !value.is_empty()
         {
             return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// GitHub 防重放窗口；窗口内同一条投递只会被处理一次。
+const REPLAY_WINDOW: Duration = Duration::from_secs(3600);
+/// 防重放表的容量上限，超过后批量清理过期项（参照 AttemptLimiter 的 MAX_KEYS）。
+const MAX_DELIVERIES: usize = 4096;
+
+/// GitHub 投递 GUID 的进程内防重放记录。
+///
+/// 记录仅存在于进程内存：重启后失效，是可接受的折衷——GitHub 官方确认
+/// redeliver 才会复用 GUID，重放攻击不得不用同签名重发旧 GUID，
+/// 签名校验已通过后的窗口内拒绝足够拦截绝大多数回放。
+/// key 为（通道, delivery GUID）二元组：同一事件配置到多个通道时，
+/// 每个通道各自独立处理，不能被第一个通道的记录误伤。
+fn deliveries() -> &'static DashMap<(i64, String), Instant> {
+    static DELIVERIES: OnceLock<DashMap<(i64, String), Instant>> = OnceLock::new();
+    DELIVERIES.get_or_init(DashMap::new)
+}
+
+/// 记录并判断该投递是否在窗口内重复；重复时返回拒绝响应。
+fn reject_replayed_delivery(
+    channel: &Channel,
+    req: &HttpRequest,
+) -> Option<(StatusCode, &'static str)> {
+    let delivery = req
+        .headers()
+        .get(GITHUB_DELIVERY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    if delivery.is_empty() {
+        return None;
+    }
+    let now = Instant::now();
+    let key = (channel.id, delivery.to_string());
+    if let Some(seen_at) = deliveries().get(&key)
+        && now.duration_since(*seen_at) < REPLAY_WINDOW
+    {
+        // GitHub 对非 2xx 会重投；用 400 让其 webhook 配置页显示失败但不触发重试风暴。
+        return Some((StatusCode::BAD_REQUEST, "重复投递，已拒绝"));
+    }
+    let map = deliveries();
+    map.insert(key, now);
+    if map.len() > MAX_DELIVERIES {
+        let expired: Vec<(i64, String)> = map
+            .iter()
+            .filter(|entry| now.duration_since(*entry.value()) >= REPLAY_WINDOW)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in expired {
+            map.remove(&key);
         }
     }
     None

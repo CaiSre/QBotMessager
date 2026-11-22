@@ -3,7 +3,7 @@
 //! QQ 的 Markdown 支持标题、加粗/斜体、链接、列表、引用、分割线、行内代码，
 //! 不支持颜色、表格与 HTML 标签；这里只输出最小公共子集，避免整条消息静默失效。
 //!
-//! 语义按字符计数；超长内容截断并追加固定后缀。
+//! 语义按字符计数；超长内容截断并追加固定后缀（上限过小时仅截断）。
 
 use std::sync::OnceLock;
 
@@ -183,11 +183,23 @@ pub fn sanitize_text(text: &str, max_len: Option<usize>) -> String {
     truncate(content, max_len)
 }
 
+/// 清洗标题：去控制字符并按字符截断。
+///
+/// 标题不参与 Markdown/HTML 语义，不做标签与图片降级，
+/// 只保证不含控制字符且长度可控，作为整体预算的一部分。
+pub fn sanitize_title(input: &str, max_chars: usize) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+    let cleaned = control_regex().replace_all(&normalized, "");
+    cleaned.trim().chars().take(max_chars).collect()
+}
+
 /// 超长时截断并追加固定后缀，保证最终输出不超过 `max_len` 字符。
 ///
-/// 设置目录已把 `markdown_max_len` / `text_max_len` 限制在至少 1；
-/// 后缀长度远小于该下限，此处按 `saturating_sub` 处理即可。
-fn truncate(content: &str, max_len: Option<usize>) -> String {
+/// 上限不大于后缀长度时无法同时容纳正文与后缀，仅保留正文截断。
+pub fn truncate(content: &str, max_len: Option<usize>) -> String {
     let Some(max_len) = max_len else {
         return content.to_string();
     };
@@ -196,6 +208,9 @@ fn truncate(content: &str, max_len: Option<usize>) -> String {
         return content.to_string();
     }
     let suffix_len = TRUNCATION_SUFFIX.chars().count();
+    if max_len <= suffix_len {
+        return chars[..max_len].iter().collect();
+    }
     let end = max_len.saturating_sub(suffix_len).min(chars.len());
     let mut out: String = chars[..end].iter().collect();
     out.push_str(TRUNCATION_SUFFIX);
@@ -237,10 +252,17 @@ mod tests {
     }
 
     #[test]
-    fn tiny_limit_still_emits_suffix() {
-        // 设置目录的长度下限是 1：此时保留后缀本身，不再模拟负数切片。
+    fn tiny_limit_truncates_without_suffix() {
+        // 上限不大于后缀长度时无法同时容纳正文与后缀，仅保留正文截断。
         let cleaned = sanitize_markdown("内容", Some(1));
-        assert!(cleaned.ends_with(TRUNCATION_SUFFIX));
+        assert_eq!(cleaned, "内");
+    }
+
+    #[test]
+    fn sanitize_title_strips_control_chars_and_caps_length() {
+        assert_eq!(sanitize_title("  告警\x00\n标题  ", 100), "告警\n标题");
+        assert_eq!(sanitize_title(&"字".repeat(10), 4), "字字字字");
+        assert_eq!(sanitize_title("", 10), "");
     }
 
     #[test]
