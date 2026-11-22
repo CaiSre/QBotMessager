@@ -60,13 +60,14 @@ pub fn session_cookie(
         .finish()
 }
 
-/// 构造删除会话 Cookie 的指令（过期时间设为 0）。
-pub fn clear_session_cookie(config: &Config) -> Cookie<'static> {
+/// 构造删除会话 Cookie 的指令（过期时间设为 0，属性与签发时保持一致）。
+pub fn clear_session_cookie(config: &Config, settings: &RuntimeSettings) -> Cookie<'static> {
     Cookie::build(config.cookie_name.clone(), String::new())
         .path("/")
         .http_only(true)
         .same_site(SameSite::Lax)
         .max_age(CookieDuration::seconds(0))
+        .secure(settings.secure_cookies())
         .finish()
 }
 

@@ -1,8 +1,11 @@
 //! 通用 OAuth2 授权码流程（GitHub 等）。
 //!
 //! OAuth2 授权码流程（提供方走 system 欢迎/管理端配置）：
-//! - state = 24 随机字节 → base64url 无填充（32 字符），纯随机、不编码任何信息；
-//! - 双提交 Cookie：`oauth_state` 与 `oauth_provider`，`Max-Age=600`；
+//! - state 参数为 "{flow16}.{state32}"：flow 是流程临时标识（8 随机字节 hex），
+//!   '.' 不在 base64url 字母表内可无歧义切分，主体仍为 24 随机字节 →
+//!   base64url 无填充（32 字符）、纯随机；
+//! - 双提交 Cookie：`oauth_state_{flow}` 与 `oauth_provider_{flow}`（绑定流程另有
+//!   `oauth_link_{flow}`），名带 flow 后缀，同一浏览器并行流程互不覆盖，`Max-Age=600`；
 //! - 回调常量时间比对 state，并要求提供方 Cookie 与路径上的 key 一致；
 //! - token / userinfo 请求的参数名、请求头与 GitHub 主邮箱兜底逻辑逐项复刻；
 //! - `client_secret` 由调用方解密后显式传入，绝不写回实体（否则会把明文写进库）。
@@ -32,6 +35,8 @@ pub const LINK_COOKIE: &str = "oauth_link";
 pub const COOKIE_MAX_AGE_SECONDS: i64 = 600;
 /// state 的随机字节数（24 字节 → 32 字符 base64url）。
 pub const STATE_BYTES: usize = 24;
+/// 流程标识的随机字节数（8 字节 → 16 个小写 hex 字符）。
+pub const FLOW_BYTES: usize = 8;
 /// GitHub 主邮箱兜底地址。
 pub const GITHUB_EMAILS_URL: &str = "https://api.github.com/user/emails";
 /// OAuth 回调路径前缀。
@@ -52,11 +57,42 @@ pub struct OAuthProfile {
     pub email_verified: bool,
 }
 
-/// 生成 OAuth state（24 随机字节 → base64url 无填充，32 字符）。
+/// 生成 OAuth state 主体（24 随机字节 → base64url 无填充，32 字符）。
 pub fn new_state() -> String {
     let mut bytes = [0u8; STATE_BYTES];
     rand::rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// 生成流程标识（8 随机字节 → 16 个小写 hex 字符）。
+///
+/// 并行流程以 flow 后缀区分 Cookie 名，互不覆盖。
+pub fn new_flow() -> String {
+    let mut bytes = [0u8; FLOW_BYTES];
+    rand::rng().fill_bytes(&mut bytes);
+    // 手写 hex 编码避免新增依赖；小写与 hex 惯例一致。
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 拼接带 flow 后缀的 Cookie 名：`{base}_{flow}`。
+///
+/// flow 为空时退回不带后缀的回退名，保证校验自然失败而非 panic。
+pub fn flow_cookie_name(base: &str, flow: &str) -> String {
+    if flow.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}_{flow}")
+    }
+}
+
+/// 从回调 state 参数解析 (flow, state 主体)。
+///
+/// state 为 "{flow16}.{state32}"；缺失 '.' 时 flow 为空，校验自然失败。
+pub fn split_state_param(state_param: &str) -> (String, &str) {
+    match state_param.split_once('.') {
+        Some((flow, body)) => (flow.to_string(), body),
+        None => (String::new(), state_param),
+    }
 }
 
 /// 回调路径：`/api/auth/oauth/{key}/callback`。
@@ -231,8 +267,10 @@ pub async fn fetch_profile(
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-    if email.is_none() && provider.key == "github" {
-        // GitHub 的 email 可能是私有的，需要单独拉取主邮箱；失败不阻断登录。
+    if provider.key == "github" {
+        // GitHub 的 /user 不返回邮箱验证标记，且 email 可能是私有的：
+        // 总是请求 /user/emails 取 primary 且 verified 的邮箱；失败不阻断登录，
+        // 此时 email_verified 保持 /user 响应解析出的值（GitHub 下为 false）。
         if let Ok(response) = client
             .get(GITHUB_EMAILS_URL)
             .header(AUTHORIZATION, format!("Bearer {access_token}"))
@@ -242,22 +280,21 @@ pub async fn fetch_profile(
             .await
             && response.status().is_success()
             && let Ok(Value::Array(items)) = response.json::<Value>().await
-            && let Some(primary) = items.iter().find(|item| {
+            && let Some(verified_primary) = items.iter().find(|item| {
                 item.as_object()
-                    .and_then(|object| object.get("primary"))
-                    .and_then(Value::as_bool)
+                    .map(|object| {
+                        object.get("primary").and_then(Value::as_bool) == Some(true)
+                            && object.get("verified").and_then(Value::as_bool) == Some(true)
+                    })
                     .unwrap_or(false)
             })
-        {
-            email = primary
+            && let Some(verified_email) = verified_primary
                 .get("email")
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            email_verified = primary
-                .get("verified")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+        {
+            email = Some(verified_email.to_string());
+            email_verified = true;
         }
     }
 
@@ -283,31 +320,52 @@ pub async fn fetch_profile(
 }
 
 /// 构造 state Cookie（HttpOnly、SameSite=Lax、Path=/、Max-Age=600）。
-pub fn state_cookie(settings: &RuntimeSettings, state: &str) -> Cookie<'static> {
-    oauth_cookie(STATE_COOKIE, state.to_string(), settings)
+///
+/// Cookie 名带 flow 后缀隔离并行流程；值仍为 state 主体（不含 flow 前缀）。
+pub fn state_cookie(settings: &RuntimeSettings, flow: &str, state: &str) -> Cookie<'static> {
+    oauth_cookie(
+        flow_cookie_name(STATE_COOKIE, flow),
+        state.to_string(),
+        settings,
+    )
 }
 
-/// 构造提供方 Cookie。
-pub fn provider_cookie(settings: &RuntimeSettings, provider_key: &str) -> Cookie<'static> {
-    oauth_cookie(PROVIDER_COOKIE, provider_key.to_string(), settings)
+/// 构造提供方 Cookie。Cookie 名带 flow 后缀隔离并行流程。
+pub fn provider_cookie(
+    settings: &RuntimeSettings,
+    flow: &str,
+    provider_key: &str,
+) -> Cookie<'static> {
+    oauth_cookie(
+        flow_cookie_name(PROVIDER_COOKIE, flow),
+        provider_key.to_string(),
+        settings,
+    )
 }
 
 /// 构造绑定用途 Cookie；值只是意图标记，回调以解析出的会话为准。
-pub fn link_cookie(settings: &RuntimeSettings) -> Cookie<'static> {
-    oauth_cookie(LINK_COOKIE, "1".to_string(), settings)
+pub fn link_cookie(settings: &RuntimeSettings, flow: &str) -> Cookie<'static> {
+    oauth_cookie(
+        flow_cookie_name(LINK_COOKIE, flow),
+        "1".to_string(),
+        settings,
+    )
 }
 
-/// 构造删除 OAuth 临时 Cookie 的指令。
-pub fn clear_cookie(name: &'static str) -> Cookie<'static> {
-    Cookie::build(name, String::new())
+/// 构造删除 OAuth 临时 Cookie 的指令（属性与签发时保持一致）。
+///
+/// name 接受运行期拼接的带 flow 后缀名，因此放宽为 `&str`。
+pub fn clear_cookie(name: &str, settings: &RuntimeSettings) -> Cookie<'static> {
+    Cookie::build(name.to_string(), String::new())
         .path("/")
         .http_only(true)
         .same_site(SameSite::Lax)
         .max_age(CookieDuration::seconds(0))
+        .secure(settings.secure_cookies())
         .finish()
 }
 
-fn oauth_cookie(name: &'static str, value: String, settings: &RuntimeSettings) -> Cookie<'static> {
+fn oauth_cookie(name: String, value: String, settings: &RuntimeSettings) -> Cookie<'static> {
     Cookie::build(name, value)
         .path("/")
         .http_only(true)
@@ -355,6 +413,56 @@ mod tests {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         );
         assert_ne!(state, new_state());
+    }
+
+    #[test]
+    fn flow_is_16_lowercase_hex_chars() {
+        let flow = new_flow();
+        assert_eq!(flow.len(), 16);
+        assert!(
+            flow.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+        assert_ne!(flow, new_flow());
+    }
+
+    #[test]
+    fn cookie_names_carry_flow_suffix() {
+        let settings = RuntimeSettings::new(None);
+        let flow = new_flow();
+        assert_eq!(
+            flow_cookie_name(STATE_COOKIE, &flow),
+            format!("oauth_state_{flow}")
+        );
+        // flow 为空时退回回退名，回调解析失败也能拿到默认名查询。
+        assert_eq!(flow_cookie_name(STATE_COOKIE, ""), "oauth_state");
+
+        let cookie = state_cookie(&settings, &flow, "state-body");
+        assert_eq!(cookie.name(), format!("oauth_state_{flow}"));
+        assert_eq!(cookie.value(), "state-body");
+        let cookie = provider_cookie(&settings, &flow, "github");
+        assert_eq!(cookie.name(), format!("oauth_provider_{flow}"));
+        assert_eq!(cookie.value(), "github");
+        let cookie = link_cookie(&settings, &flow);
+        assert_eq!(cookie.name(), format!("oauth_link_{flow}"));
+        assert_eq!(cookie.value(), "1");
+        // 清除指令同样落在带后缀的名上。
+        let cookie = clear_cookie(&format!("oauth_state_{flow}"), &settings);
+        assert_eq!(cookie.name(), format!("oauth_state_{flow}"));
+    }
+
+    #[test]
+    fn state_param_splits_into_flow_and_body() {
+        let flow = new_flow();
+        let state = new_state();
+        let param = format!("{flow}.{state}");
+        let (parsed_flow, body) = split_state_param(&param);
+        assert_eq!(parsed_flow, flow);
+        assert_eq!(body, state);
+        // 缺失分隔符：flow 为空，主体保持原值（校验随后自然失败）。
+        let (parsed_flow, body) = split_state_param(&state);
+        assert_eq!(parsed_flow, "");
+        assert_eq!(body, state);
     }
 
     #[test]

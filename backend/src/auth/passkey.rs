@@ -3,7 +3,7 @@
 //! 协议要点：
 //! - user handle = `str(user_id)` 的 UTF-8 字节；
 //! - 支持算法固定为 `[-8 EdDSA, -7 ES256, -257 RS256]`；
-//! - challenge = 32 随机字节 → base64url 无填充，放 Cookie `webauthn_challenge`；
+//! - challenge = 32 随机字节 → base64url 无填充，放 Cookie `webauthn_challenge_{flow}`；
 //! - 库内 `public_key` 存 COSE 公钥的原始 CBOR 字节，断言时经
 //!   `serde_cbor_2::from_slice` + `COSEKey::try_from` 反序列化并校验；
 //! - 注册结果的 AAGUID 与 COSE 字节从 `AuthenticatorData::<Registration>` 中提取
@@ -11,15 +11,21 @@
 //! - 认证成功后回写 sign_count / last_used_at / device_type / backed_up；
 //! - 签名计数回退 `(current > 0 || stored > 0) && current <= stored` 一律拒绝。
 //!
-//! ceremony state（含 challenge）以 base64url JSON 存于 `webauthn_state` Cookie；
-//! `webauthn_challenge` 另存一份 challenge，本地校验时两者必须一致。
+//! ceremony state（含 challenge）以 base64url JSON 存于 `webauthn_state_{flow}` Cookie；
+//! `webauthn_challenge_{flow}` 另存一份 challenge，本地校验时两者必须一致。
+//!
+//! 并行流程：每次 begin 生成 flow（8 随机字节 hex），三个临时 Cookie 名以 `_{flow}`
+//! 后缀隔离，同浏览器并行的注册/登录互不覆盖；finish 按请求体里的 flow 读写与清理，
+//! 其它 flow 的残留依赖 Max-Age 自然过期。
 
+use std::borrow::Cow;
 use std::time::Duration as StdDuration;
 
 use actix_web::cookie::time::Duration as CookieDuration;
 use actix_web::cookie::{Cookie, SameSite};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rand::Rng;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_cbor_2::Value as CborValue;
@@ -38,25 +44,53 @@ use webauthn_rs_core::proto::{
 use crate::error::AppError;
 use crate::services::runtime_settings::RuntimeSettings;
 
-/// challenge Cookie 名。
+/// challenge Cookie 名基准；实际签发名追加 `_{flow}` 后缀。
 pub const CHALLENGE_COOKIE: &str = "webauthn_challenge";
-/// 注册时绑定用户 ID 的 Cookie 名。
+/// 注册时绑定用户 ID 的 Cookie 名基准；实际签发名追加 `_{flow}` 后缀。
 pub const USER_COOKIE: &str = "webauthn_user";
-/// ceremony state 的附加 Cookie 名。
+/// ceremony state 的附加 Cookie 名基准；实际签发名追加 `_{flow}` 后缀。
 pub const STATE_COOKIE: &str = "webauthn_state";
 /// 临时 Cookie 有效期（秒）。
 pub const COOKIE_MAX_AGE_SECONDS: i64 = 300;
 /// WebAuthn 超时（秒）。
 const WEBAUTHN_TIMEOUT_SECONDS: u64 = 300;
+/// flow 的随机字节数（8 字节 → 16 个小写 hex 字符）。
+const FLOW_BYTES: usize = 8;
+
+/// 生成 flow id：8 随机字节 → 16 字符小写 hex（随机源同 `oauth::new_state`）。
+///
+/// 每个 begin 独立生成并拼入临时 Cookie 名，隔离同浏览器并行的流程。
+pub fn new_flow() -> String {
+    let mut bytes = [0u8; FLOW_BYTES];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// flow 是否为合法格式（`new_flow` 的输出：16 个小写 hex 字符）。
+///
+/// finish 用请求体里的 flow 拼 Cookie 名，先校验格式，防止任意字符串进入 Cookie 名。
+pub fn is_valid_flow(flow: &str) -> bool {
+    flow.len() == 16
+        && flow
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// 拼 flow 后缀的临时 Cookie 名：`{base}_{flow}`。
+///
+/// begin 签发与 finish 读取/清理共用此拼名逻辑，保证三处一致。
+pub fn cookie_name(base: &str, flow: &str) -> String {
+    format!("{base}_{flow}")
+}
 
 /// 注册挑战的生成结果。
 #[derive(Debug, Clone)]
 pub struct RegistrationBegin {
     /// 下发给浏览器的 `PublicKeyCredentialCreationOptions`。
     pub options: Value,
-    /// base64url 无填充的 challenge（写入 `webauthn_challenge`）。
+    /// base64url 无填充的 challenge（写入 `webauthn_challenge_{flow}`）。
     pub challenge: String,
-    /// base64url 编码的 ceremony state（写入 `webauthn_state`）。
+    /// base64url 编码的 ceremony state（写入 `webauthn_state_{flow}`）。
     pub state: String,
 }
 
@@ -208,8 +242,8 @@ pub fn authentication_options(
 
 /// 校验注册响应。
 ///
-/// `expected_challenge` 来自 `webauthn_challenge` Cookie（已解码的原始字节），
-/// `state_cookie` 来自 `webauthn_state` Cookie。
+/// `expected_challenge` 来自 `webauthn_challenge_{flow}` Cookie（已解码的原始字节），
+/// `state_cookie` 来自 `webauthn_state_{flow}` Cookie。
 pub fn verify_registration(
     credential: &RegisterPublicKeyCredential,
     expected_challenge: &[u8],
@@ -370,44 +404,60 @@ pub fn resolve_origin(public_base_url: &str, scheme: &str, host: Option<&str>) -
     format!("{scheme}://{}", host.unwrap_or("localhost"))
 }
 
-/// challenge Cookie。
-pub fn challenge_cookie(settings: &RuntimeSettings, challenge: &str) -> Cookie<'static> {
-    passkey_cookie(CHALLENGE_COOKIE, challenge.to_string(), settings)
+/// challenge Cookie（名带 flow 后缀，隔离并行流程）。
+pub fn challenge_cookie(
+    settings: &RuntimeSettings,
+    flow: &str,
+    challenge: &str,
+) -> Cookie<'static> {
+    passkey_cookie(
+        cookie_name(CHALLENGE_COOKIE, flow),
+        challenge.to_string(),
+        settings,
+    )
 }
 
-/// 注册用户 Cookie。
-pub fn user_cookie(settings: &RuntimeSettings, user_id: i64) -> Cookie<'static> {
-    passkey_cookie(USER_COOKIE, user_id.to_string(), settings)
+/// 注册用户 Cookie（名带 flow 后缀，隔离并行流程）。
+pub fn user_cookie(settings: &RuntimeSettings, flow: &str, user_id: i64) -> Cookie<'static> {
+    passkey_cookie(
+        cookie_name(USER_COOKIE, flow),
+        user_id.to_string(),
+        settings,
+    )
 }
 
-/// ceremony state Cookie。
-pub fn state_cookie(settings: &RuntimeSettings, state: &str) -> Cookie<'static> {
-    passkey_cookie(STATE_COOKIE, state.to_string(), settings)
+/// ceremony state Cookie（名带 flow 后缀，隔离并行流程）。
+pub fn state_cookie(settings: &RuntimeSettings, flow: &str, state: &str) -> Cookie<'static> {
+    passkey_cookie(cookie_name(STATE_COOKIE, flow), state.to_string(), settings)
 }
 
-/// 删除全部 Passkey 临时 Cookie。
-pub fn clear_passkey_cookies() -> Vec<Cookie<'static>> {
+/// 删除当前 flow 的三个 Passkey 临时 Cookie（属性与签发时保持一致）。
+///
+/// 其它 flow 的残留 Cookie 不在此清理，依赖 Max-Age 自然过期。
+pub fn clear_passkey_cookies(settings: &RuntimeSettings, flow: &str) -> Vec<Cookie<'static>> {
     [CHALLENGE_COOKIE, USER_COOKIE, STATE_COOKIE]
         .into_iter()
-        .map(clear_cookie)
+        .map(|base| clear_cookie(cookie_name(base, flow), settings))
         .collect()
 }
 
 /// 构造删除指定 Cookie 的指令。
-pub fn clear_cookie(name: &'static str) -> Cookie<'static> {
+///
+/// 名放宽为动态 Cookie 名（flow 后缀拼接结果由调用方传入）。
+pub fn clear_cookie(
+    name: impl Into<Cow<'static, str>>,
+    settings: &RuntimeSettings,
+) -> Cookie<'static> {
     Cookie::build(name, String::new())
         .path("/")
         .http_only(true)
         .same_site(SameSite::Lax)
         .max_age(CookieDuration::seconds(0))
+        .secure(settings.secure_cookies())
         .finish()
 }
 
-fn passkey_cookie(
-    name: &'static str,
-    value: String,
-    settings: &RuntimeSettings,
-) -> Cookie<'static> {
+fn passkey_cookie(name: String, value: String, settings: &RuntimeSettings) -> Cookie<'static> {
     Cookie::build(name, value)
         .path("/")
         .http_only(true)
@@ -549,6 +599,36 @@ mod tests {
             (cbor_int(-2), cbor_bytes(&[7u8; 32])),
             (cbor_int(-3), cbor_bytes(&[9u8; 32])),
         ])
+    }
+
+    /// flow 契约：16 个小写 hex 字符、两次生成不同、格式校验与三处拼名一致。
+    #[test]
+    fn flow_and_cookie_names_follow_contract() {
+        let flow = new_flow();
+        assert_eq!(flow.len(), 16, "{flow}");
+        assert!(
+            flow.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{flow}"
+        );
+        assert_ne!(flow, new_flow(), "两次 begin 必须 flow 不同");
+        assert!(is_valid_flow(&flow));
+        // finish 把请求体里的 flow 拼进 Cookie 名，格式必须先收紧。
+        assert!(!is_valid_flow(""));
+        assert!(!is_valid_flow("0123456789abcdef0"));
+        assert!(!is_valid_flow("0123456789ABCDEF"));
+        assert!(!is_valid_flow("0123456789abcdeG"));
+        assert_eq!(
+            cookie_name(CHALLENGE_COOKIE, &flow),
+            format!("webauthn_challenge_{flow}")
+        );
+        assert_eq!(
+            cookie_name(USER_COOKIE, &flow),
+            format!("webauthn_user_{flow}")
+        );
+        assert_eq!(
+            cookie_name(STATE_COOKIE, &flow),
+            format!("webauthn_state_{flow}")
+        );
     }
 
     #[test]

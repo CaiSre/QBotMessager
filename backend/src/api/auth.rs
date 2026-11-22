@@ -141,10 +141,14 @@ struct PasswordChangeIn {
     email_code: String,
 }
 
-/// Passkey 注册 / 登录完成：浏览器返回的凭据对象。
+/// Passkey 注册 / 登录完成：浏览器返回的凭据对象与本次流程的 flow。
+///
+/// `flow` 必填（缺失由 serde 拒绝），值来自 begin 响应外层的 `flow` 键，
+/// 用于定位 `webauthn_*_{flow}` 临时 Cookie，隔离同浏览器并行的流程。
 #[derive(Debug, Deserialize)]
 struct PasskeyFinishIn {
     credential: Value,
+    flow: String,
 }
 
 /// OAuth 回调查询参数；缺失时按空串处理。
@@ -241,8 +245,10 @@ async fn update_email(
     let user = require_user(&state, &req).await?;
     validate_optional_password(&body.current_password)?;
     let email = validate_email_input(&body.email)?;
+    let token = session_token(&state, &req);
     let updated =
-        users::update_profile_email(&state.pool, &user, &email, &body.current_password).await?;
+        users::update_profile_email(&state.pool, &user, &email, &body.current_password, &token)
+            .await?;
     Ok(HttpResponse::Ok().json(user_payload(&updated)))
 }
 
@@ -389,10 +395,11 @@ async fn login(
 
 /// `POST /api/auth/logout`
 async fn logout(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
+    let settings = (*state.settings()).clone();
     let token = session_token(&state, &req);
     sessions::revoke_session(&state.pool, &token).await?;
     Ok(HttpResponse::Ok()
-        .cookie(sessions::clear_session_cookie(&state.config))
+        .cookie(sessions::clear_session_cookie(&state.config, &settings))
         .json(json!({ "ok": true })))
 }
 
@@ -453,8 +460,11 @@ async fn oauth_start(
     let settings = (*state.settings()).clone();
     let origin = request_origin(&state, &settings, &req);
     let redirect_uri = oauth::redirect_uri(&origin, &provider.key);
+    // flow 编码进 state 参数与 Cookie 名后缀，同一浏览器的并行流程互不覆盖。
+    let flow = oauth::new_flow();
     let state_value = oauth::new_state();
-    let url = oauth::build_authorize_url(&provider, &redirect_uri, &state_value);
+    let url =
+        oauth::build_authorize_url(&provider, &redirect_uri, &format!("{flow}.{state_value}"));
 
     // 已登录用户发起的流程按「绑定」处理：回调据此把第三方账号挂到当前用户，
     // 而不是走登录/自动注册分支。
@@ -463,11 +473,13 @@ async fn oauth_start(
         .append_header((LOCATION, url))
         .finish();
     let cookie_result = response
-        .add_cookie(&oauth::state_cookie(&settings, &state_value))
-        .and_then(|()| response.add_cookie(&oauth::provider_cookie(&settings, &provider.key)))
+        .add_cookie(&oauth::state_cookie(&settings, &flow, &state_value))
+        .and_then(|()| {
+            response.add_cookie(&oauth::provider_cookie(&settings, &flow, &provider.key))
+        })
         .and_then(|()| {
             if session_user.is_some() {
-                response.add_cookie(&oauth::link_cookie(&settings))
+                response.add_cookie(&oauth::link_cookie(&settings, &flow))
             } else {
                 Ok(())
             }
@@ -486,11 +498,15 @@ async fn oauth_callback(
     path: web::Path<String>,
     query: web::Query<OAuthCallbackQuery>,
 ) -> HttpResponse {
+    let settings = (*state.settings()).clone();
     let provider_key_path = path.into_inner();
+    // 失败路径的 Cookie 清理以 query.state 解析出的 flow 为准；
+    // 能解析则清对应流程的三个 Cookie，解析不出则不清。
+    let (failure_flow, _) = oauth::split_state_param(&query.state);
     let result = oauth_callback_inner(&req, &state, &provider_key_path, &query).await;
     match result {
         Ok(response) => response,
-        Err(err) => oauth_failure_redirect(&err),
+        Err(err) => oauth_failure_redirect(&settings, &failure_flow, &err),
     }
 }
 
@@ -502,15 +518,18 @@ async fn oauth_callback_inner(
     query: &OAuthCallbackQuery,
 ) -> Result<HttpResponse, AppError> {
     let provider_key = path.to_string();
+    // state 参数格式为 "{flow16}.{state32}"：flow 决定读哪组 Cookie；
+    // 缺 '.' 时 flow 为空，回退到不带后缀的名，校验自然失败而非 panic。
+    let (flow, state_body) = oauth::split_state_param(&query.state);
     let cookie_state = req
-        .cookie(oauth::STATE_COOKIE)
+        .cookie(&oauth::flow_cookie_name(oauth::STATE_COOKIE, &flow))
         .map(|cookie| cookie.value().to_string())
         .unwrap_or_default();
     let cookie_provider = req
-        .cookie(oauth::PROVIDER_COOKIE)
+        .cookie(&oauth::flow_cookie_name(oauth::PROVIDER_COOKIE, &flow))
         .map(|cookie| cookie.value().to_string())
         .unwrap_or_default();
-    oauth::validate_state(&query.state, &cookie_state, &cookie_provider, &provider_key)?;
+    oauth::validate_state(state_body, &cookie_state, &cookie_provider, &provider_key)?;
     if query.code.is_empty() {
         return Err(AppError::bad_request("缺少授权码"));
     }
@@ -545,7 +564,8 @@ async fn oauth_callback_inner(
             .await?;
 
     // 绑定分支：start 时带会话、且回调时仍能解析出有效会话。
-    let link_user = match req.cookie(oauth::LINK_COOKIE) {
+    let link_cookie_name = oauth::flow_cookie_name(oauth::LINK_COOKIE, &flow);
+    let link_user = match req.cookie(&link_cookie_name) {
         Some(_) => sessions::resolve_session(&state.pool, &session_token(state, req)).await?,
         None => None,
     };
@@ -555,9 +575,12 @@ async fn oauth_callback_inner(
         }
         return match identity {
             // 已绑定在当前用户名下：视为成功，直接回用户中心。
-            Some(found) if found.user_id == current.id => {
-                Ok(oauth_done_redirect(false, "该账号已绑定，无需重复操作"))
-            }
+            Some(found) if found.user_id == current.id => Ok(oauth_done_redirect(
+                &settings,
+                &flow,
+                false,
+                "该账号已绑定，无需重复操作",
+            )),
             // 被其他用户绑定：不允许接管。
             Some(_) => Err(AppError::conflict(
                 "该第三方账号已绑定到其他用户，无法重复绑定",
@@ -574,14 +597,17 @@ async fn oauth_callback_inner(
                     },
                 )
                 .await?;
-                Ok(oauth_done_redirect(true, "绑定成功"))
+                Ok(oauth_done_redirect(&settings, &flow, true, "绑定成功"))
             }
         };
     }
 
     let identity_exists = identity.is_some();
+    // 自动注册分支会在建号事务内一并绑定身份；外层兜底插入须跳过该路径，
+    // 否则同一身份会被插入两次并撞唯一索引。
+    let mut identity_created_in_tx = false;
 
-    let mut user = if let Some(identity) = identity {
+    let user = if let Some(identity) = identity {
         queries::users::find_by_id(&state.pool, identity.user_id).await?
     } else {
         let existing = match profile.email.as_deref() {
@@ -592,8 +618,9 @@ async fn oauth_callback_inner(
         };
         match existing {
             Some(found) => {
-                // 只有提供方邮箱可信时才自动关联，避免被冒名登录接管账号。
-                if !(provider.email_verified || profile.email_verified) {
+                // 自动关联要求提供方在本次响应中确认邮箱已验证；
+                // 管理端的静态开关不参与该判定，避免逐响应标记被整体覆盖。
+                if !profile.email_verified {
                     return Err(AppError::conflict(
                         "该邮箱已存在本地账号，但提供方未验证邮箱，无法自动关联；请改用密码登录",
                     ));
@@ -624,7 +651,23 @@ async fn oauth_callback_inner(
                     status: STATUS_ACTIVE,
                     created_at: now,
                 };
-                let user_id = queries::users::insert(&state.pool, &new_user).await?;
+                // 建号与身份绑定同一事务提交，任一步失败整体回滚，避免产生
+                // 没有任何登录凭据的孤儿账号。
+                let mut tx = state.pool.begin().await?;
+                let user_id = queries::users::insert(&mut *tx, &new_user).await?;
+                queries::oauth::insert_identity(
+                    &mut *tx,
+                    &queries::oauth::NewAuthIdentity {
+                        user_id,
+                        provider: &provider.key,
+                        provider_user_id: &profile.provider_user_id,
+                        provider_login: Some(&profile.login),
+                        created_at: now,
+                    },
+                )
+                .await?;
+                tx.commit().await?;
+                identity_created_in_tx = true;
                 Some(User {
                     id: user_id,
                     email: email_lower,
@@ -639,19 +682,20 @@ async fn oauth_callback_inner(
         }
     };
 
-    let Some(ref resolved) = user else {
+    let Some(user) = user else {
         return Err(AppError::forbidden("账号不可用"));
     };
-    if resolved.status != STATUS_ACTIVE {
+    if user.status != STATUS_ACTIVE {
         return Err(AppError::forbidden("账号不可用"));
     }
 
-    // 新绑定的 identity 在账号确认可用之后写入失败时整体放弃。
-    if !identity_exists {
+    // 已有账号但尚未绑定身份：绑定动作在账号确认可用之后单独提交。
+    // 注册事务里已绑定的不算，避免重复插入撞唯一索引。
+    if !identity_exists && !identity_created_in_tx {
         queries::oauth::insert_identity(
             &state.pool,
             &queries::oauth::NewAuthIdentity {
-                user_id: resolved.id,
+                user_id: user.id,
                 provider: &provider.key,
                 provider_user_id: &profile.provider_user_id,
                 provider_login: Some(&profile.login),
@@ -661,7 +705,6 @@ async fn oauth_callback_inner(
         .await?;
     }
 
-    let user = user.take().expect("user 已在上方确认存在");
     let ip = state.client_ip(req);
     let token = sessions::create_session(
         &state.pool,
@@ -681,40 +724,81 @@ async fn oauth_callback_inner(
     Ok(HttpResponse::Found()
         .append_header((LOCATION, "/"))
         .cookie(cookie)
-        .cookie(oauth::clear_cookie(oauth::STATE_COOKIE))
-        .cookie(oauth::clear_cookie(oauth::PROVIDER_COOKIE))
-        .cookie(oauth::clear_cookie(oauth::LINK_COOKIE))
+        .cookie(oauth::clear_cookie(
+            &oauth::flow_cookie_name(oauth::STATE_COOKIE, &flow),
+            &settings,
+        ))
+        .cookie(oauth::clear_cookie(
+            &oauth::flow_cookie_name(oauth::PROVIDER_COOKIE, &flow),
+            &settings,
+        ))
+        .cookie(oauth::clear_cookie(
+            &oauth::flow_cookie_name(oauth::LINK_COOKIE, &flow),
+            &settings,
+        ))
         .finish())
 }
 
 /// 绑定流程结束后的跳转：带结果参数跳回安全设置页。
-fn oauth_done_redirect(ok: bool, message: &str) -> HttpResponse {
+///
+/// 只清除当前 flow 对应的临时 Cookie；其它并行流程的残留按 Max-Age 自然过期。
+fn oauth_done_redirect(
+    settings: &RuntimeSettings,
+    flow: &str,
+    ok: bool,
+    message: &str,
+) -> HttpResponse {
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("oauth", if ok { "ok" } else { "fail" })
         .append_pair("message", message)
         .finish();
     HttpResponse::Found()
         .append_header((LOCATION, format!("/security?{query}")))
-        .cookie(oauth::clear_cookie(oauth::STATE_COOKIE))
-        .cookie(oauth::clear_cookie(oauth::PROVIDER_COOKIE))
-        .cookie(oauth::clear_cookie(oauth::LINK_COOKIE))
+        .cookie(oauth::clear_cookie(
+            &oauth::flow_cookie_name(oauth::STATE_COOKIE, flow),
+            settings,
+        ))
+        .cookie(oauth::clear_cookie(
+            &oauth::flow_cookie_name(oauth::PROVIDER_COOKIE, flow),
+            settings,
+        ))
+        .cookie(oauth::clear_cookie(
+            &oauth::flow_cookie_name(oauth::LINK_COOKIE, flow),
+            settings,
+        ))
         .finish()
 }
 
 /// 回调失败后的跳转：中文提示交给前端提示页展示。
-fn oauth_failure_redirect(err: &AppError) -> HttpResponse {
+///
+/// flow 为空（state 无法解析出 flow）时不下发任何清除指令，
+/// 避免误清其它并行流程仍在使用的 Cookie。
+fn oauth_failure_redirect(settings: &RuntimeSettings, flow: &str, err: &AppError) -> HttpResponse {
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("message", err.detail())
         .append_pair("detail", &err.to_string())
         .finish();
     let location = format!("/oauth/failure?{query}");
     tracing::warn!(error = %err, "OAuth 回调失败，重定向到提示页");
-    HttpResponse::Found()
-        .append_header((LOCATION, location))
-        .cookie(oauth::clear_cookie(oauth::STATE_COOKIE))
-        .cookie(oauth::clear_cookie(oauth::PROVIDER_COOKIE))
-        .cookie(oauth::clear_cookie(oauth::LINK_COOKIE))
-        .finish()
+    // 无法解析 flow 时不下发任何清除指令，避免误删其它并行流程仍在使用的 Cookie。
+    let mut builder = HttpResponse::Found();
+    let mut response = builder.append_header((LOCATION, location));
+    if !flow.is_empty() {
+        response = response
+            .cookie(oauth::clear_cookie(
+                &oauth::flow_cookie_name(oauth::STATE_COOKIE, flow),
+                settings,
+            ))
+            .cookie(oauth::clear_cookie(
+                &oauth::flow_cookie_name(oauth::PROVIDER_COOKIE, flow),
+                settings,
+            ))
+            .cookie(oauth::clear_cookie(
+                &oauth::flow_cookie_name(oauth::LINK_COOKIE, flow),
+                settings,
+            ));
+    }
+    response.finish()
 }
 
 /// `GET /api/auth/oauth/identities`
@@ -807,12 +891,22 @@ async fn passkey_register_begin(
     let origin = request_origin(&state, &settings, &req);
     let begin =
         passkey::registration_options(&rp_id, settings.rp_name(), &origin, user.id, &user.email)?;
+    let flow = passkey::new_flow();
+    let mut body = begin.options;
+    // flow 并入 options JSON 外层（前端 unwrap 只取 publicKey，外层多键安全）。
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("flow".into(), json!(flow));
+    }
 
     Ok(HttpResponse::Ok()
-        .cookie(passkey::challenge_cookie(&settings, &begin.challenge))
-        .cookie(passkey::user_cookie(&settings, user.id))
-        .cookie(passkey::state_cookie(&settings, &begin.state))
-        .json(begin.options))
+        .cookie(passkey::challenge_cookie(
+            &settings,
+            &flow,
+            &begin.challenge,
+        ))
+        .cookie(passkey::user_cookie(&settings, &flow, user.id))
+        .cookie(passkey::state_cookie(&settings, &flow, &begin.state))
+        .json(body))
 }
 
 /// `POST /api/auth/passkey/register/finish`
@@ -823,12 +917,16 @@ async fn passkey_register_finish(
 ) -> Result<HttpResponse, AppError> {
     let user = require_user(&state, &req).await?;
     let settings = (*state.settings()).clone();
-    let raw_challenge = cookie_value(&req, passkey::CHALLENGE_COOKIE);
-    let cookie_user = cookie_value(&req, passkey::USER_COOKIE);
+    let flow = finish_flow(&body.flow)?;
+    let raw_challenge = cookie_value(
+        &req,
+        &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+    );
+    let cookie_user = cookie_value(&req, &passkey::cookie_name(passkey::USER_COOKIE, &flow));
     if raw_challenge.is_empty() || cookie_user != user.id.to_string() {
         return Err(AppError::bad_request("注册会话已过期，请重试"));
     }
-    let state_cookie = cookie_value(&req, passkey::STATE_COOKIE);
+    let state_cookie = cookie_value(&req, &passkey::cookie_name(passkey::STATE_COOKIE, &flow));
     if state_cookie.is_empty() {
         return Err(AppError::bad_request("注册会话已过期，请重试"));
     }
@@ -880,7 +978,7 @@ async fn passkey_register_finish(
     .await?;
 
     let mut response = HttpResponse::Ok();
-    for cookie in passkey::clear_passkey_cookies() {
+    for cookie in passkey::clear_passkey_cookies(&settings, &flow) {
         response.cookie(cookie);
     }
     Ok(response.json(json!({ "ok": true })))
@@ -915,11 +1013,21 @@ async fn passkey_login_begin(
     let rp_id = request_rp_id(&settings, &req);
     let origin = request_origin(&state, &settings, &req);
     let begin = passkey::authentication_options(&rp_id, settings.rp_name(), &origin)?;
+    let flow = passkey::new_flow();
+    let mut body = begin.options;
+    // flow 并入 options JSON 外层（前端 unwrap 只取 publicKey，外层多键安全）。
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("flow".into(), json!(flow));
+    }
 
     Ok(HttpResponse::Ok()
-        .cookie(passkey::challenge_cookie(&settings, &begin.challenge))
-        .cookie(passkey::state_cookie(&settings, &begin.state))
-        .json(begin.options))
+        .cookie(passkey::challenge_cookie(
+            &settings,
+            &flow,
+            &begin.challenge,
+        ))
+        .cookie(passkey::state_cookie(&settings, &flow, &begin.state))
+        .json(body))
 }
 
 /// `POST /api/auth/passkey/login/finish`
@@ -929,11 +1037,15 @@ async fn passkey_login_finish(
     body: web::Json<PasskeyFinishIn>,
 ) -> Result<HttpResponse, AppError> {
     let settings = (*state.settings()).clone();
-    let raw_challenge = cookie_value(&req, passkey::CHALLENGE_COOKIE);
+    let flow = finish_flow(&body.flow)?;
+    let raw_challenge = cookie_value(
+        &req,
+        &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+    );
     if raw_challenge.is_empty() {
         return Err(AppError::bad_request("登录会话已过期，请重试"));
     }
-    let state_cookie = cookie_value(&req, passkey::STATE_COOKIE);
+    let state_cookie = cookie_value(&req, &passkey::cookie_name(passkey::STATE_COOKIE, &flow));
     if state_cookie.is_empty() {
         return Err(AppError::bad_request("登录会话已过期，请重试"));
     }
@@ -1011,10 +1123,22 @@ async fn passkey_login_finish(
 
     let mut response = HttpResponse::Ok();
     response.cookie(cookie);
-    for cookie in passkey::clear_passkey_cookies() {
+    for cookie in passkey::clear_passkey_cookies(&settings, &flow) {
         response.cookie(cookie);
     }
     Ok(response.json(json!({ "ok": true })))
+}
+
+/// 校验 finish 请求体里的 flow，通过则原样返回。
+///
+/// flow 会被拼进 Cookie 名，必须先收紧为 `new_flow` 的输出格式，
+/// 防止任意字符串进入 Set-Cookie 头。
+fn finish_flow(flow: &str) -> Result<&str, AppError> {
+    if passkey::is_valid_flow(flow) {
+        Ok(flow)
+    } else {
+        Err(AppError::validation("flow 格式非法"))
+    }
 }
 
 // ----------------------------------------------------------------------- 辅助
@@ -1097,7 +1221,10 @@ async fn send_code(
     );
     if let Err(err) = mail::send_mail(settings, email, &subject, &text, Some(&html)).await {
         tracing::warn!(error = %err, purpose, "验证码邮件发送失败");
-        let _ = email_codes::discard_latest(&state.pool, email, purpose).await;
+        if let Err(discard_err) = email_codes::discard_latest(&state.pool, email, purpose).await {
+            // 作废失败不阻断报错返回；残留记录由冷却期抑制下次签发。
+            tracing::warn!(error = %discard_err, "作废验证码失败");
+        }
         return Err(match err {
             mail::MailError::NotConfigured => AppError::database_busy("邮件服务未配置"),
             mail::MailError::SendFailed => {
@@ -1221,6 +1348,10 @@ fn last_forwarded(req: &HttpRequest, name: &str) -> Option<String> {
 }
 
 /// 站点 origin：`public_base_url` 优先，否则按请求推导。
+///
+/// `public_base_url` 为空时 origin 取自请求 Host（或 `TRUST_PROXY` 下的转发头），
+/// 仅适用于反向代理已强制校验 Host 的部署；转发 proto 只认 http/https，
+/// 其它值按 http 回退。
 fn request_origin(state: &AppState, settings: &RuntimeSettings, req: &HttpRequest) -> String {
     if !settings.public_base_url().is_empty() {
         return settings.public_base_url().trim_end_matches('/').to_string();
@@ -1228,7 +1359,9 @@ fn request_origin(state: &AppState, settings: &RuntimeSettings, req: &HttpReques
     let mut scheme = "http".to_string();
     let mut host = request_host(req).unwrap_or_else(|| "localhost".to_string());
     if state.config.trust_proxy {
-        if let Some(value) = last_forwarded(req, "x-forwarded-proto") {
+        if let Some(value) = last_forwarded(req, "x-forwarded-proto")
+            && matches!(value.to_ascii_lowercase().as_str(), "http" | "https")
+        {
             scheme = value;
         }
         if let Some(value) = last_forwarded(req, "x-forwarded-host") {
@@ -1347,6 +1480,8 @@ mod passkey_store {
     }
 
     /// 认证成功后回写签名计数、使用时间与设备信息。
+    ///
+    /// 并发断言取较大计数回写，避免双写时互相回退。
     pub async fn update_usage(
         pool: &MySqlPool,
         id: i64,
@@ -1357,7 +1492,8 @@ mod passkey_store {
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE webauthn_credentials \
-             SET sign_count = ?, last_used_at = ?, device_type = ?, backed_up = ? WHERE id = ?",
+             SET sign_count = GREATEST(sign_count, ?), last_used_at = ?, device_type = ?, \
+             backed_up = ? WHERE id = ?",
         )
         .bind(sign_count)
         .bind(last_used_at)

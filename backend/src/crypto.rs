@@ -57,8 +57,9 @@ fn build_fernet(key: &str) -> Option<fernet::Fernet> {
 /// `key` 为 `None`（未配置 `APP_SECRET_KEY`）时降级为带 `plain1:` 前缀的明文；
 /// 空串保持为空（避免写入无意义的密文）。
 ///
-/// 密钥格式非法时记录错误日志并同样降级为明文：正常流程下
-/// [`crate::config::Config::from_env`] 已在启动时校验过密钥。
+/// 密钥格式非法时记录 error 日志并同样降级为明文：正常流程下
+/// [`crate::config::Config::from_env`] 已在启动时校验过密钥，运行期该分支
+/// 不可达；需要显式失败的调用方应优先使用 [`try_encrypt_secret`]。
 pub fn encrypt_secret(plain: &str, key: Option<&str>) -> String {
     match try_encrypt_secret(plain, key) {
         Ok(value) => value,

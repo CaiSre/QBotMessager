@@ -30,11 +30,13 @@ use actix_web::{App, HttpResponse, HttpServer, web};
 use base64::Engine;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use chrono::{Duration, NaiveDateTime, Utc};
+use qbotmessager::auth::passkey;
 use qbotmessager::auth::{passwords, sessions};
 use qbotmessager::config::Config;
 use qbotmessager::crypto;
 use qbotmessager::db::models::{ROLE_SUPER_ADMIN, ROLE_USER, STATUS_ACTIVE, STATUS_DISABLED};
 use qbotmessager::db::queries;
+use qbotmessager::services::email_codes;
 use qbotmessager::services::runtime_settings::RuntimeSettings;
 use qbotmessager::state::AppState;
 use serde_json::{Value, json};
@@ -1818,6 +1820,54 @@ async fn email_code_resend_cooldown_and_hourly_quota() {
     assert_eq!(before, after, "已注册邮箱不应真的发码");
 }
 
+/// 并发提交错误验证码时尝试计数由数据库原子推进：一次只 +1，
+/// 计满 `MAX_ATTEMPTS` 后立即作废，不允许通过竞争突破上限。
+#[tokio::test]
+async fn email_code_attempts_increment_atomically_under_concurrency() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let email = format!("{}-race@example.com", fixture.prefix);
+    insert_email_code(
+        &fixture,
+        &email,
+        "reset_password",
+        "999999",
+        Utc::now().naive_utc(),
+        false,
+    )
+    .await;
+
+    // 一个错误码、并发打满上限之后再补一轮，全部应返回 false。
+    let rounds = email_codes::MAX_ATTEMPTS + 3;
+    let mut joins = Vec::with_capacity(rounds as usize);
+    for _ in 0..rounds {
+        let pool = fixture.pool.clone();
+        let email = email.clone();
+        joins.push(tokio::spawn(async move {
+            email_codes::verify_code(&pool, &email, "reset_password", "000000").await
+        }));
+    }
+    for join in joins {
+        assert!(!join.await.expect("verify 任务 panic").expect("verify 失败"));
+    }
+
+    let (attempts, consumed): (i32, Option<NaiveDateTime>) = sqlx::query_as(
+        "SELECT attempts, consumed_at FROM email_verification_codes WHERE email = ?",
+    )
+    .bind(&email)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(attempts, email_codes::MAX_ATTEMPTS);
+    assert!(consumed.is_some(), "计满上限后必须作废");
+
+    // 已作废后正确码也无效。
+    let ok = email_codes::verify_code(&fixture.pool, &email, "reset_password", "999999")
+        .await
+        .unwrap();
+    assert!(!ok);
+}
+
 #[actix_web::test]
 async fn password_reset_with_email_code() {
     let _guard = TEST_LOCK.lock().await;
@@ -1965,19 +2015,43 @@ macro_rules! oauth_start {
     ($app:expr, $key:expr) => {{ send!($app, get(&format!("/api/auth/oauth/{}/start", $key))) }};
 }
 
+/// 从 Location 的 state 参数（"{flow16}.{state32}"）提取 flow 后缀。
+fn state_flow(location: &str) -> String {
+    query_param(location, "state")
+        .and_then(|state| state.split_once('.').map(|(flow, _)| flow.to_string()))
+        .unwrap_or_default()
+}
+
+/// 与服务端一致：flow 为空时退回不带后缀的回退名。
+fn flow_cookie_name(base: &str, flow: &str) -> String {
+    if flow.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}_{flow}")
+    }
+}
+
 macro_rules! oauth_callback {
     ($app:expr, $key:expr, $code:expr, $state:expr, $state_cookie:expr, $provider_cookie:expr) => {{
+        // state 参数为 "{flow16}.{state32}"，从 flow 拼 Cookie 名，与服务端解析一致。
+        let full_state: String = $state.to_string();
+        let flow = full_state
+            .split_once('.')
+            .map(|(flow, _)| flow.to_string())
+            .unwrap_or_default();
+        let state_name = flow_cookie_name("oauth_state", &flow);
+        let provider_name = flow_cookie_name("oauth_provider", &flow);
         let uri = format!(
             "/api/auth/oauth/{}/callback?code={}&state={}",
-            $key, $code, $state
+            $key, $code, full_state
         );
         send!(
             $app,
             get_with(
                 &uri,
                 &[
-                    ("oauth_state", $state_cookie.as_str()),
-                    ("oauth_provider", $provider_cookie.as_str()),
+                    (state_name.as_str(), $state_cookie.as_str()),
+                    (provider_name.as_str(), $provider_cookie.as_str()),
                 ]
             )
         )
@@ -2057,19 +2131,27 @@ async fn oauth_state_cookie_validation() {
         "{location}"
     );
     let state = query_param(&location, "state").expect("Location 缺少 state");
-    assert_eq!(state.len(), 32);
+    // state 参数为 "{flow16}.{state32}"，共 49 字符。
+    assert_eq!(state.len(), 49, "{state}");
+    let (flow_part, state_body) = state.split_once('.').expect("state 必须含 flow 分隔符");
+    assert_eq!(flow_part.len(), 16, "{state}");
+    assert_eq!(state_body.len(), 32, "{state}");
     let state_cookie = start
-        .cookie("oauth_state")
+        .cookie(&format!("oauth_state_{flow_part}"))
         .expect("缺少 oauth_state Cookie");
     let provider_cookie = start
-        .cookie("oauth_provider")
+        .cookie(&format!("oauth_provider_{flow_part}"))
         .expect("缺少 oauth_provider Cookie");
-    let raw_state_cookie = start.raw_cookie("oauth_state").unwrap();
+    let raw_state_cookie = start
+        .raw_cookie(&format!("oauth_state_{flow_part}"))
+        .unwrap();
     assert!(
         raw_state_cookie.contains("Max-Age=600"),
         "{raw_state_cookie}"
     );
     assert!(raw_state_cookie.contains("HttpOnly"), "{raw_state_cookie}");
+    // Cookie 值仍是 state 主体（不含 flow 前缀）。
+    assert_eq!(state_cookie, state_body);
 
     let mismatch = oauth_callback!(
         app,
@@ -2151,8 +2233,13 @@ async fn oauth_login_keeps_secret_encrypted_and_uses_plaintext() {
         .unwrap()
         .to_string();
     let state = query_param(&location, "state").unwrap();
-    let state_cookie = start.cookie("oauth_state").unwrap();
-    let provider_cookie = start.cookie("oauth_provider").unwrap();
+    let flow = state_flow(&location);
+    let state_cookie = start
+        .cookie(&flow_cookie_name("oauth_state", &flow))
+        .unwrap();
+    let provider_cookie = start
+        .cookie(&flow_cookie_name("oauth_provider", &flow))
+        .unwrap();
 
     let callback = oauth_callback!(app, key, "mock-code", state, state_cookie, provider_cookie);
     let callback = assert_status!(callback, StatusCode::FOUND);
@@ -2252,8 +2339,13 @@ async fn oauth_untrusted_email_cannot_take_over_account() {
         .unwrap()
         .to_string();
     let state = query_param(&location, "state").unwrap();
-    let state_cookie = start.cookie("oauth_state").unwrap();
-    let provider_cookie = start.cookie("oauth_provider").unwrap();
+    let flow = state_flow(&location);
+    let state_cookie = start
+        .cookie(&flow_cookie_name("oauth_state", &flow))
+        .unwrap();
+    let provider_cookie = start
+        .cookie(&flow_cookie_name("oauth_provider", &flow))
+        .unwrap();
 
     let callback = oauth_callback!(app, key, "mock-code", state, state_cookie, provider_cookie);
     let location = assert_oauth_failure(callback, "未验证邮箱");
@@ -2324,8 +2416,13 @@ async fn oauth_trusted_email_links_existing_account() {
         .unwrap()
         .to_string();
     let state = query_param(&location, "state").unwrap();
-    let state_cookie = start.cookie("oauth_state").unwrap();
-    let provider_cookie = start.cookie("oauth_provider").unwrap();
+    let flow = state_flow(&location);
+    let state_cookie = start
+        .cookie(&flow_cookie_name("oauth_state", &flow))
+        .unwrap();
+    let provider_cookie = start
+        .cookie(&flow_cookie_name("oauth_provider", &flow))
+        .unwrap();
 
     let callback = oauth_callback!(app, key, "mock-code", state, state_cookie, provider_cookie);
     let callback = assert_status!(callback, StatusCode::FOUND);
@@ -2365,7 +2462,7 @@ async fn oauth_trusted_email_links_existing_account() {
 }
 
 #[actix_web::test]
-async fn oauth_github_preset_defaults_email_verified() {
+async fn oauth_github_preset_defaults_email_unverified() {
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -2425,7 +2522,7 @@ async fn oauth_github_preset_defaults_email_verified() {
         .iter()
         .find(|item| item["key"] == json!("github"))
         .expect("缺少 github 提供方");
-    assert_eq!(github_item["email_verified"], json!(true));
+    assert_eq!(github_item["email_verified"], json!(false));
     assert_eq!(
         github_item["authorization_url"],
         json!("https://github.com/login/oauth/authorize")
@@ -2521,9 +2618,19 @@ async fn oauth_link_binds_identity_to_logged_in_user() {
         .unwrap()
         .to_string();
     let state = query_param(&location, "state").unwrap();
-    let state_cookie = start.cookie("oauth_state").unwrap();
-    let provider_cookie = start.cookie("oauth_provider").unwrap();
-    assert!(start.cookie("oauth_link").is_some(), "登录态应签发绑定标记");
+    let flow = state_flow(&location);
+    let state_cookie = start
+        .cookie(&flow_cookie_name("oauth_state", &flow))
+        .unwrap();
+    let provider_cookie = start
+        .cookie(&flow_cookie_name("oauth_provider", &flow))
+        .unwrap();
+    assert!(
+        start
+            .cookie(&flow_cookie_name("oauth_link", &flow))
+            .is_some(),
+        "登录态应签发绑定标记"
+    );
 
     let callback = send!(
         app,
@@ -2531,9 +2638,15 @@ async fn oauth_link_binds_identity_to_logged_in_user() {
             &format!("/api/auth/oauth/{key}/callback?code=mock-code&state={state}"),
             &[
                 ("sid", sid.as_str()),
-                ("oauth_state", state_cookie.as_str()),
-                ("oauth_provider", provider_cookie.as_str()),
-                ("oauth_link", "1"),
+                (
+                    flow_cookie_name("oauth_state", &flow).as_str(),
+                    state_cookie.as_str()
+                ),
+                (
+                    flow_cookie_name("oauth_provider", &flow).as_str(),
+                    provider_cookie.as_str()
+                ),
+                (flow_cookie_name("oauth_link", &flow).as_str(), "1"),
             ]
         )
     );
@@ -2612,8 +2725,13 @@ async fn oauth_link_rejects_identity_bound_to_other_user() {
         .unwrap()
         .to_string();
     let state = query_param(&location, "state").unwrap();
-    let state_cookie = first_start.cookie("oauth_state").unwrap();
-    let provider_cookie = first_start.cookie("oauth_provider").unwrap();
+    let flow = state_flow(&location);
+    let state_cookie = first_start
+        .cookie(&flow_cookie_name("oauth_state", &flow))
+        .unwrap();
+    let provider_cookie = first_start
+        .cookie(&flow_cookie_name("oauth_provider", &flow))
+        .unwrap();
     let first = oauth_callback!(
         app,
         key.clone(),
@@ -2642,8 +2760,13 @@ async fn oauth_link_rejects_identity_bound_to_other_user() {
         .unwrap()
         .to_string();
     let state = query_param(&location, "state").unwrap();
-    let state_cookie = second_start.cookie("oauth_state").unwrap();
-    let provider_cookie = second_start.cookie("oauth_provider").unwrap();
+    let flow = state_flow(&location);
+    let state_cookie = second_start
+        .cookie(&flow_cookie_name("oauth_state", &flow))
+        .unwrap();
+    let provider_cookie = second_start
+        .cookie(&flow_cookie_name("oauth_provider", &flow))
+        .unwrap();
 
     let callback = send!(
         app,
@@ -2651,9 +2774,15 @@ async fn oauth_link_rejects_identity_bound_to_other_user() {
             &format!("/api/auth/oauth/{key}/callback?code=mock-code&state={state}"),
             &[
                 ("sid", sid.as_str()),
-                ("oauth_state", state_cookie.as_str()),
-                ("oauth_provider", provider_cookie.as_str()),
-                ("oauth_link", "1"),
+                (
+                    flow_cookie_name("oauth_state", &flow).as_str(),
+                    state_cookie.as_str()
+                ),
+                (
+                    flow_cookie_name("oauth_provider", &flow).as_str(),
+                    provider_cookie.as_str()
+                ),
+                (flow_cookie_name("oauth_link", &flow).as_str(), "1"),
             ]
         )
     );
@@ -2786,10 +2915,17 @@ async fn oauth_no_identity_with_register_closed_redirects_to_failure_page() {
         .unwrap()
         .to_string();
     let state = query_param(&location, "state").unwrap();
-    let state_cookie = start.cookie("oauth_state").unwrap();
-    let provider_cookie = start.cookie("oauth_provider").unwrap();
+    let flow = state_flow(&location);
+    let state_cookie = start
+        .cookie(&flow_cookie_name("oauth_state", &flow))
+        .unwrap();
+    let provider_cookie = start
+        .cookie(&flow_cookie_name("oauth_provider", &flow))
+        .unwrap();
     assert!(
-        start.cookie("oauth_link").is_none(),
+        start
+            .cookie(&flow_cookie_name("oauth_link", &flow))
+            .is_none(),
         "未登录不得签发绑定标记"
     );
 
@@ -3074,6 +3210,8 @@ async fn insert_passkey(fixture: &Fixture, user_id: i64, credential_id: &[u8], s
 }
 
 // 用宏避免为 actix 的私有 Request 类型写泛型约束。
+// 返回 (reply, challenge, flow)；flow 来自 begin 响应外层，finish 用它拼
+// `webauthn_*_{flow}` 临时 Cookie 名，并发流程互不覆盖。
 macro_rules! passkey_begin_macro {
     ($app:expr, $uri:expr, $cookies:expr) => {{
         let reply = send!($app, post_json_with($uri, &json!({}), $cookies));
@@ -3083,7 +3221,15 @@ macro_rules! passkey_begin_macro {
             .as_str()
             .expect("begin 响应缺少 challenge")
             .to_string();
-        (reply, challenge, body)
+        let flow = body["flow"]
+            .as_str()
+            .expect("begin 响应缺少 flow")
+            .to_string();
+        assert!(
+            qbotmessager::auth::passkey::is_valid_flow(&flow),
+            "flow 必须是 16 个小写 hex 字符：{flow}"
+        );
+        (reply, challenge, flow)
     }};
 }
 
@@ -3103,30 +3249,33 @@ async fn passkey_register_stores_single_device() {
     let token = token_for(&fixture, account.id).await;
     fixture.configure_webauthn();
 
-    let (begin_reply, challenge, options) = passkey_begin_macro!(
+    let (begin_reply, challenge, flow) = passkey_begin_macro!(
         app,
         "/api/auth/passkey/register/begin",
         &[("sid", token.as_str())]
     );
     assert_eq!(
-        options["publicKey"]["rp"]["id"],
+        begin_reply.json()["publicKey"]["rp"]["id"],
         json!("passkey.example"),
-        "{options}"
+        "{}",
+        begin_reply.text()
     );
     assert_eq!(
-        options["publicKey"]["user"]["id"],
+        begin_reply.json()["publicKey"]["user"]["id"],
         json!(b64(account.id.to_string().as_bytes()))
     );
     let challenge_cookie = begin_reply
-        .cookie("webauthn_challenge")
+        .cookie(&passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow))
         .expect("缺少 webauthn_challenge");
     let user_cookie = begin_reply
-        .cookie("webauthn_user")
+        .cookie(&passkey::cookie_name(passkey::USER_COOKIE, &flow))
         .expect("缺少 webauthn_user");
     let state_cookie = begin_reply
-        .cookie("webauthn_state")
+        .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &flow))
         .expect("缺少 webauthn_state");
     assert_eq!(user_cookie, account.id.to_string());
+    // 非 flow 后缀的旧 Cookie 名不应再签发。
+    assert!(begin_reply.cookie("webauthn_challenge").is_none());
 
     let credential_id = format!("credential-1-{}", fixture.prefix).into_bytes();
     let credential = registration_credential(
@@ -3139,12 +3288,21 @@ async fn passkey_register_stores_single_device() {
         app,
         post_json_with(
             "/api/auth/passkey/register/finish",
-            &json!({"credential": credential}),
+            &json!({"credential": credential, "flow": flow}),
             &[
                 ("sid", token.as_str()),
-                ("webauthn_challenge", challenge_cookie.as_str()),
-                ("webauthn_user", user_cookie.as_str()),
-                ("webauthn_state", state_cookie.as_str()),
+                (
+                    &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+                    challenge_cookie.as_str()
+                ),
+                (
+                    &passkey::cookie_name(passkey::USER_COOKIE, &flow),
+                    user_cookie.as_str()
+                ),
+                (
+                    &passkey::cookie_name(passkey::STATE_COOKIE, &flow),
+                    state_cookie.as_str()
+                ),
             ]
         )
     );
@@ -3207,8 +3365,20 @@ async fn passkey_register_duplicate_and_delete() {
     let other_token = token_for(&fixture, other.id).await;
     fixture.configure_webauthn();
 
-    // 缺少 webauthn_state Cookie 时拒绝。
+    // 缺少 flow 对应的 webauthn_state Cookie 时拒绝。
     let missing = send!(
+        app,
+        post_json_with(
+            "/api/auth/passkey/register/finish",
+            &json!({"credential": {"id": "x"}, "flow": "0123456789abcdef"}),
+            &[("sid", token.as_str())]
+        )
+    );
+    let missing = assert_status!(missing, StatusCode::BAD_REQUEST);
+    assert_eq!(missing.detail(), "注册会话已过期，请重试");
+
+    // 缺少 flow 字段：serde 直接拒绝。
+    let missing_flow = send!(
         app,
         post_json_with(
             "/api/auth/passkey/register/finish",
@@ -3216,30 +3386,39 @@ async fn passkey_register_duplicate_and_delete() {
             &[("sid", token.as_str())]
         )
     );
-    let missing = assert_status!(missing, StatusCode::BAD_REQUEST);
-    assert_eq!(missing.detail(), "注册会话已过期，请重试");
+    assert_status!(missing_flow, StatusCode::UNPROCESSABLE_ENTITY);
 
     let credential_id = format!("credential-dup-{}", fixture.prefix).into_bytes();
-    let register = |challenge: String, challenge_cookie: String, state_cookie: String| {
-        let credential = registration_credential(
-            &challenge,
-            "passkey.example",
-            "https://passkey.example",
-            &credential_id,
-        );
-        post_json_with(
-            "/api/auth/passkey/register/finish",
-            &json!({"credential": credential}),
-            &[
-                ("sid", token.as_str()),
-                ("webauthn_challenge", challenge_cookie.as_str()),
-                ("webauthn_user", account.id.to_string().as_str()),
-                ("webauthn_state", state_cookie.as_str()),
-            ],
-        )
-    };
+    let register =
+        |challenge: String, flow: String, challenge_cookie: String, state_cookie: String| {
+            let credential = registration_credential(
+                &challenge,
+                "passkey.example",
+                "https://passkey.example",
+                &credential_id,
+            );
+            post_json_with(
+                "/api/auth/passkey/register/finish",
+                &json!({"credential": credential, "flow": flow}),
+                &[
+                    ("sid", token.as_str()),
+                    (
+                        &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+                        challenge_cookie.as_str(),
+                    ),
+                    (
+                        &passkey::cookie_name(passkey::USER_COOKIE, &flow),
+                        account.id.to_string().as_str(),
+                    ),
+                    (
+                        &passkey::cookie_name(passkey::STATE_COOKIE, &flow),
+                        state_cookie.as_str(),
+                    ),
+                ],
+            )
+        };
 
-    let (first_begin, challenge, _) = passkey_begin_macro!(
+    let (first_begin, challenge, first_flow) = passkey_begin_macro!(
         app,
         "/api/auth/passkey/register/begin",
         &[("sid", token.as_str())]
@@ -3248,13 +3427,21 @@ async fn passkey_register_duplicate_and_delete() {
         app,
         register(
             challenge,
-            first_begin.cookie("webauthn_challenge").unwrap(),
-            first_begin.cookie("webauthn_state").unwrap()
+            first_flow.clone(),
+            first_begin
+                .cookie(&passkey::cookie_name(
+                    passkey::CHALLENGE_COOKIE,
+                    &first_flow
+                ))
+                .unwrap(),
+            first_begin
+                .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &first_flow))
+                .unwrap()
         )
     );
     assert_status!(first, StatusCode::OK);
 
-    let (second_begin, challenge, _) = passkey_begin_macro!(
+    let (second_begin, challenge, second_flow) = passkey_begin_macro!(
         app,
         "/api/auth/passkey/register/begin",
         &[("sid", token.as_str())]
@@ -3263,8 +3450,16 @@ async fn passkey_register_duplicate_and_delete() {
         app,
         register(
             challenge,
-            second_begin.cookie("webauthn_challenge").unwrap(),
-            second_begin.cookie("webauthn_state").unwrap()
+            second_flow.clone(),
+            second_begin
+                .cookie(&passkey::cookie_name(
+                    passkey::CHALLENGE_COOKIE,
+                    &second_flow
+                ))
+                .unwrap(),
+            second_begin
+                .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &second_flow))
+                .unwrap()
         )
     );
     let duplicate = assert_status!(duplicate, StatusCode::CONFLICT);
@@ -3323,7 +3518,7 @@ async fn passkey_login_rejects_unknown_and_rollback() {
     insert_passkey(&fixture, account.id, &stored_id, 5).await;
 
     // 未知凭据：401 且不进入签名校验。
-    let (begin, challenge, _) = passkey_begin_macro!(app, "/api/auth/passkey/login/begin", &[]);
+    let (begin, challenge, flow) = passkey_begin_macro!(app, "/api/auth/passkey/login/begin", &[]);
     let unknown = assertion_credential(
         &challenge,
         "passkey.example",
@@ -3335,15 +3530,21 @@ async fn passkey_login_rejects_unknown_and_rollback() {
         app,
         post_json_with(
             "/api/auth/passkey/login/finish",
-            &json!({"credential": unknown}),
+            &json!({"credential": unknown, "flow": flow}),
             &[
                 (
-                    "webauthn_challenge",
-                    begin.cookie("webauthn_challenge").unwrap().as_str()
+                    &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+                    begin
+                        .cookie(&passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow))
+                        .unwrap()
+                        .as_str()
                 ),
                 (
-                    "webauthn_state",
-                    begin.cookie("webauthn_state").unwrap().as_str()
+                    &passkey::cookie_name(passkey::STATE_COOKIE, &flow),
+                    begin
+                        .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &flow))
+                        .unwrap()
+                        .as_str()
                 ),
             ]
         )
@@ -3352,7 +3553,7 @@ async fn passkey_login_rejects_unknown_and_rollback() {
     assert_eq!(reply.detail(), "该 Passkey 未绑定");
 
     // 签名计数回退：库内 5，断言 1。
-    let (begin, challenge, _) = passkey_begin_macro!(app, "/api/auth/passkey/login/begin", &[]);
+    let (begin, challenge, flow) = passkey_begin_macro!(app, "/api/auth/passkey/login/begin", &[]);
     let rollback = assertion_credential(
         &challenge,
         "passkey.example",
@@ -3364,15 +3565,21 @@ async fn passkey_login_rejects_unknown_and_rollback() {
         app,
         post_json_with(
             "/api/auth/passkey/login/finish",
-            &json!({"credential": rollback}),
+            &json!({"credential": rollback, "flow": flow}),
             &[
                 (
-                    "webauthn_challenge",
-                    begin.cookie("webauthn_challenge").unwrap().as_str()
+                    &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+                    begin
+                        .cookie(&passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow))
+                        .unwrap()
+                        .as_str()
                 ),
                 (
-                    "webauthn_state",
-                    begin.cookie("webauthn_state").unwrap().as_str()
+                    &passkey::cookie_name(passkey::STATE_COOKIE, &flow),
+                    begin
+                        .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &flow))
+                        .unwrap()
+                        .as_str()
                 ),
             ]
         )
@@ -3384,7 +3591,7 @@ async fn passkey_login_rejects_unknown_and_rollback() {
     );
 
     // challenge 不匹配。
-    let (begin, _challenge, _) = passkey_begin_macro!(app, "/api/auth/passkey/login/begin", &[]);
+    let (begin, _challenge, flow) = passkey_begin_macro!(app, "/api/auth/passkey/login/begin", &[]);
     let mismatch = assertion_credential(
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "passkey.example",
@@ -3396,15 +3603,21 @@ async fn passkey_login_rejects_unknown_and_rollback() {
         app,
         post_json_with(
             "/api/auth/passkey/login/finish",
-            &json!({"credential": mismatch}),
+            &json!({"credential": mismatch, "flow": flow}),
             &[
                 (
-                    "webauthn_challenge",
-                    begin.cookie("webauthn_challenge").unwrap().as_str()
+                    &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+                    begin
+                        .cookie(&passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow))
+                        .unwrap()
+                        .as_str()
                 ),
                 (
-                    "webauthn_state",
-                    begin.cookie("webauthn_state").unwrap().as_str()
+                    &passkey::cookie_name(passkey::STATE_COOKIE, &flow),
+                    begin
+                        .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &flow))
+                        .unwrap()
+                        .as_str()
                 ),
             ]
         )
@@ -3412,13 +3625,16 @@ async fn passkey_login_rejects_unknown_and_rollback() {
     let reply = assert_status!(reply, StatusCode::UNAUTHORIZED);
     assert_eq!(reply.detail(), "Passkey 校验失败：challenge 不匹配");
 
-    // 缺少 state Cookie。
+    // 缺少 flow 对应的 state Cookie。
     let reply = send!(
         app,
         post_json_with(
             "/api/auth/passkey/login/finish",
-            &json!({"credential": {"id": "x"}}),
-            &[("webauthn_challenge", "AAAA")]
+            &json!({"credential": {"id": "x"}, "flow": "0123456789abcdef"}),
+            &[(
+                &passkey::cookie_name(passkey::CHALLENGE_COOKIE, "0123456789abcdef"),
+                "AAAA"
+            )]
         )
     );
     let reply = assert_status!(reply, StatusCode::BAD_REQUEST);
@@ -3451,7 +3667,7 @@ async fn passkey_login_succeeds_with_real_signature() {
     .await
     .expect("插入签名凭据失败");
 
-    let (begin, challenge, _) = passkey_begin_macro!(app, "/api/auth/passkey/login/begin", &[]);
+    let (begin, challenge, flow) = passkey_begin_macro!(app, "/api/auth/passkey/login/begin", &[]);
     let (_, credential) = signed_assertion_credential(
         &challenge,
         "passkey.example",
@@ -3464,15 +3680,21 @@ async fn passkey_login_succeeds_with_real_signature() {
         app,
         post_json_with(
             "/api/auth/passkey/login/finish",
-            &json!({"credential": credential}),
+            &json!({"credential": credential, "flow": flow}),
             &[
                 (
-                    "webauthn_challenge",
-                    begin.cookie("webauthn_challenge").unwrap().as_str()
+                    &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+                    begin
+                        .cookie(&passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow))
+                        .unwrap()
+                        .as_str()
                 ),
                 (
-                    "webauthn_state",
-                    begin.cookie("webauthn_state").unwrap().as_str()
+                    &passkey::cookie_name(passkey::STATE_COOKIE, &flow),
+                    begin
+                        .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &flow))
+                        .unwrap()
+                        .as_str()
                 ),
             ]
         )
@@ -3496,9 +3718,11 @@ async fn passkey_login_succeeds_with_real_signature() {
             .unwrap();
     assert_eq!(stored.0, 3);
 
-    // 临时 Cookie 被清理（Max-Age=0 的删除指令）。
-    for name in ["webauthn_challenge", "webauthn_state"] {
-        let line = reply.raw_cookie(name).expect("成功后应清除临时 Cookie");
+    // 当前 flow 的临时 Cookie 被清理（Max-Age=0 的删除指令）。
+    for base in [passkey::CHALLENGE_COOKIE, passkey::STATE_COOKIE] {
+        let line = reply
+            .raw_cookie(&passkey::cookie_name(base, &flow))
+            .expect("成功后应清除临时 Cookie");
         assert!(line.contains("Max-Age=0"), "Cookie 未被删除：{line}");
     }
 }

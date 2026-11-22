@@ -408,7 +408,14 @@ pub async fn admin_update_user(
 ) -> Result<User, AppError> {
     require_super_admin(actor)?;
 
-    let Some(mut target) = queries::users::find_by_id(pool, target_id).await? else {
+    // 降级判定涉及「整个启用超管行集」的不变式：并发降级事务若各在
+    // 事务外读计数，可交错通过校验把系统降成零超管。这里在事务内先按
+    // id 序锁定全部启用超管行，再读目标行并完成其余校验，两个并发降
+    // 级在同一行集上串行化，后到者在先者提交后重新评估。
+    let mut tx = pool.begin().await?;
+    let super_admin_ids = queries::users::active_super_admin_ids_for_update(&mut *tx).await?;
+
+    let Some(mut target) = queries::users::find_by_id(&mut *tx, target_id).await? else {
         return Err(AppError::not_found("用户不存在"));
     };
 
@@ -432,22 +439,25 @@ pub async fn admin_update_user(
     let demoting = target.role == ROLE_SUPER_ADMIN
         && ((patch.role.is_some() && patch.role != Some(ROLE_SUPER_ADMIN))
             || (patch.status.is_some() && patch.status != Some(STATUS_ACTIVE)));
-    if demoting {
-        let remaining = queries::users::count_other_active_super_admins(pool, target.id).await?;
-        if remaining == 0 {
-            return Err(AppError::bad_request("系统至少需要一个启用的超级管理员"));
-        }
+    if demoting
+        && !super_admin_ids
+            .iter()
+            .any(|&admin_id| admin_id != target.id)
+    {
+        // 超管行集已在锁内，事务内的评估没有 TOCTOU 窗口。
+        return Err(AppError::bad_request("系统至少需要一个启用的超级管理员"));
     }
 
-    let new_name = patch.name.map(|value| value.trim().to_string());
+    // 空串视为不修改：与 `COALESCE(?, name)` 语义一致，传 None 时保留原用户名。
+    let new_name = patch
+        .name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     if let Some(name) = new_name.as_deref()
-        && !name.is_empty()
-        && name_taken(pool, name, Some(target.id)).await?
+        && queries::users::name_taken(&mut *tx, name, Some(target.id)).await?
     {
         return Err(AppError::conflict("该用户名已被使用"));
     }
-
-    let mut tx = pool.begin().await?;
     queries::users::update_admin_fields(
         &mut *tx,
         target.id,
@@ -506,20 +516,27 @@ pub async fn update_profile_name(
 
 /// 个人资料：修改邮箱。
 ///
-/// 账号已有密码时必须校验当前密码；仅 OAuth 创建的账号没有密码可验。
+/// 账号已有密码时必须校验当前密码；无密码账号（仅 OAuth 创建）没有可验凭据，
+/// 不允许直接改邮箱，须先通过「设置密码」流程补齐密码。成功后吊销其他会话，
+/// 避免凭据泄露时旧设备仍以新邮箱维持登录。
 pub async fn update_profile_email(
     pool: &MySqlPool,
     user: &User,
     email: &str,
     current_password: &str,
+    keep_token: &str,
 ) -> Result<User, AppError> {
     let email = normalize_email(email);
     validate_email(&email)?;
 
-    if let Some(stored) = user.password_hash.as_deref()
-        && !verify_password_async(current_password, stored).await
-    {
-        return Err(AppError::bad_request("当前密码错误"));
+    if let Some(stored) = user.password_hash.as_deref() {
+        if !verify_password_async(current_password, stored).await {
+            return Err(AppError::bad_request("当前密码错误"));
+        }
+    } else {
+        return Err(AppError::bad_request(
+            "该账号未设置密码，请先在安全设置中设置密码",
+        ));
     }
     if email == user.email {
         return Ok(user.clone());
@@ -531,6 +548,7 @@ pub async fn update_profile_email(
     queries::users::update_email(pool, user.id, &email)
         .await
         .map_err(map_email_duplicate)?;
+    revoke_other_sessions(pool, user.id, keep_token).await?;
 
     let mut updated = user.clone();
     updated.email = email;
@@ -628,7 +646,8 @@ enum DuplicateKey {
 /// 识别 MySQL 1062（唯一索引冲突）。
 ///
 /// MySQL 8 的错误信息形如
-/// `Duplicate entry 'x' for key 'users.uq_users_name_lower'`。
+/// `Duplicate entry 'x' for key 'users.uq_users_name_lower'`；
+/// 按索引名判定，不匹配时按邮箱兜底。
 fn duplicate_key(err: &sqlx::Error) -> Option<DuplicateKey> {
     let sqlx::Error::Database(db_err) = err else {
         return None;
@@ -637,8 +656,10 @@ fn duplicate_key(err: &sqlx::Error) -> Option<DuplicateKey> {
         return None;
     }
     let message = db_err.message().to_ascii_lowercase();
-    if message.contains("name") {
+    if message.contains("uq_users_name_lower") {
         Some(DuplicateKey::Name)
+    } else if message.contains("uq_users_email") {
+        Some(DuplicateKey::Email)
     } else {
         Some(DuplicateKey::Email)
     }

@@ -134,6 +134,10 @@ pub async fn issue_code(
 }
 
 /// 校验并一次性消费验证码；失败会累计尝试次数。
+///
+/// 尝试计数由数据库原子完成：失败分支用
+/// `attempts = attempts + 1 WHERE attempts < MAX_ATTEMPTS` 条件更新，
+/// 并发提交失败时一次只能推进一格，不会因为竞争读到旧值而突破上限。
 pub async fn verify_code(
     pool: &MySqlPool,
     email: &str,
@@ -155,6 +159,7 @@ pub async fn verify_code(
         return Ok(false);
     };
 
+    // attempts 只用于这条已锁却未消费的兜底判定，不参与计数写入。
     if expires_at <= now || attempts >= MAX_ATTEMPTS {
         sqlx::query("UPDATE email_verification_codes SET consumed_at = ? WHERE id = ?")
             .bind(now)
@@ -165,23 +170,28 @@ pub async fn verify_code(
     }
 
     if !verify_password_async(code.trim(), &code_hash).await {
-        let attempts = attempts + 1;
-        if attempts >= MAX_ATTEMPTS {
-            sqlx::query(
-                "UPDATE email_verification_codes SET attempts = ?, consumed_at = ? WHERE id = ?",
-            )
-            .bind(attempts)
-            .bind(now)
-            .bind(id)
-            .execute(pool)
-            .await?;
-        } else {
-            sqlx::query("UPDATE email_verification_codes SET attempts = ? WHERE id = ?")
-                .bind(attempts)
-                .bind(id)
-                .execute(pool)
-                .await?;
+        // rows_affected == 0 表示并发下另一分支已先计满本轮额度，直接按失败返回。
+        let result = sqlx::query(
+            "UPDATE email_verification_codes SET attempts = attempts + 1 \
+             WHERE id = ? AND attempts < ?",
+        )
+        .bind(id)
+        .bind(MAX_ATTEMPTS)
+        .execute(pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
         }
+        // 条件更新成功且计数已达上限时补写作废时间；仍小于上限则留给后继轮次。
+        sqlx::query(
+            "UPDATE email_verification_codes SET consumed_at = ? \
+             WHERE id = ? AND attempts >= ?",
+        )
+        .bind(now)
+        .bind(id)
+        .bind(MAX_ATTEMPTS)
+        .execute(pool)
+        .await?;
         return Ok(false);
     }
 
@@ -211,7 +221,8 @@ pub async fn discard_latest(pool: &MySqlPool, email: &str, purpose: &str) -> Res
 ///
 /// 向零截断，不足 1 秒按 0 处理。
 fn too_frequent_wait(created_at: NaiveDateTime, now: NaiveDateTime, resend_seconds: u64) -> i64 {
-    let resend_seconds = i64::try_from(resend_seconds).unwrap_or(i64::MAX);
+    // 设置面板已有 30~600 的上下限；这里夹一天作为防御，避免极端值换算溢出。
+    let resend_seconds = i64::try_from(resend_seconds.min(86_400)).unwrap_or(86_400);
     (created_at + Duration::seconds(resend_seconds) - now).num_seconds()
 }
 

@@ -49,6 +49,10 @@ pub fn hash_password_with(password: &str, salt: &[u8], rounds: u32) -> String {
     )
 }
 
+/// 校验时允许的最大轮数：按 0.15s/600k 轮折算约 0.5s 上限，防住被灌库的
+/// 超大轮数哈希把校验线程拖死；库内哈希不因此改写。
+pub const VERIFY_ROUNDS_MAX: u32 = 2_000_000;
+
 /// 校验密码。
 ///
 /// 哈希串格式非法（段数不对、算法不符、轮数非法、base64 损坏）时返回 `false`。
@@ -73,6 +77,7 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
         return false;
     };
 
+    let rounds = rounds.min(VERIFY_ROUNDS_MAX);
     let mut digest = [0u8; DIGEST_LEN];
     pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, rounds, &mut digest);
     digest.ct_eq(expected.as_slice()).into()
