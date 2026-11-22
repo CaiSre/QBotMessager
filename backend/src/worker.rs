@@ -6,6 +6,7 @@
 //! - 任务超时 180s、重试 2 次（最多 3 次尝试）、固定 5s 重试间隔；
 //! - 每分钟同步一次库内设置，让频控参数在 worker 内生效；
 //! - 定期清理 `sent_guards` 过期行。
+//! - 启动时回收崩溃残留的 worker 注册行与在跑任务。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,7 @@ use crate::error::AppError;
 use crate::services::push::{PushJob, execute_push};
 use crate::services::queue::{
     JOB_RETRIES, QUEUE_NAME, job_retry_delay, job_timeout, purge_expired_pending,
+    recover_worker_registration,
 };
 use crate::state::AppState;
 
@@ -94,12 +96,25 @@ pub async fn run(state: Arc<AppState>) -> Result<(), AppError> {
         .await
         .map_err(|err| AppError::internal(format!("初始化推送队列表失败：{err}")))?;
 
+    let config = apalis_mysql::Config::default().queue(QUEUE_NAME);
+    let heartbeat_seconds = config.heartbeat_interval.as_secs();
+
+    // 崩溃残留的注册行会让 apalis 拒绝注册（WorkerAlreadyExists），worker 随即退出；
+    // 先回收旧进程的注册与在跑任务。
+    match recover_worker_registration(&state.pool, WORKER_NAME, heartbeat_seconds).await {
+        Ok(requeued) => {
+            if requeued > 0 {
+                tracing::info!(requeued, "已回收崩溃残留的推送任务");
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "回收崩溃残留的 worker 注册失败"),
+    }
+
     // 服务停摆期间积压的旧任务不应在重启后集中补发。
     if let Err(err) = purge_expired_pending(&state.pool).await {
         tracing::warn!(error = %err, "清理过期的排队推送任务失败");
     }
 
-    let config = apalis_mysql::Config::default().queue(QUEUE_NAME);
     let backend = MySqlStorage::<PushJob>::new(&state.pool).with_config(config);
 
     let settings_task = spawn_settings_refresh(state.clone());

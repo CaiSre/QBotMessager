@@ -156,6 +156,49 @@ pub async fn purge_expired_pending(pool: &MySqlPool) -> Result<u64, sqlx::Error>
     Ok(result.rows_affected())
 }
 
+/// 回收崩溃残留的 worker 注册状态。
+///
+/// apalis 用 `workers` 表做 worker 注册去重：同名 worker 的心跳未超过窗口
+/// （默认 30 秒）时拒绝注册，直接返回 `WorkerAlreadyExists`，worker 随即退出。
+/// 容器重建时旧进程被结束后不会删除自己的注册行，新进程在窗口内启动就会注册
+/// 失败，队列里的推送任务无人消费。
+///
+/// 这里做两件事：
+/// - 把旧进程锁住的任务退回 `Pending`：apalis 的孤儿回收要等心跳超时
+///   （30s × 10）才触发，而新 worker 接管同一行后会持续刷新心跳，孤儿回收
+///   不会再触发，崩溃时在跑的任务会一直卡在 `Running`；
+/// - 把注册行的心跳回拨一个窗口，apalis 随即走「重复键更新」路径完成注册。
+///
+/// 返回退回队列的任务数。
+pub async fn recover_worker_registration(
+    pool: &MySqlPool,
+    worker_name: &str,
+    heartbeat_seconds: u64,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let requeued = sqlx::query(
+        "UPDATE jobs SET status = 'Pending', lock_by = NULL, lock_at = NULL, done_at = NULL, \
+         attempts = attempts + 1, last_result = ? WHERE lock_by = ? \
+         AND status IN ('Running', 'Queued')",
+    )
+    .bind("已退出的 worker 残留，重新入队")
+    .bind(worker_name)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    // 心跳回拨一个窗口再留一秒余量：apalis 的注册 SQL 只在心跳过期时才允许写入。
+    sqlx::query("UPDATE workers SET last_seen = TIMESTAMPADD(SECOND, ?, NOW()) WHERE id = ?")
+        .bind(-(heartbeat_seconds as i64) - 1)
+        .bind(worker_name)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(requeued)
+}
+
 /// 是否为唯一索引冲突（MySQL 1062）。
 fn is_duplicate_key(err: &TaskSinkError<apalis_mysql::Error>) -> bool {
     match err {
