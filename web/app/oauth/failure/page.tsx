@@ -8,10 +8,18 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
+// URL 参数由外链可控，渲染前截断长度上限，避免异常超长文案破坏版面。
+const PARAM_MAX_CHARS = 200;
+
+function truncateParam(value: string | null): string | null {
+  if (value === null) return null;
+  return value.length > PARAM_MAX_CHARS ? `${value.slice(0, PARAM_MAX_CHARS)}…` : value;
+}
+
 function FailureContent() {
   const searchParams = useSearchParams();
-  const message = searchParams.get("message") ?? "第三方授权未完成";
-  const detail = searchParams.get("detail");
+  const message = truncateParam(searchParams.get("message")) ?? "第三方授权未完成";
+  const detail = truncateParam(searchParams.get("detail"));
 
   return (
     <main className="flex min-h-screen items-center justify-center px-4 py-10">
@@ -23,6 +31,7 @@ function FailureContent() {
 
         <Card>
           <CardContent className="flex flex-col gap-4">
+            <p className="text-xs text-muted-foreground">以下信息来自登录跳转参数</p>
             <Alert variant="destructive">
               <AlertTitle>授权未完成</AlertTitle>
               <AlertDescription>

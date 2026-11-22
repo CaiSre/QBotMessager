@@ -97,10 +97,17 @@ export default function SettingsPage() {
           group.items.filter((item) => item.secret).map((item) => item.key),
         ) ?? [],
       );
+      const kinds = new Map(
+        settings.data?.groups.flatMap((group) =>
+          group.items.map((item) => [item.key, item.kind] as const),
+        ) ?? [],
+      );
       const body: Draft = {};
       for (const [key, value] of Object.entries(draft)) {
         // 敏感项留空表示不修改，避免页面回显误清空已保存的密码
         if (secretKeys.has(key) && value === "") continue;
+        // 数值项清空后无法转成合法数字，跳过该项（保持库中原值）
+        if ((kinds.get(key) === "int" || kinds.get(key) === "float") && value === "") continue;
         body[key] = value;
       }
       const data = await api<SystemSettings>("/api/admin/settings", {

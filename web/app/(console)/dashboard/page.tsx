@@ -40,8 +40,10 @@ export default function DashboardPage() {
   const me = useMe();
   const { data, error, loading } = useApi<Stats>("/api/admin/stats");
 
-  const weekTotal = data ? data.trend.reduce((sum, day) => sum + day.count, 0) : 0;
-  const maxTrend = data ? Math.max(1, ...data.trend.map((day) => day.count)) : 1;
+  // 后端异常响应可能缺 trend，兜底避免渲染时 TypeError 白屏。
+  const trend = data?.trend ?? [];
+  const weekTotal = trend.reduce((sum, day) => sum + day.count, 0);
+  const maxTrend = Math.max(1, ...trend.map((day) => day.count));
 
   return (
     <div>
@@ -69,7 +71,7 @@ export default function DashboardPage() {
               </CardHeader>
               <CardContent>
                 <div className="flex h-44 items-end gap-2">
-                  {data.trend.map((day) => (
+                  {trend.map((day) => (
                     <div key={day.date} className="flex flex-1 flex-col items-center gap-2">
                       <span className="text-xs tabular-nums text-muted-foreground">{day.count}</span>
                       <div className="flex w-full flex-1 items-end">

@@ -100,6 +100,7 @@ export default function BotsPage() {
   const [confirm, setConfirm] = useState<{
     title: string;
     description: string;
+    confirmLabel?: string;
     action: () => Promise<void>;
   } | null>(null);
 
@@ -120,7 +121,7 @@ export default function BotsPage() {
       appid: bot.qq_appid,
       secret: "",
       host: bot.qq_host,
-      openids: bot.default_openids.join("\n"),
+      openids: Array.isArray(bot.default_openids) ? bot.default_openids.join("\n") : "",
       group: bot.default_group_openid ?? "",
       enabled: bot.enabled,
     });
@@ -148,7 +149,8 @@ export default function BotsPage() {
           .split(/[\s,，]+/)
           .map((item) => item.trim())
           .filter(Boolean),
-        default_group_openid: botForm.group.trim() || null,
+        // 空串提交以清空默认群；后端把 Some("") 解释为清除该值，缺省字段才是不修改。
+        default_group_openid: botForm.group.trim(),
         enabled: botForm.enabled,
       };
       if (botForm.secret.trim()) body.qq_app_secret = botForm.secret.trim();
@@ -277,7 +279,9 @@ export default function BotsPage() {
             </CardAction>
           </CardHeader>
           <CardContent>
-            {botList.length === 0 ? (
+            {bots.loading && botList.length === 0 ? (
+              <EmptyHint>加载中…</EmptyHint>
+            ) : botList.length === 0 ? (
               <EmptyHint>还没有机器人配置</EmptyHint>
             ) : (
               <Table>
@@ -312,7 +316,7 @@ export default function BotsPage() {
                         <span className="text-xs">
                           {bot.default_group_openid
                             ? `群 ${bot.default_group_openid}`
-                            : bot.default_openids.length > 0
+                            : Array.isArray(bot.default_openids) && bot.default_openids.length > 0
                               ? `${bot.default_openids.length} 个用户`
                               : "未设置"}
                         </span>
@@ -393,7 +397,9 @@ export default function BotsPage() {
             </CardAction>
           </CardHeader>
           <CardContent>
-            {(channels.data ?? []).length === 0 ? (
+            {channels.loading && (channels.data ?? []).length === 0 ? (
+              <EmptyHint>加载中…</EmptyHint>
+            ) : (channels.data ?? []).length === 0 ? (
               <EmptyHint>还没有接入通道</EmptyHint>
             ) : (
               <Table>
@@ -451,7 +457,17 @@ export default function BotsPage() {
                           <Button
                             size="sm"
                             variant="ghost"
-                            onClick={() => void rotateChannel(channel)}
+                            onClick={() =>
+                              setConfirm({
+                                title: "轮换 GitHub Token",
+                                confirmLabel: "轮换",
+                                description:
+                                  "轮换会使原 Payload URL 与签名密钥立即失效，需要同步更新 GitHub 仓库的 Webhook 配置。确定继续吗？",
+                                action: async () => {
+                                  await rotateChannel(channel);
+                                },
+                              })
+                            }
                           >
                             轮换
                           </Button>
@@ -732,6 +748,7 @@ export default function BotsPage() {
       </Dialog>
 
       <ConfirmDialog
+        confirmLabel={confirm?.confirmLabel ?? "确认删除"}
         description={confirm?.description ?? ""}
         onConfirm={async () => {
           if (!confirm) return;

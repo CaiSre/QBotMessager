@@ -55,9 +55,10 @@ export default function LoginPage() {
     setBusy("passkey");
     setError(null);
     try {
-      const options = await api<unknown>("/api/auth/passkey/login/begin", { method: "POST" });
+      const options = await api<Record<string, unknown>>("/api/auth/passkey/login/begin", { method: "POST" });
       const credential = await getPasskey(JSON.stringify(options), "登录");
-      await api("/api/auth/passkey/login/finish", { method: "POST", body: { credential } });
+      // flow 由后端在 begin 响应下发，finish 需原样带回以关联流程
+      await api("/api/auth/passkey/login/finish", { method: "POST", body: { credential, flow: options["flow"] as string } });
       router.replace("/dashboard");
     } catch (err) {
       setError(messageOf(err));

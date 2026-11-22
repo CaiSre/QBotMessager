@@ -203,7 +203,9 @@ export default function UsersPage() {
             <CardDescription>超级管理员可调整角色与账号状态</CardDescription>
           </CardHeader>
           <CardContent>
-            {userList.length === 0 ? (
+            {users.loading && userList.length === 0 ? (
+              <EmptyHint>加载中…</EmptyHint>
+            ) : userList.length === 0 ? (
               <EmptyHint>暂无用户</EmptyHint>
             ) : (
               <Table>
@@ -280,7 +282,9 @@ export default function UsersPage() {
             </CardAction>
           </CardHeader>
           <CardContent>
-            {inviteList.length === 0 ? (
+            {invites.loading && inviteList.length === 0 ? (
+              <EmptyHint>加载中…</EmptyHint>
+            ) : inviteList.length === 0 ? (
               <EmptyHint>还没有邀请码</EmptyHint>
             ) : (
               <Table>

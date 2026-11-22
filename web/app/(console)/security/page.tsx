@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -135,16 +135,18 @@ function SecurityPageInner() {
   } | null>(null);
 
   // 绑定流程结束回跳：后端带 ?oauth=ok|fail&message=…，展示后清掉参数。
+  // ref 守卫防止 identities.reload 换代时 effect 重跑造成重复导航与重复请求。
   const router = useRouter();
   const searchParams = useSearchParams();
   const oauthParam = searchParams.get("oauth");
   const oauthResult = oauthParam === "ok" || oauthParam === "fail" ? oauthParam : null;
   const oauthMessage = searchParams.get("message");
+  const handledOauth = useRef<string | null>(null);
   useEffect(() => {
-    if (oauthResult) {
-      router.replace("/security");
-      if (oauthResult === "ok") void identities.reload();
-    }
+    if (!oauthResult || handledOauth.current === oauthResult) return;
+    handledOauth.current = oauthResult;
+    router.replace("/security");
+    if (oauthResult === "ok") void identities.reload();
   }, [oauthResult, router, identities]);
 
   const providerList = providers.data ?? [];
@@ -252,9 +254,10 @@ function SecurityPageInner() {
     setError(null);
     setNotice(null);
     try {
-      const options = await api<unknown>("/api/auth/passkey/register/begin", { method: "POST" });
+      const options = await api<Record<string, unknown>>("/api/auth/passkey/register/begin", { method: "POST" });
       const credential = await createPasskey(JSON.stringify(options));
-      await api("/api/auth/passkey/register/finish", { method: "POST", body: { credential } });
+      // flow 由后端在 begin 响应下发，finish 需原样带回以关联流程
+      await api("/api/auth/passkey/register/finish", { method: "POST", body: { credential, flow: options["flow"] as string } });
       await passkeys.reload();
       setNotice("通行密钥已添加");
     } catch (err) {
