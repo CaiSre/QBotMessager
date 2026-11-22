@@ -458,14 +458,13 @@ async fn oauth_start(
 
     // 已登录用户发起的流程按「绑定」处理：回调据此把第三方账号挂到当前用户，
     // 而不是走登录/自动注册分支。
-    let session_user =
-        sessions::resolve_session(&state.pool, &session_token(&state, &req)).await?;
-    let mut response = HttpResponse::Found().append_header((LOCATION, url)).finish();
+    let session_user = sessions::resolve_session(&state.pool, &session_token(&state, &req)).await?;
+    let mut response = HttpResponse::Found()
+        .append_header((LOCATION, url))
+        .finish();
     let cookie_result = response
         .add_cookie(&oauth::state_cookie(&settings, &state_value))
-        .and_then(|()| {
-            response.add_cookie(&oauth::provider_cookie(&settings, &provider.key))
-        })
+        .and_then(|()| response.add_cookie(&oauth::provider_cookie(&settings, &provider.key)))
         .and_then(|()| {
             if session_user.is_some() {
                 response.add_cookie(&oauth::link_cookie(&settings))
@@ -556,10 +555,9 @@ async fn oauth_callback_inner(
         }
         return match identity {
             // 已绑定在当前用户名下：视为成功，直接回用户中心。
-            Some(found) if found.user_id == current.id => Ok(oauth_done_redirect(
-                false,
-                "该账号已绑定，无需重复操作",
-            )),
+            Some(found) if found.user_id == current.id => {
+                Ok(oauth_done_redirect(false, "该账号已绑定，无需重复操作"))
+            }
             // 被其他用户绑定：不允许接管。
             Some(_) => Err(AppError::conflict(
                 "该第三方账号已绑定到其他用户，无法重复绑定",

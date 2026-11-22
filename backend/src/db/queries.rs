@@ -944,10 +944,7 @@ pub mod oauth {
     }
 
     /// 按主键删除账号绑定，返回是否删除了记录。
-    pub async fn delete_identity<'e, E>(
-        executor: E,
-        id: i64,
-    ) -> Result<bool, sqlx::Error>
+    pub async fn delete_identity<'e, E>(executor: E, id: i64) -> Result<bool, sqlx::Error>
     where
         E: Executor<'e, Database = MySql>,
     {
@@ -966,12 +963,11 @@ pub mod oauth {
     where
         E: Executor<'e, Database = MySql>,
     {
-        let (count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM auth_identities WHERE user_id = ?",
-        )
-        .bind(user_id)
-        .fetch_one(executor)
-        .await?;
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM auth_identities WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_one(executor)
+                .await?;
         Ok(count)
     }
 }

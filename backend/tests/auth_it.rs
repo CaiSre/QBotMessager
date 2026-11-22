@@ -1991,7 +1991,7 @@ fn query_param(url: &str, name: &str) -> Option<String> {
             return parsed
                 .query_pairs()
                 .find(|(key, _)| key == name)
-                .map(|(_, value)| value.into_owned())
+                .map(|(_, value)| value.into_owned());
         }
         Err(_) => url.split_once('?')?.1,
     };
@@ -2494,7 +2494,14 @@ async fn oauth_link_binds_identity_to_logged_in_user() {
     .await;
     let key = format!("{}-link", fixture.prefix);
     assert_status!(
-        create_provider!(app, admin_token, key.clone(), base, Value::Bool(false), false),
+        create_provider!(
+            app,
+            admin_token,
+            key.clone(),
+            base,
+            Value::Bool(false),
+            false
+        ),
         StatusCode::CREATED
     );
 
@@ -2542,10 +2549,7 @@ async fn oauth_link_binds_identity_to_logged_in_user() {
         "绑定后应回到安全设置页：{redirect}"
     );
     assert_eq!(query_param(&redirect, "oauth").as_deref(), Some("ok"));
-    assert!(
-        callback.cookie("sid").is_none(),
-        "绑定流程不换发会话"
-    );
+    assert!(callback.cookie("sid").is_none(), "绑定流程不换发会话");
     let _ = handle.stop(true).await;
 
     let bound_user: i64 = sqlx::query_scalar(
@@ -2586,7 +2590,14 @@ async fn oauth_link_rejects_identity_bound_to_other_user() {
     .await;
     let key = format!("{}-occu", fixture.prefix);
     assert_status!(
-        create_provider!(app, admin_token, key.clone(), base, Value::Bool(true), false),
+        create_provider!(
+            app,
+            admin_token,
+            key.clone(),
+            base,
+            Value::Bool(true),
+            false
+        ),
         StatusCode::CREATED
     );
     fixture.enable_register();
@@ -2603,7 +2614,14 @@ async fn oauth_link_rejects_identity_bound_to_other_user() {
     let state = query_param(&location, "state").unwrap();
     let state_cookie = first_start.cookie("oauth_state").unwrap();
     let provider_cookie = first_start.cookie("oauth_provider").unwrap();
-    let first = oauth_callback!(app, key.clone(), "mock-code", state, state_cookie, provider_cookie);
+    let first = oauth_callback!(
+        app,
+        key.clone(),
+        "mock-code",
+        state,
+        state_cookie,
+        provider_cookie
+    );
     assert_status!(first, StatusCode::FOUND);
     let _ = mock;
 
@@ -2701,11 +2719,7 @@ async fn oauth_unlink_guards_last_login_method() {
         )
     );
     let unlink = assert_status!(unlink, StatusCode::CONFLICT);
-    assert!(
-        unlink.detail().contains("登录方式"),
-        "{}",
-        unlink.detail()
-    );
+    assert!(unlink.detail().contains("登录方式"), "{}", unlink.detail());
 
     // 设置密码后解绑成功。
     let hash = passwords::hash_password_with("dummy-unlink-pw", b"test-salt-16byte", 1_000);
@@ -2726,13 +2740,12 @@ async fn oauth_unlink_guards_last_login_method() {
     let unlink = assert_status!(unlink, StatusCode::OK);
     assert_eq!(unlink.json()["ok"], json!(true));
 
-    let remaining: i64 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS SIGNED) FROM auth_identities WHERE id = ?",
-    )
-    .bind(identity_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .unwrap();
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS SIGNED) FROM auth_identities WHERE id = ?")
+            .bind(identity_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
     assert_eq!(remaining, 0, "绑定应已删除");
 }
 
@@ -2752,7 +2765,14 @@ async fn oauth_no_identity_with_register_closed_redirects_to_failure_page() {
     .await;
     let key = format!("{}-closed", fixture.prefix);
     assert_status!(
-        create_provider!(app, admin_token, key.clone(), base, Value::Bool(true), false),
+        create_provider!(
+            app,
+            admin_token,
+            key.clone(),
+            base,
+            Value::Bool(true),
+            false
+        ),
         StatusCode::CREATED
     );
     // 默认注册关闭。
@@ -2768,7 +2788,10 @@ async fn oauth_no_identity_with_register_closed_redirects_to_failure_page() {
     let state = query_param(&location, "state").unwrap();
     let state_cookie = start.cookie("oauth_state").unwrap();
     let provider_cookie = start.cookie("oauth_provider").unwrap();
-    assert!(start.cookie("oauth_link").is_none(), "未登录不得签发绑定标记");
+    assert!(
+        start.cookie("oauth_link").is_none(),
+        "未登录不得签发绑定标记"
+    );
 
     let callback = oauth_callback!(app, key, "mock-code", state, state_cookie, provider_cookie);
     let location = assert_oauth_failure(callback, "注册入口已关闭");
@@ -2814,13 +2837,12 @@ async fn oauth_unlink_rejects_foreign_identity() {
     );
     assert_status!(unlink, StatusCode::NOT_FOUND);
 
-    let remaining: i64 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS SIGNED) FROM auth_identities WHERE id = ?",
-    )
-    .bind(identity_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .unwrap();
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS SIGNED) FROM auth_identities WHERE id = ?")
+            .bind(identity_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
     assert_eq!(remaining, 1);
     let _ = (other.id, owner_sid);
 }
