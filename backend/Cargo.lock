@@ -2699,7 +2699,7 @@ dependencies = [
 
 [[package]]
 name = "qbotmessager"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "actix-files",
  "actix-web",
