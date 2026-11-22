@@ -918,15 +918,12 @@ async fn passkey_register_finish(
     let user = require_user(&state, &req).await?;
     let settings = (*state.settings()).clone();
     let flow = finish_flow(&body.flow)?;
-    let raw_challenge = cookie_value(
-        &req,
-        &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
-    );
-    let cookie_user = cookie_value(&req, &passkey::cookie_name(passkey::USER_COOKIE, &flow));
+    let raw_challenge = cookie_value(&req, &passkey::cookie_name(passkey::CHALLENGE_COOKIE, flow));
+    let cookie_user = cookie_value(&req, &passkey::cookie_name(passkey::USER_COOKIE, flow));
     if raw_challenge.is_empty() || cookie_user != user.id.to_string() {
         return Err(AppError::bad_request("注册会话已过期，请重试"));
     }
-    let state_cookie = cookie_value(&req, &passkey::cookie_name(passkey::STATE_COOKIE, &flow));
+    let state_cookie = cookie_value(&req, &passkey::cookie_name(passkey::STATE_COOKIE, flow));
     if state_cookie.is_empty() {
         return Err(AppError::bad_request("注册会话已过期，请重试"));
     }
@@ -978,7 +975,7 @@ async fn passkey_register_finish(
     .await?;
 
     let mut response = HttpResponse::Ok();
-    for cookie in passkey::clear_passkey_cookies(&settings, &flow) {
+    for cookie in passkey::clear_passkey_cookies(&settings, flow) {
         response.cookie(cookie);
     }
     Ok(response.json(json!({ "ok": true })))
@@ -1038,14 +1035,11 @@ async fn passkey_login_finish(
 ) -> Result<HttpResponse, AppError> {
     let settings = (*state.settings()).clone();
     let flow = finish_flow(&body.flow)?;
-    let raw_challenge = cookie_value(
-        &req,
-        &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
-    );
+    let raw_challenge = cookie_value(&req, &passkey::cookie_name(passkey::CHALLENGE_COOKIE, flow));
     if raw_challenge.is_empty() {
         return Err(AppError::bad_request("登录会话已过期，请重试"));
     }
-    let state_cookie = cookie_value(&req, &passkey::cookie_name(passkey::STATE_COOKIE, &flow));
+    let state_cookie = cookie_value(&req, &passkey::cookie_name(passkey::STATE_COOKIE, flow));
     if state_cookie.is_empty() {
         return Err(AppError::bad_request("登录会话已过期，请重试"));
     }
@@ -1123,7 +1117,7 @@ async fn passkey_login_finish(
 
     let mut response = HttpResponse::Ok();
     response.cookie(cookie);
-    for cookie in passkey::clear_passkey_cookies(&settings, &flow) {
+    for cookie in passkey::clear_passkey_cookies(&settings, flow) {
         response.cookie(cookie);
     }
     Ok(response.json(json!({ "ok": true })))

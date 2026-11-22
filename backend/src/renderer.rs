@@ -193,7 +193,7 @@ pub fn render_qq_with_limits(
         if !cleaned.is_empty() {
             parts.push(cleaned);
         }
-        let markdown = truncate(&parts.join("\n\n").trim(), Some(markdown_max_len));
+        let markdown = truncate(parts.join("\n\n").trim(), Some(markdown_max_len));
         if !markdown.is_empty() {
             return QqPayload {
                 msg_type: MSG_TYPE_MARKDOWN,

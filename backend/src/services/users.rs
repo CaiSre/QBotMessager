@@ -656,10 +656,9 @@ fn duplicate_key(err: &sqlx::Error) -> Option<DuplicateKey> {
         return None;
     }
     let message = db_err.message().to_ascii_lowercase();
+    // 未匹配到已知索引名时按邮箱兜底，与下方注册映射的判定顺序一致。
     if message.contains("uq_users_name_lower") {
         Some(DuplicateKey::Name)
-    } else if message.contains("uq_users_email") {
-        Some(DuplicateKey::Email)
     } else {
         Some(DuplicateKey::Email)
     }
