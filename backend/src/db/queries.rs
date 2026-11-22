@@ -908,6 +908,72 @@ pub mod oauth {
         .await?;
         Ok(result.last_insert_id() as i64)
     }
+
+    /// 按主键查询账号绑定（校验归属时使用）。
+    pub async fn find_identity_by_id<'e, E>(
+        executor: E,
+        id: i64,
+    ) -> Result<Option<AuthIdentity>, sqlx::Error>
+    where
+        E: Executor<'e, Database = MySql>,
+    {
+        sqlx::query_as::<_, AuthIdentity>(
+            "SELECT id, user_id, provider, provider_user_id, provider_login, created_at \
+             FROM auth_identities WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(executor)
+        .await
+    }
+
+    /// 列出用户在全部提供方下的账号绑定。
+    pub async fn list_identities_for_user<'e, E>(
+        executor: E,
+        user_id: i64,
+    ) -> Result<Vec<AuthIdentity>, sqlx::Error>
+    where
+        E: Executor<'e, Database = MySql>,
+    {
+        sqlx::query_as::<_, AuthIdentity>(
+            "SELECT id, user_id, provider, provider_user_id, provider_login, created_at \
+             FROM auth_identities WHERE user_id = ? ORDER BY id",
+        )
+        .bind(user_id)
+        .fetch_all(executor)
+        .await
+    }
+
+    /// 按主键删除账号绑定，返回是否删除了记录。
+    pub async fn delete_identity<'e, E>(
+        executor: E,
+        id: i64,
+    ) -> Result<bool, sqlx::Error>
+    where
+        E: Executor<'e, Database = MySql>,
+    {
+        let result = sqlx::query("DELETE FROM auth_identities WHERE id = ?")
+            .bind(id)
+            .execute(executor)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 统计用户名下账号绑定的数量（与通行密钥计数同型）。
+    pub async fn count_identities_for_user<'e, E>(
+        executor: E,
+        user_id: i64,
+    ) -> Result<i64, sqlx::Error>
+    where
+        E: Executor<'e, Database = MySql>,
+    {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM auth_identities WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_one(executor)
+        .await?;
+        Ok(count)
+    }
 }
 
 /// 会话。

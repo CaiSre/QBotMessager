@@ -26,6 +26,8 @@ use crate::services::runtime_settings::RuntimeSettings;
 pub const STATE_COOKIE: &str = "oauth_state";
 /// 提供方 Cookie 名。
 pub const PROVIDER_COOKIE: &str = "oauth_provider";
+/// 绑定用途 Cookie 名；存在表示本次流程用于给已登录用户绑定账号。
+pub const LINK_COOKIE: &str = "oauth_link";
 /// 两个临时 Cookie 的有效期（秒）。
 pub const COOKIE_MAX_AGE_SECONDS: i64 = 600;
 /// state 的随机字节数（24 字节 → 32 字符 base64url）。
@@ -288,6 +290,11 @@ pub fn state_cookie(settings: &RuntimeSettings, state: &str) -> Cookie<'static> 
 /// 构造提供方 Cookie。
 pub fn provider_cookie(settings: &RuntimeSettings, provider_key: &str) -> Cookie<'static> {
     oauth_cookie(PROVIDER_COOKIE, provider_key.to_string(), settings)
+}
+
+/// 构造绑定用途 Cookie；值只是意图标记，回调以解析出的会话为准。
+pub fn link_cookie(settings: &RuntimeSettings) -> Cookie<'static> {
+    oauth_cookie(LINK_COOKIE, "1".to_string(), settings)
 }
 
 /// 构造删除 OAuth 临时 Cookie 的指令。

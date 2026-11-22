@@ -1985,11 +1985,41 @@ macro_rules! oauth_callback {
 }
 
 fn query_param(url: &str, name: &str) -> Option<String> {
-    url::Url::parse(url)
-        .ok()?
-        .query_pairs()
+    // 相对路径（如 /oauth/failure?message=…）不是合法绝对 URL，直接取问号后的部分。
+    let query = match url::Url::parse(url) {
+        Ok(parsed) => {
+            return parsed
+                .query_pairs()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.into_owned())
+        }
+        Err(_) => url.split_once('?')?.1,
+    };
+    url::form_urlencoded::parse(query.as_bytes())
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.into_owned())
+}
+
+/// 回调失败统一 302 到提示页；断言 Location 与 message 参数。
+fn assert_oauth_failure(reply: Reply, message_contains: &str) -> String {
+    let reply = assert_status!(reply, StatusCode::FOUND);
+    let location = reply
+        .headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("失败必须重定向到提示页")
+        .to_string();
+    assert!(
+        location.starts_with("/oauth/failure?"),
+        "应重定向到提示页：{location}"
+    );
+    let message = query_param(&location, "message").unwrap_or_default();
+    assert!(
+        message.contains(message_contains),
+        "提示信息应包含「{message_contains}」：{message}"
+    );
+    assert!(reply.cookie("sid").is_none(), "失败时不得下发会话");
+    location
 }
 
 #[actix_web::test]
@@ -2049,8 +2079,7 @@ async fn oauth_state_cookie_validation() {
         state_cookie,
         provider_cookie
     );
-    let mismatch = assert_status!(mismatch, StatusCode::BAD_REQUEST);
-    assert_eq!(mismatch.detail(), "OAuth state 校验失败");
+    let mismatch = assert_oauth_failure(mismatch, "state 校验失败");
 
     let missing_cookie = send!(
         app,
@@ -2058,8 +2087,7 @@ async fn oauth_state_cookie_validation() {
             "/api/auth/oauth/{key}/callback?code=abc&state={state}"
         ))
     );
-    let missing_cookie = assert_status!(missing_cookie, StatusCode::BAD_REQUEST);
-    assert_eq!(missing_cookie.detail(), "OAuth state 校验失败");
+    let missing_cookie = assert_oauth_failure(missing_cookie, "state 校验失败");
 
     let wrong_provider = oauth_callback!(
         app,
@@ -2069,12 +2097,11 @@ async fn oauth_state_cookie_validation() {
         state_cookie,
         "another-provider".to_string()
     );
-    let wrong_provider = assert_status!(wrong_provider, StatusCode::BAD_REQUEST);
-    assert_eq!(wrong_provider.detail(), "OAuth state 校验失败");
+    let wrong_provider = assert_oauth_failure(wrong_provider, "state 校验失败");
 
     let no_code = oauth_callback!(app, key, "", state, state_cookie, provider_cookie);
-    let no_code = assert_status!(no_code, StatusCode::BAD_REQUEST);
-    assert_eq!(no_code.detail(), "缺少授权码");
+    let no_code = assert_oauth_failure(no_code, "缺少授权码");
+    let _ = (mismatch, missing_cookie, wrong_provider, no_code);
 
     let _ = handle.stop(true).await;
 }
@@ -2229,13 +2256,8 @@ async fn oauth_untrusted_email_cannot_take_over_account() {
     let provider_cookie = start.cookie("oauth_provider").unwrap();
 
     let callback = oauth_callback!(app, key, "mock-code", state, state_cookie, provider_cookie);
-    let callback = assert_status!(callback, StatusCode::CONFLICT);
-    assert!(
-        callback.detail().contains("未验证邮箱"),
-        "{}",
-        callback.detail()
-    );
-    assert!(callback.cookie("sid").is_none(), "失败时不得下发会话");
+    let location = assert_oauth_failure(callback, "未验证邮箱");
+    let _ = location;
     let _ = handle.stop(true).await;
 
     let identities: i64 = sqlx::query_scalar(
@@ -2454,6 +2476,353 @@ async fn oauth_login_does_not_break_password_login() {
     );
     let login = assert_status!(login, StatusCode::OK);
     assert_eq!(login.json()["role"], json!("super_admin"));
+}
+
+#[actix_web::test]
+async fn oauth_link_binds_identity_to_logged_in_user() {
+    // 登录态下发起 OAuth：绑定到当前用户，不产生新账号，也不换发会话。
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let (_admin, admin_token) = make_admin(&fixture, "adminlink").await;
+    let (base, _mock, handle) = start_oauth_mock(json!({
+        "id": "link-4242",
+        "login": "link-octo",
+        "name": "Link Cat",
+        "email_verified": false,
+    }))
+    .await;
+    let key = format!("{}-link", fixture.prefix);
+    assert_status!(
+        create_provider!(app, admin_token, key.clone(), base, Value::Bool(false), false),
+        StatusCode::CREATED
+    );
+
+    let (linker, sid) = make_admin(&fixture, "linker").await;
+    let start = send!(
+        app,
+        get_with(
+            &format!("/api/auth/oauth/{key}/start"),
+            &[("sid", sid.as_str())]
+        )
+    );
+    let start = assert_status!(start, StatusCode::FOUND);
+    let location = start
+        .headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    let state = query_param(&location, "state").unwrap();
+    let state_cookie = start.cookie("oauth_state").unwrap();
+    let provider_cookie = start.cookie("oauth_provider").unwrap();
+    assert!(start.cookie("oauth_link").is_some(), "登录态应签发绑定标记");
+
+    let callback = send!(
+        app,
+        get_with(
+            &format!("/api/auth/oauth/{key}/callback?code=mock-code&state={state}"),
+            &[
+                ("sid", sid.as_str()),
+                ("oauth_state", state_cookie.as_str()),
+                ("oauth_provider", provider_cookie.as_str()),
+                ("oauth_link", "1"),
+            ]
+        )
+    );
+    let callback = assert_status!(callback, StatusCode::FOUND);
+    let redirect = callback
+        .headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert!(
+        redirect.starts_with("/security"),
+        "绑定后应回到安全设置页：{redirect}"
+    );
+    assert_eq!(query_param(&redirect, "oauth").as_deref(), Some("ok"));
+    assert!(
+        callback.cookie("sid").is_none(),
+        "绑定流程不换发会话"
+    );
+    let _ = handle.stop(true).await;
+
+    let bound_user: i64 = sqlx::query_scalar(
+        "SELECT user_id FROM auth_identities WHERE provider = ? AND provider_user_id = 'link-4242'",
+    )
+    .bind(&key)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("缺少身份绑定");
+    assert_eq!(bound_user, linker.id);
+
+    // 列表端点返回该绑定。
+    let list = send!(
+        app,
+        get_with("/api/auth/oauth/identities", &[("sid", sid.as_str())])
+    );
+    let list = assert_status!(list, StatusCode::OK);
+    let items = list.json();
+    let items = items.as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["provider"], json!(key));
+    assert_eq!(items[0]["provider_login"], json!("link-octo"));
+}
+
+#[actix_web::test]
+async fn oauth_link_rejects_identity_bound_to_other_user() {
+    // 第三方账号已被他人绑定：返回提示页，不写入新绑定。
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let (_admin, admin_token) = make_admin(&fixture, "adminoccu").await;
+    let (base, mock, handle) = start_oauth_mock(json!({
+        "id": "occu-1",
+        "login": "occu-login",
+        "email": format!("occu-{}@example.com", fixture.prefix),
+        "email_verified": true,
+    }))
+    .await;
+    let key = format!("{}-occu", fixture.prefix);
+    assert_status!(
+        create_provider!(app, admin_token, key.clone(), base, Value::Bool(true), false),
+        StatusCode::CREATED
+    );
+    fixture.enable_register();
+
+    // 第一个用户先通过 OAuth 登录占住该第三方账号。
+    let first_start = oauth_start!(app, key.clone());
+    let first_start = assert_status!(first_start, StatusCode::FOUND);
+    let location = first_start
+        .headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    let state = query_param(&location, "state").unwrap();
+    let state_cookie = first_start.cookie("oauth_state").unwrap();
+    let provider_cookie = first_start.cookie("oauth_provider").unwrap();
+    let first = oauth_callback!(app, key.clone(), "mock-code", state, state_cookie, provider_cookie);
+    assert_status!(first, StatusCode::FOUND);
+    let _ = mock;
+
+    // 第二个已登录用户尝试绑定同一个第三方账号。
+    let (occupier, sid) = make_admin(&fixture, "occupier").await;
+    let second_start = send!(
+        app,
+        get_with(
+            &format!("/api/auth/oauth/{key}/start"),
+            &[("sid", sid.as_str())]
+        )
+    );
+    let second_start = assert_status!(second_start, StatusCode::FOUND);
+    let location = second_start
+        .headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    let state = query_param(&location, "state").unwrap();
+    let state_cookie = second_start.cookie("oauth_state").unwrap();
+    let provider_cookie = second_start.cookie("oauth_provider").unwrap();
+
+    let callback = send!(
+        app,
+        get_with(
+            &format!("/api/auth/oauth/{key}/callback?code=mock-code&state={state}"),
+            &[
+                ("sid", sid.as_str()),
+                ("oauth_state", state_cookie.as_str()),
+                ("oauth_provider", provider_cookie.as_str()),
+                ("oauth_link", "1"),
+            ]
+        )
+    );
+    let location = assert_oauth_failure(callback, "已绑定到其他用户");
+    let _ = location;
+    let _ = handle.stop(true).await;
+
+    let identities: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM auth_identities WHERE provider = ? AND provider_user_id = 'occu-1'",
+    )
+    .bind(&key)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(identities, 1, "仍只有一条绑定");
+    let _ = occupier;
+}
+
+#[actix_web::test]
+async fn oauth_unlink_guards_last_login_method() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    // 提供方无需真实交互：identity 直接落库即可。
+    let key = format!("{}-unl", fixture.prefix);
+    sqlx::query(
+        "INSERT INTO oauth_providers (`key`, display_name, client_id, client_secret, \
+         authorization_url, token_url, userinfo_url, scopes, email_field, id_field, \
+         name_field, enabled, email_verified, created_at) \
+         VALUES (?, 'Unlink', 'c', 'enc1:x', 'http://a', 'http://t', 'http://u', 's', \
+         'email', 'id', 'name', TRUE, TRUE, ?)",
+    )
+    .bind(&key)
+    .bind(Utc::now().naive_utc())
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+
+    // 无密码、无 passkey、仅一个 OAuth 绑定：拒绝解绑。
+    let (owner, sid) = make_admin(&fixture, "unlowner").await;
+    sqlx::query("UPDATE users SET password_hash = NULL WHERE id = ?")
+        .bind(owner.id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let identity_id = sqlx::query(
+        "INSERT INTO auth_identities (user_id, provider, provider_user_id, provider_login, \
+         created_at) VALUES (?, ?, '9413', 'unl-login', ?)",
+    )
+    .bind(owner.id)
+    .bind(&key)
+    .bind(Utc::now().naive_utc())
+    .execute(&fixture.pool)
+    .await
+    .unwrap()
+    .last_insert_id() as i64;
+
+    let unlink = send!(
+        app,
+        delete_with(
+            &format!("/api/auth/oauth/identities/{identity_id}"),
+            &[("sid", sid.as_str())]
+        )
+    );
+    let unlink = assert_status!(unlink, StatusCode::CONFLICT);
+    assert!(
+        unlink.detail().contains("登录方式"),
+        "{}",
+        unlink.detail()
+    );
+
+    // 设置密码后解绑成功。
+    let hash = passwords::hash_password_with("dummy-unlink-pw", b"test-salt-16byte", 1_000);
+    sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+        .bind(&hash)
+        .bind(owner.id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+    let unlink = send!(
+        app,
+        delete_with(
+            &format!("/api/auth/oauth/identities/{identity_id}"),
+            &[("sid", sid.as_str())]
+        )
+    );
+    let unlink = assert_status!(unlink, StatusCode::OK);
+    assert_eq!(unlink.json()["ok"], json!(true));
+
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM auth_identities WHERE id = ?",
+    )
+    .bind(identity_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, 0, "绑定应已删除");
+}
+
+#[actix_web::test]
+async fn oauth_no_identity_with_register_closed_redirects_to_failure_page() {
+    // 注册关闭且无关联账号：不再返回 JSON，而是 302 到提示页。
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let (_admin, admin_token) = make_admin(&fixture, "adminnoclose").await;
+    let (base, _mock, handle) = start_oauth_mock(json!({
+        "id": "closed-1",
+        "login": "closed-login",
+        "email": format!("closed-{}@example.com", fixture.prefix),
+        "email_verified": true,
+    }))
+    .await;
+    let key = format!("{}-closed", fixture.prefix);
+    assert_status!(
+        create_provider!(app, admin_token, key.clone(), base, Value::Bool(true), false),
+        StatusCode::CREATED
+    );
+    // 默认注册关闭。
+
+    let start = oauth_start!(app, key);
+    let start = assert_status!(start, StatusCode::FOUND);
+    let location = start
+        .headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    let state = query_param(&location, "state").unwrap();
+    let state_cookie = start.cookie("oauth_state").unwrap();
+    let provider_cookie = start.cookie("oauth_provider").unwrap();
+    assert!(start.cookie("oauth_link").is_none(), "未登录不得签发绑定标记");
+
+    let callback = oauth_callback!(app, key, "mock-code", state, state_cookie, provider_cookie);
+    let location = assert_oauth_failure(callback, "注册入口已关闭");
+    let _ = location;
+    let _ = handle.stop(true).await;
+
+    let users: i64 =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS SIGNED) FROM users WHERE email = ?")
+            .bind(format!("closed-{}@example.com", fixture.prefix))
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(users, 0, "注册关闭时不得自动建号");
+}
+
+#[actix_web::test]
+async fn oauth_unlink_rejects_foreign_identity() {
+    // 不能删别人的绑定。
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let (owner, owner_sid) = make_admin(&fixture, "ownerfgn").await;
+    let (other, other_sid) = make_admin(&fixture, "otherfgn").await;
+    let provider_key = format!("{}-fgn", fixture.prefix);
+    let identity_id = sqlx::query(
+        "INSERT INTO auth_identities (user_id, provider, provider_user_id, provider_login, \
+         created_at) VALUES (?, ?, 'fgn-1', 'fgn-login', ?)",
+    )
+    .bind(owner.id)
+    .bind(&provider_key)
+    .bind(Utc::now().naive_utc())
+    .execute(&fixture.pool)
+    .await
+    .unwrap()
+    .last_insert_id() as i64;
+
+    let unlink = send!(
+        app,
+        delete_with(
+            &format!("/api/auth/oauth/identities/{identity_id}"),
+            &[("sid", other_sid.as_str())]
+        )
+    );
+    assert_status!(unlink, StatusCode::NOT_FOUND);
+
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM auth_identities WHERE id = ?",
+    )
+    .bind(identity_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, 1);
+    let _ = (other.id, owner_sid);
 }
 
 // --------------------------------------------------------------------------- Passkey

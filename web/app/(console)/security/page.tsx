@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -43,7 +44,13 @@ import { formatDateTime } from "@/lib/format";
 import { useApi } from "@/lib/hooks";
 import { isSuperAdmin, useMe } from "@/lib/me";
 import { createPasskey, passkeySupported } from "@/lib/passkey";
-import type { OAuthProvider, Passkey, SecuritySettings } from "@/lib/types";
+import type {
+  AuthMeta,
+  OAuthIdentity,
+  OAuthProvider,
+  Passkey,
+  SecuritySettings,
+} from "@/lib/types";
 
 interface OAuthForm {
   key: string;
@@ -80,6 +87,14 @@ const EMPTY_OAUTH: OAuthForm = {
 };
 
 export default function SecurityPage() {
+  return (
+    <Suspense>
+      <SecurityPageInner />
+    </Suspense>
+  );
+}
+
+function SecurityPageInner() {
   const me = useMe();
   const manage = isSuperAdmin(me.role);
 
@@ -90,6 +105,8 @@ export default function SecurityPage() {
     manage ? "/api/admin/oauth-providers" : null,
   );
   const passkeys = useApi<Passkey[]>("/api/auth/passkey");
+  const identities = useApi<OAuthIdentity[]>("/api/auth/oauth/identities");
+  const providerMeta = useApi<AuthMeta>("/api/auth/providers");
 
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -117,8 +134,27 @@ export default function SecurityPage() {
     action: () => Promise<void>;
   } | null>(null);
 
+  // 绑定流程结束回跳：后端带 ?oauth=ok|fail&message=…，展示后清掉参数。
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const oauthParam = searchParams.get("oauth");
+  const oauthResult = oauthParam === "ok" || oauthParam === "fail" ? oauthParam : null;
+  const oauthMessage = searchParams.get("message");
+  useEffect(() => {
+    if (oauthResult) {
+      router.replace("/security");
+      if (oauthResult === "ok") void identities.reload();
+    }
+  }, [oauthResult, router, identities]);
+
   const providerList = providers.data ?? [];
   const passkeyList = passkeys.data ?? [];
+  const identityList = identities.data ?? [];
+  const providerOptions = providerMeta.data?.oauth_providers ?? [];
+
+  function providerNameOf(key: string) {
+    return providerOptions.find((provider) => provider.key === key)?.display_name ?? key;
+  }
 
   async function toggleRegistration(value: boolean) {
     setError(null);
@@ -231,8 +267,22 @@ export default function SecurityPage() {
   return (
     <div>
       <PageHeader title="安全设置" description="注册开关、OAuth2 登录与通行密钥" />
-      <ErrorAlert message={error ?? settings.error ?? providers.error ?? passkeys.error} />
+      <ErrorAlert
+        message={
+          error ??
+          settings.error ??
+          providers.error ??
+          passkeys.error ??
+          identities.error
+        }
+      />
       <SuccessAlert message={notice} />
+      {oauthResult === "fail" ? (
+        <ErrorAlert message={oauthMessage || "第三方账号绑定失败"} />
+      ) : null}
+      {oauthResult === "ok" ? (
+        <SuccessAlert message={oauthMessage || "第三方账号绑定成功"} />
+      ) : null}
 
       <div className="flex flex-col gap-6">
         {manage ? (
@@ -435,6 +485,80 @@ export default function SecurityPage() {
                   ))}
                 </TableBody>
               </Table>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>第三方账号</CardTitle>
+            <CardDescription>
+              绑定后可直接使用第三方账号登录；当前已绑定 {identityList.length} 个
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            {providerOptions.length === 0 ? (
+              <EmptyHint>管理员尚未配置任何第三方登录</EmptyHint>
+            ) : (
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-wrap gap-2">
+                  {providerOptions.map((provider) => (
+                    <Button
+                      key={provider.key}
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        window.location.href = `/api/auth/oauth/${provider.key}/start`;
+                      }}
+                    >
+                      绑定 {provider.display_name}
+                    </Button>
+                  ))}
+                </div>
+                {identityList.length > 0 ? (
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>提供方</TableHead>
+                        <TableHead>第三方账号</TableHead>
+                        <TableHead>绑定时间</TableHead>
+                        <TableHead>操作</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {identityList.map((item) => (
+                        <TableRow key={item.id}>
+                          <TableCell>{providerNameOf(item.provider)}</TableCell>
+                          <TableCell>{item.provider_login || "-"}</TableCell>
+                          <TableCell>{formatDateTime(item.created_at)}</TableCell>
+                          <TableCell>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              onClick={() =>
+                                setConfirm({
+                                  title: "解绑第三方账号",
+                                  description: `解绑「${providerNameOf(item.provider)}」后将无法再用该第三方账号登录本站。`,
+                                  action: async () => {
+                                    await api(`/api/auth/oauth/identities/${item.id}`, {
+                                      method: "DELETE",
+                                    });
+                                    await identities.reload();
+                                  },
+                                })
+                              }
+                            >
+                              解绑
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                ) : (
+                  <EmptyHint>还没有绑定第三方账号</EmptyHint>
+                )}
+              </div>
             )}
           </CardContent>
         </Card>

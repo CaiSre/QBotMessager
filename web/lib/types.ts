@@ -126,6 +126,14 @@ export interface OAuthProvider {
   email_verified: boolean;
 }
 
+/** 已绑定的第三方账号（auth_identities 一行）。 */
+export interface OAuthIdentity {
+  id: number;
+  provider: string;
+  provider_login: string | null;
+  created_at: string | null;
+}
+
 export interface SecuritySettings {
   register_enabled: boolean;
   register_enabled_source: "database" | "env";

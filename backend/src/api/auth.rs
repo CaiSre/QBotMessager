@@ -15,6 +15,7 @@
 //! - `POST /api/auth/password/reset`
 //! - `POST /api/auth/login`、`POST /api/auth/logout`、`POST /api/auth/register`
 //! - `GET  /api/auth/oauth/{key}/start`、`GET /api/auth/oauth/{key}/callback`
+//! - `GET  /api/auth/oauth/identities`、`DELETE /api/auth/oauth/identities/{id}`
 //! - `GET  /api/auth/passkey`、`DELETE /api/auth/passkey/{id}`
 //! - `POST /api/auth/passkey/register/begin`、`POST /api/auth/passkey/register/finish`
 //! - `POST /api/auth/passkey/login/begin`、`POST /api/auth/passkey/login/finish`
@@ -57,6 +58,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 "/oauth/{provider_key}/callback",
                 web::get().to(oauth_callback),
             )
+            .route("/oauth/identities", web::get().to(list_oauth_identities))
+            .route("/oauth/identities/{id}", web::delete().to(unlink_oauth))
             .route("/passkey", web::get().to(list_passkeys))
             .route("/passkey/{credential_id}", web::delete().to(delete_passkey))
             .route(
@@ -453,21 +456,53 @@ async fn oauth_start(
     let state_value = oauth::new_state();
     let url = oauth::build_authorize_url(&provider, &redirect_uri, &state_value);
 
-    Ok(HttpResponse::Found()
-        .append_header((LOCATION, url))
-        .cookie(oauth::state_cookie(&settings, &state_value))
-        .cookie(oauth::provider_cookie(&settings, &provider.key))
-        .finish())
+    // 已登录用户发起的流程按「绑定」处理：回调据此把第三方账号挂到当前用户，
+    // 而不是走登录/自动注册分支。
+    let session_user =
+        sessions::resolve_session(&state.pool, &session_token(&state, &req)).await?;
+    let mut response = HttpResponse::Found().append_header((LOCATION, url)).finish();
+    let cookie_result = response
+        .add_cookie(&oauth::state_cookie(&settings, &state_value))
+        .and_then(|()| {
+            response.add_cookie(&oauth::provider_cookie(&settings, &provider.key))
+        })
+        .and_then(|()| {
+            if session_user.is_some() {
+                response.add_cookie(&oauth::link_cookie(&settings))
+            } else {
+                Ok(())
+            }
+        });
+    cookie_result.map_err(|_| AppError::internal("响应构造失败"))?;
+    Ok(response)
 }
 
 /// `GET /api/auth/oauth/{key}/callback`
+///
+/// 浏览器直达端点：任何流程错误都不再返回 JSON，而是 302 到前端提示页
+/// `/oauth/failure`，由页面渲染中文提示与后续操作。
 async fn oauth_callback(
     req: HttpRequest,
     state: web::Data<AppState>,
     path: web::Path<String>,
     query: web::Query<OAuthCallbackQuery>,
+) -> HttpResponse {
+    let provider_key_path = path.into_inner();
+    let result = oauth_callback_inner(&req, &state, &provider_key_path, &query).await;
+    match result {
+        Ok(response) => response,
+        Err(err) => oauth_failure_redirect(&err),
+    }
+}
+
+/// 回调主逻辑；错误统一交给外层转提示页。
+async fn oauth_callback_inner(
+    req: &HttpRequest,
+    state: &web::Data<AppState>,
+    path: &str,
+    query: &OAuthCallbackQuery,
 ) -> Result<HttpResponse, AppError> {
-    let provider_key = path.into_inner();
+    let provider_key = path.to_string();
     let cookie_state = req
         .cookie(oauth::STATE_COOKIE)
         .map(|cookie| cookie.value().to_string())
@@ -487,7 +522,7 @@ async fn oauth_callback(
     let client_secret = oauth::client_secret(&provider, state.config.app_secret_key.as_deref())?;
 
     let settings = (*state.settings()).clone();
-    let origin = request_origin(&state, &settings, &req);
+    let origin = request_origin(state, &settings, req);
     let redirect_uri = oauth::redirect_uri(&origin, &provider.key);
 
     let token_data = oauth::exchange_code(
@@ -509,6 +544,43 @@ async fn oauth_callback(
     let identity =
         queries::oauth::find_identity(&state.pool, &provider.key, &profile.provider_user_id)
             .await?;
+
+    // 绑定分支：start 时带会话、且回调时仍能解析出有效会话。
+    let link_user = match req.cookie(oauth::LINK_COOKIE) {
+        Some(_) => sessions::resolve_session(&state.pool, &session_token(state, req)).await?,
+        None => None,
+    };
+    if let Some(current) = link_user {
+        if current.status != STATUS_ACTIVE {
+            return Err(AppError::forbidden("账号不可用"));
+        }
+        return match identity {
+            // 已绑定在当前用户名下：视为成功，直接回用户中心。
+            Some(found) if found.user_id == current.id => Ok(oauth_done_redirect(
+                false,
+                "该账号已绑定，无需重复操作",
+            )),
+            // 被其他用户绑定：不允许接管。
+            Some(_) => Err(AppError::conflict(
+                "该第三方账号已绑定到其他用户，无法重复绑定",
+            )),
+            None => {
+                queries::oauth::insert_identity(
+                    &state.pool,
+                    &queries::oauth::NewAuthIdentity {
+                        user_id: current.id,
+                        provider: &provider.key,
+                        provider_user_id: &profile.provider_user_id,
+                        provider_login: Some(&profile.login),
+                        created_at: now,
+                    },
+                )
+                .await?;
+                Ok(oauth_done_redirect(true, "绑定成功"))
+            }
+        };
+    }
+
     let identity_exists = identity.is_some();
 
     let mut user = if let Some(identity) = identity {
@@ -592,13 +664,13 @@ async fn oauth_callback(
     }
 
     let user = user.take().expect("user 已在上方确认存在");
-    let ip = state.client_ip(&req);
+    let ip = state.client_ip(req);
     let token = sessions::create_session(
         &state.pool,
         &user,
         settings.session_ttl_hours(),
         ip.as_deref(),
-        user_agent(&req),
+        user_agent(req),
     )
     .await?;
     let cookie = sessions::session_cookie(
@@ -613,7 +685,92 @@ async fn oauth_callback(
         .cookie(cookie)
         .cookie(oauth::clear_cookie(oauth::STATE_COOKIE))
         .cookie(oauth::clear_cookie(oauth::PROVIDER_COOKIE))
+        .cookie(oauth::clear_cookie(oauth::LINK_COOKIE))
         .finish())
+}
+
+/// 绑定流程结束后的跳转：带结果参数跳回安全设置页。
+fn oauth_done_redirect(ok: bool, message: &str) -> HttpResponse {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("oauth", if ok { "ok" } else { "fail" })
+        .append_pair("message", message)
+        .finish();
+    HttpResponse::Found()
+        .append_header((LOCATION, format!("/security?{query}")))
+        .cookie(oauth::clear_cookie(oauth::STATE_COOKIE))
+        .cookie(oauth::clear_cookie(oauth::PROVIDER_COOKIE))
+        .cookie(oauth::clear_cookie(oauth::LINK_COOKIE))
+        .finish()
+}
+
+/// 回调失败后的跳转：中文提示交给前端提示页展示。
+fn oauth_failure_redirect(err: &AppError) -> HttpResponse {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("message", err.detail())
+        .append_pair("detail", &err.to_string())
+        .finish();
+    let location = format!("/oauth/failure?{query}");
+    tracing::warn!(error = %err, "OAuth 回调失败，重定向到提示页");
+    HttpResponse::Found()
+        .append_header((LOCATION, location))
+        .cookie(oauth::clear_cookie(oauth::STATE_COOKIE))
+        .cookie(oauth::clear_cookie(oauth::PROVIDER_COOKIE))
+        .cookie(oauth::clear_cookie(oauth::LINK_COOKIE))
+        .finish()
+}
+
+/// `GET /api/auth/oauth/identities`
+async fn list_oauth_identities(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, AppError> {
+    let user = require_user(&state, &req).await?;
+    let rows = queries::oauth::list_identities_for_user(&state.pool, user.id).await?;
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "provider": &row.provider,
+                "provider_login": &row.provider_login,
+                "created_at": &row.created_at,
+            })
+        })
+        .collect();
+    Ok(HttpResponse::Ok().json(items))
+}
+
+/// `DELETE /api/auth/oauth/identities/{id}`
+///
+/// 解绑前确保账号仍保有至少一种登录方式：密码、通行密钥或其他第三方绑定；
+/// 否则仅剩这一条绑定会被删光，账号将无法登录。
+async fn unlink_oauth(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
+    let user = require_user(&state, &req).await?;
+    let identity_id = path
+        .into_inner()
+        .parse::<i64>()
+        .map_err(|_| AppError::validation("绑定 ID 非法"))?;
+
+    let record = queries::oauth::find_identity_by_id(&state.pool, identity_id).await?;
+    if record.as_ref().map(|row| row.user_id) != Some(user.id) {
+        return Err(AppError::not_found("绑定不存在"));
+    }
+
+    let has_password = user.password_hash.is_some();
+    let passkey_count = passkey_store::count_for_user(&state.pool, user.id).await?;
+    let identity_count = queries::oauth::count_identities_for_user(&state.pool, user.id).await?;
+    if !has_password && passkey_count == 0 && identity_count <= 1 {
+        return Err(AppError::conflict(
+            "解绑后账号将没有任何登录方式，请先设置密码或通行密钥",
+        ));
+    }
+
+    queries::oauth::delete_identity(&state.pool, identity_id).await?;
+    Ok(HttpResponse::Ok().json(json!({ "ok": true })))
 }
 
 // ---------------------------------------------------------------------- Passkey
