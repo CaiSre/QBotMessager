@@ -9,6 +9,8 @@
 //! 数据库为真实 MySQL（默认 `qbot_test_bootstrap`）。引导逻辑读写的是全局表，
 //! 因此用例用进程内互斥锁串行化，并在每个用例开始时清空相关表。
 
+mod common;
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
@@ -41,12 +43,14 @@ static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static MIGRATED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
 fn database_url() -> String {
-    std::env::var("MYSQL_URL")
+    let url = std::env::var("MYSQL_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| {
             "mysql://qbotmessager:testpw@127.0.0.1:13306/qbot_test_bootstrap".to_string()
-        })
+        });
+    // 库名固定为本套件的库：与其它套件隔离，避免并跑时互相清库。
+    common::with_database(&url, "qbot_test_bootstrap")
 }
 
 async fn test_pool() -> MySqlPool {

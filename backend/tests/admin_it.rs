@@ -13,6 +13,8 @@
 //! `system_settings` 与登录失败计数是全局状态，测试之间不能并行改写。
 //! 每个用例都使用随机前缀创建独立账号/资源，避免互相干扰。
 
+mod common;
+
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,12 +46,14 @@ static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static MIGRATED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
 fn database_url() -> String {
-    std::env::var("MYSQL_URL")
+    let url = std::env::var("MYSQL_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| {
             "mysql://qbotmessager:testpw@127.0.0.1:13306/qbot_test_admin".to_string()
-        })
+        });
+    // 库名固定为本套件的库：与其它套件隔离，避免并跑时互相清库。
+    common::with_database(&url, "qbot_test_admin")
 }
 
 async fn test_pool() -> MySqlPool {

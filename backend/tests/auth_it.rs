@@ -12,6 +12,8 @@
 //! Passkey 登录用 p256 产生真实 ES256 签名（`passkey_login_succeeds_with_real_signature`），
 //! 注册走测试构造的 attestation 对象。
 
+mod common;
+
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
@@ -54,10 +56,14 @@ static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static MIGRATED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
 fn database_url() -> String {
-    std::env::var("MYSQL_URL")
+    let url = std::env::var("MYSQL_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "mysql://qbotmessager:testpw@127.0.0.1:13306/qbot_test_auth".to_string())
+        .unwrap_or_else(|| {
+            "mysql://qbotmessager:testpw@127.0.0.1:13306/qbot_test_auth".to_string()
+        });
+    // 库名固定为本套件的库：与其它套件隔离，避免并跑时互相清库。
+    common::with_database(&url, "qbot_test_auth")
 }
 
 async fn test_pool() -> MySqlPool {
