@@ -457,7 +457,7 @@ export default function SecurityPage() {
                   value={oauthForm.key}
                   onChange={(event) => {
                     setOauthForm((prev) => ({ ...prev, key: event.target.value }));
-                    if (oauthErrors.key) setOauthErrors((prev) => ({ ...prev, key: undefined }));
+                    if (oauthErrors.key) setOauthErrors(({ key, ...rest }) => rest);
                   }}
                 />
                 <FieldError>{oauthErrors.key}</FieldError>
@@ -472,7 +472,7 @@ export default function SecurityPage() {
                   onChange={(event) => {
                     setOauthForm((prev) => ({ ...prev, displayName: event.target.value }));
                     if (oauthErrors.displayName) {
-                      setOauthErrors((prev) => ({ ...prev, displayName: undefined }));
+                      setOauthErrors(({ displayName, ...rest }) => rest);
                     }
                   }}
                 />
@@ -487,7 +487,7 @@ export default function SecurityPage() {
                   onChange={(event) => {
                     setOauthForm((prev) => ({ ...prev, clientId: event.target.value }));
                     if (oauthErrors.clientId) {
-                      setOauthErrors((prev) => ({ ...prev, clientId: undefined }));
+                      setOauthErrors(({ clientId, ...rest }) => rest);
                     }
                   }}
                 />
@@ -504,7 +504,7 @@ export default function SecurityPage() {
                   onChange={(event) => {
                     setOauthForm((prev) => ({ ...prev, clientSecret: event.target.value }));
                     if (oauthErrors.clientSecret) {
-                      setOauthErrors((prev) => ({ ...prev, clientSecret: undefined }));
+                      setOauthErrors(({ clientSecret, ...rest }) => rest);
                     }
                   }}
                 />

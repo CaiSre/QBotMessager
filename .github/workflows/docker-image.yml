@@ -13,9 +13,107 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  BUN_VERSION: "1.4.5"
 
 jobs:
+  # 质量门禁：Rust 与前端检查全绿才允许出镜像
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: rootpw
+          MYSQL_DATABASE: qbot_test_auth
+          MYSQL_USER: qbotmessager
+          MYSQL_PASSWORD: testpw
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -prootpw"
+          --health-interval=10s --health-timeout=5s --health-retries=12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # 每个集成测试套件使用独立数据库，避免全局表（设置、队列、引导）互相干扰。
+      - name: Prepare test databases
+        run: |
+          mysql -h 127.0.0.1 -uroot -prootpw -e "
+            CREATE DATABASE IF NOT EXISTS qbot_test_admin CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+            CREATE DATABASE IF NOT EXISTS qbot_test_webhook CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+            CREATE DATABASE IF NOT EXISTS qbot_test_bootstrap CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+            GRANT ALL PRIVILEGES ON qbot_test_admin.* TO 'qbotmessager'@'%';
+            GRANT ALL PRIVILEGES ON qbot_test_webhook.* TO 'qbotmessager'@'%';
+            GRANT ALL PRIVILEGES ON qbot_test_bootstrap.* TO 'qbotmessager'@'%';
+            FLUSH PRIVILEGES;"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Rust format
+        working-directory: backend
+        run: cargo fmt --all --check
+
+      - name: Rust clippy
+        working-directory: backend
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Rust test (unit)
+        working-directory: backend
+        run: cargo test --lib --all-features
+
+      - name: Rust test (auth)
+        working-directory: backend
+        env:
+          MYSQL_URL: mysql://qbotmessager:testpw@127.0.0.1:3306/qbot_test_auth
+        run: cargo test --test auth_it --all-features
+
+      - name: Rust test (admin)
+        working-directory: backend
+        env:
+          MYSQL_URL: mysql://qbotmessager:testpw@127.0.0.1:3306/qbot_test_admin
+        run: cargo test --test admin_it --all-features
+
+      - name: Rust test (webhook)
+        working-directory: backend
+        env:
+          MYSQL_URL: mysql://qbotmessager:testpw@127.0.0.1:3306/qbot_test_webhook
+        run: cargo test --test webhook_it --all-features
+
+      - name: Rust test (bootstrap)
+        working-directory: backend
+        env:
+          MYSQL_URL: mysql://qbotmessager:testpw@127.0.0.1:3306/qbot_test_bootstrap
+        run: cargo test --test bootstrap_it --all-features
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Frontend install
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Frontend typecheck
+        working-directory: web
+        run: bun run typecheck
+
+      - name: Frontend build
+        working-directory: web
+        run: bun run build
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -1,9 +1,6 @@
-.venv/
-__pycache__/
-*.py[cod]
-.pytest_cache/
 .env
 
 # 前端构建产物与依赖
 web/node_modules/
 web/.next/
+web/out/

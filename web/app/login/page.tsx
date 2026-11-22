@@ -96,7 +96,7 @@ export default function LoginPage() {
                     onChange={(event) => {
                       setAccount(event.target.value);
                       if (fieldErrors.account) {
-                        setFieldErrors((prev) => ({ ...prev, account: undefined }));
+                        setFieldErrors(({ account, ...rest }) => rest);
                       }
                     }}
                   />
@@ -121,7 +121,7 @@ export default function LoginPage() {
                     onChange={(event) => {
                       setPassword(event.target.value);
                       if (fieldErrors.password) {
-                        setFieldErrors((prev) => ({ ...prev, password: undefined }));
+                        setFieldErrors(({ password, ...rest }) => rest);
                       }
                     }}
                   />

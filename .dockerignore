@@ -1,18 +1,15 @@
 .git
 .gitignore
-.venv
-.pytest_cache
-__pycache__
-*.py[cod]
 .env
 .env.*
 !.env.example
 
-tests
-
 web/node_modules
 web/.next
+web/out
 web/AGENTS.md
+
+backend/target
 
 data
 Dockerfile

@@ -92,6 +92,14 @@ const MSG_TYPES: Record<Platform, MsgTypeDef[]> = {
 
 const PLATFORMS: Platform[] = ["dingtalk", "wecom", "feishu"];
 
+// GitHub 不参与调试页，其消息类型列表为空；兜底常量保证取默认类型时不会越界。
+const FALLBACK_MSG_TYPE: MsgTypeDef = { value: "text", label: "文本 text" };
+
+/** 取该平台的默认消息类型（各平台列表的首项）。 */
+function defaultMsgType(platform: Platform): MsgTypeDef {
+  return MSG_TYPES[platform].at(0) ?? FALLBACK_MSG_TYPE;
+}
+
 const TARGET_OPTIONS = [
   { value: "default", label: "机器人默认目标" },
   { value: "group", label: "指定群 group_openid" },
@@ -212,17 +220,17 @@ export default function DebugPage() {
     setPlatform(first.platform);
     setChannelId(String(first.id));
     setToken(first.webhook_token);
-    setMsgType(MSG_TYPES[first.platform][0].value);
+    setMsgType(defaultMsgType(first.platform).value);
   }, [channelList]);
 
   const platformChannels = channelList.filter((item) => item.platform === platform);
   const typeDef =
-    MSG_TYPES[platform].find((item) => item.value === msgType) ?? MSG_TYPES[platform][0];
+    MSG_TYPES[platform].find((item) => item.value === msgType) ?? defaultMsgType(platform);
 
   function changePlatform(next: Platform) {
     setPlatform(next);
     if (!MSG_TYPES[next].some((item) => item.value === msgType)) {
-      setMsgType(MSG_TYPES[next][0].value);
+      setMsgType(defaultMsgType(next).value);
     }
     setChannelId("");
     setResult(null);
@@ -235,7 +243,7 @@ export default function DebugPage() {
     if (!channel) return;
     setPlatform(channel.platform);
     if (!MSG_TYPES[channel.platform].some((item) => item.value === msgType)) {
-      setMsgType(MSG_TYPES[channel.platform][0].value);
+      setMsgType(defaultMsgType(channel.platform).value);
     }
     setToken(channel.webhook_token);
     setResult(null);

@@ -51,11 +51,15 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
   try {
     response = await fetch(path, {
       method,
-      headers: hasBody ? { "Content-Type": "application/json" } : undefined,
-      body: hasBody ? JSON.stringify(body) : undefined,
       credentials: "include",
       cache: "no-store",
       signal: controller.signal,
+      ...(hasBody
+        ? {
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          }
+        : {}),
     });
     text = await response.text();
   } catch (error) {

@@ -507,7 +507,7 @@ export default function BotsPage() {
                   value={botForm.name}
                   onChange={(event) => {
                     setBotForm((prev) => ({ ...prev, name: event.target.value }));
-                    if (botErrors.name) setBotErrors((prev) => ({ ...prev, name: undefined }));
+                    if (botErrors.name) setBotErrors(({ name, ...rest }) => rest);
                   }}
                 />
                 <FieldError>{botErrors.name}</FieldError>
@@ -520,7 +520,7 @@ export default function BotsPage() {
                   value={botForm.appid}
                   onChange={(event) => {
                     setBotForm((prev) => ({ ...prev, appid: event.target.value }));
-                    if (botErrors.appid) setBotErrors((prev) => ({ ...prev, appid: undefined }));
+                    if (botErrors.appid) setBotErrors(({ appid, ...rest }) => rest);
                   }}
                 />
                 <FieldError>{botErrors.appid}</FieldError>
@@ -536,7 +536,7 @@ export default function BotsPage() {
                   value={botForm.secret}
                   onChange={(event) => {
                     setBotForm((prev) => ({ ...prev, secret: event.target.value }));
-                    if (botErrors.secret) setBotErrors((prev) => ({ ...prev, secret: undefined }));
+                    if (botErrors.secret) setBotErrors(({ secret, ...rest }) => rest);
                   }}
                 />
                 <FieldDescription>密钥加密后入库，页面只显示掩码。</FieldDescription>

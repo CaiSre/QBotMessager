@@ -25,8 +25,9 @@ services:
     build:
       context: .
       args:
-        PYPI_MIRROR: ${PYPI_MIRROR:-https://pypi.org/simple}
-        NPM_MIRROR: ${NPM_MIRROR:-https://registry.npmjs.org}
+        ALPINE_VERSION: ${ALPINE_VERSION:-3.24}
+        BUN_VERSION: ${BUN_VERSION:-1.4.5}
+        RUST_VERSION: ${RUST_VERSION:-1.100}
     restart: unless-stopped
     depends_on:
       db:
@@ -34,12 +35,11 @@ services:
     env_file:
       - .env
     environment:
-      MYSQL_URL: mysql+asyncmy://qbotmessager:${MYSQL_PASSWORD}@db:3306/qbotmessager
-      # 默认使用容器内随镜像启动的 Redis；也可指向外部实例
-      REDIS_URL: ${REDIS_URL:-redis://127.0.0.1:6379}
+      # sqlx 的 MySQL URL 协议前缀是 mysql://（不再是 Python 的 mysql+asyncmy://）
+      MYSQL_URL: mysql://qbotmessager:${MYSQL_PASSWORD}@db:3306/qbotmessager
     ports:
       - "${APP_PORT:-3000}:3000"
-    # 与 supervisord 的 stopwaitsecs 对齐，让 worker 把当前任务跑完
+    # 与 worker 的优雅退出时间对齐，让队列里的任务跑完
     stop_grace_period: 30s
 
 volumes:

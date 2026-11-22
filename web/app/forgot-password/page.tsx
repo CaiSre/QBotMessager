@@ -133,7 +133,7 @@ export default function ForgotPasswordPage() {
                     onChange={(event) => {
                       setEmail(event.target.value);
                       if (fieldErrors.email) {
-                        setFieldErrors((prev) => ({ ...prev, email: undefined }));
+                        setFieldErrors(({ email, ...rest }) => rest);
                       }
                     }}
                   />
@@ -148,7 +148,7 @@ export default function ForgotPasswordPage() {
                   onChange={(value) => {
                     setCode(value);
                     if (fieldErrors.code) {
-                      setFieldErrors((prev) => ({ ...prev, code: undefined }));
+                      setFieldErrors(({ code, ...rest }) => rest);
                     }
                   }}
                   onSend={() => void sendCode()}
@@ -168,7 +168,7 @@ export default function ForgotPasswordPage() {
                     onChange={(event) => {
                       setPassword(event.target.value);
                       if (fieldErrors.password) {
-                        setFieldErrors((prev) => ({ ...prev, password: undefined }));
+                        setFieldErrors(({ password, ...rest }) => rest);
                       }
                     }}
                   />
@@ -185,7 +185,7 @@ export default function ForgotPasswordPage() {
                     onChange={(event) => {
                       setConfirm(event.target.value);
                       if (fieldErrors.password) {
-                        setFieldErrors((prev) => ({ ...prev, password: undefined }));
+                        setFieldErrors(({ password, ...rest }) => rest);
                       }
                     }}
                   />

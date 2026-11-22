@@ -108,7 +108,7 @@ export default function RegisterPage() {
                     onChange={(event) => {
                       setInviteCode(event.target.value);
                       if (fieldErrors.inviteCode) {
-                        setFieldErrors((prev) => ({ ...prev, inviteCode: undefined }));
+                        setFieldErrors(({ inviteCode, ...rest }) => rest);
                       }
                     }}
                   />
@@ -126,7 +126,7 @@ export default function RegisterPage() {
                     onChange={(event) => {
                       setEmail(event.target.value);
                       if (fieldErrors.email) {
-                        setFieldErrors((prev) => ({ ...prev, email: undefined }));
+                        setFieldErrors(({ email, ...rest }) => rest);
                       }
                     }}
                   />
@@ -185,7 +185,7 @@ export default function RegisterPage() {
                     onChange={(event) => {
                       setPassword(event.target.value);
                       if (fieldErrors.password) {
-                        setFieldErrors((prev) => ({ ...prev, password: undefined }));
+                        setFieldErrors(({ password, ...rest }) => rest);
                       }
                     }}
                   />
