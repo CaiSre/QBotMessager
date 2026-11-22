@@ -280,6 +280,23 @@ pub mod users {
         Ok(result.rows_affected())
     }
 
+    /// 锁定全部启用的超管行（按 id 序）并返回 id；须在事务内使用。
+    /// 降级检查前的取锁集步骤：并发降级事务按同一顺序竞争同一行集，
+    /// 后来者在第一个事务提交、锁释放后重新评估计数。
+    pub async fn active_super_admin_ids_for_update<'e, E>(
+        executor: E,
+    ) -> Result<Vec<i64>, sqlx::Error>
+    where
+        E: Executor<'e, Database = MySql>,
+    {
+        sqlx::query_scalar(
+            "SELECT id FROM users WHERE role = 'super_admin' AND status = 'active' \
+             ORDER BY id FOR UPDATE",
+        )
+        .fetch_all(executor)
+        .await
+    }
+
     /// 除指定账号外仍然启用的超级管理员数量。
     pub async fn count_other_active_super_admins<'e, E>(
         executor: E,

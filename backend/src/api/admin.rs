@@ -1398,11 +1398,8 @@ async fn create_oauth_provider(
         return Err(AppError::conflict("提供方已存在"));
     }
 
-    let email_verified = if preset {
-        data.email_verified.unwrap_or(true)
-    } else {
-        data.email_verified.unwrap_or(false)
-    };
+    // GitHub 预置不再隐式信任邮箱；自动账号关联只认授权响应里的逐响应 verified。
+    let email_verified = data.email_verified.unwrap_or(false);
     let encrypted = encrypt_secret(&data.client_secret, state.config.app_secret_key.as_deref());
     let now = Utc::now().naive_utc();
     let ip = state.client_ip(&req);
@@ -1464,17 +1461,18 @@ async fn patch_oauth_provider(
     };
     let data = body.into_inner();
 
-    for value in [
-        data.authorization_url.as_deref(),
-        data.token_url.as_deref(),
-        data.userinfo_url.as_deref(),
+    for (field, value) in [
+        ("authorization_url", data.authorization_url.as_deref()),
+        ("token_url", data.token_url.as_deref()),
+        ("userinfo_url", data.userinfo_url.as_deref()),
     ]
     .into_iter()
-    .flatten()
+    .filter_map(|(field, value)| value.map(|value| (field, value)))
     {
-        if !value.is_empty() {
-            require_https(value)?;
+        if value.is_empty() {
+            return Err(AppError::bad_request(format!("{field} 不能为空")));
         }
+        require_https(value)?;
     }
 
     let mut fields: Vec<&'static str> = Vec::new();
@@ -1656,6 +1654,10 @@ fn require_https(value: &str) -> Result<(), AppError> {
 
 // --------------------------------------------------------------------- 系统设置
 
+/// 系统设置 PATCH 的串行化闸门：persist 与 apply 合并为同一临界区，
+/// 避免并发 PATCH 交叉写入后数据库与内存缓存不一致。
+static SETTINGS_PATCH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// `GET /api/admin/settings`
 async fn get_settings(
     req: HttpRequest,
@@ -1688,9 +1690,21 @@ async fn patch_settings(
         return Ok(HttpResponse::Ok().json(settings_payload(&runtime)));
     }
 
+    // persist 成功即数据库已正确；随后无论审计成败都要更新缓存，
+    // 保证库与缓存一致优先，审计属旁路（失败只记日志）。
+    let _gate = SETTINGS_PATCH_GATE.lock().await;
     {
         let runtime = state.settings().clone();
         runtime.persist(&state.pool, &values).await?;
+    }
+
+    {
+        let mut runtime = state
+            .runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.apply(&values);
+        runtime.apply_side_effects(&state.limiters, &state.login_limiter);
     }
 
     let mut detail = serde_json::Map::new();
@@ -1703,7 +1717,7 @@ async fn patch_settings(
         detail.insert(key.clone(), Value::String(rendered));
     }
     let ip = state.client_ip(&req);
-    audit::record_audit(
+    if let Err(err) = audit::record_audit(
         &state.pool,
         AuditEntry {
             actor_user_id: Some(actor.id),
@@ -1714,15 +1728,9 @@ async fn patch_settings(
             ip: ip.as_deref(),
         },
     )
-    .await?;
-
+    .await
     {
-        let mut runtime = state
-            .runtime
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        runtime.apply(&values);
-        runtime.apply_side_effects(&state.limiters, &state.login_limiter);
+        tracing::warn!(error = %err, "写入系统设置审计日志失败");
     }
 
     let runtime = state.settings();
@@ -1903,6 +1911,11 @@ fn timezone_offset(zone: &str, at: i64) -> i32 {
                 return offset;
             }
         }
+        // 低频路径，接受每次请求重复告警；非法或缺失的 zone 影响统计口径，需可见。
+        tracing::warn!(
+            zone = name,
+            "业务时区缺少 tzdata 文件，统计回退到容器本地时区"
+        );
     }
     local_offset()
 }

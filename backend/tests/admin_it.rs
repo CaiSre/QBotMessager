@@ -1595,6 +1595,18 @@ async fn oauth_provider_crud_and_secret_masking() {
         "提供方 URL 必须为 https（本地开发可用 localhost）"
     );
 
+    // PATCH 传空串同样是非法值，不得把已有 https URL 清空落库。
+    let empty_patch = send!(
+        app,
+        patch_json_with(
+            &format!("/api/admin/oauth-providers/{provider_id}"),
+            &json!({"authorization_url": ""}),
+            &auth
+        )
+    );
+    let empty_patch = assert_status!(empty_patch, StatusCode::BAD_REQUEST);
+    assert_eq!(empty_patch.detail(), "authorization_url 不能为空");
+
     let missing = send!(
         app,
         patch_json_with(
@@ -1632,7 +1644,7 @@ async fn oauth_provider_crud_and_secret_masking() {
 }
 
 #[actix_web::test]
-async fn oauth_github_preset_trusts_email() {
+async fn oauth_github_preset_defaults_unverified_email() {
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1688,7 +1700,7 @@ async fn oauth_github_preset_trusts_email() {
         .iter()
         .find(|row| row["key"] == json!("github"))
         .unwrap();
-    assert_eq!(github_row["email_verified"], json!(true));
+    assert_eq!(github_row["email_verified"], json!(false));
     assert_eq!(
         github_row["authorization_url"],
         json!("https://github.com/login/oauth/authorize")
@@ -2148,4 +2160,88 @@ async fn stats_today_follows_timezone_and_trend() {
     let all = assert_status!(all, StatusCode::OK).json();
     assert_eq!(all["scope"], json!("all"));
     assert!(all["today"]["total"].as_i64().unwrap() >= 2);
+}
+
+// --------------------------------------------------------------------------- 超管保护
+
+/// 两个超管并发互踢（A 降 B、B 降 A）时，事务先锁全部启用超管行再评估
+/// 「除目标外还有超管」，两个事务在同行集上串行：先提交者胜出，后者基于
+/// 已提交的新状态重新评估而拒绝，系统始终保留一个启用超管。
+#[tokio::test]
+async fn concurrent_super_admin_demotion_keeps_one_admin() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+
+    // 清空残留超管构造封闭世界；本套件各测试均自建管理员，不受影响。
+    sqlx::query("UPDATE users SET role = ? WHERE role = ?")
+        .bind(ROLE_USER)
+        .bind(ROLE_SUPER_ADMIN)
+        .execute(&fixture.pool)
+        .await
+        .expect("清空残留超管失败");
+
+    let account_a = make_account(
+        &fixture,
+        "kick-a",
+        Some(PASSWORD),
+        ROLE_SUPER_ADMIN,
+        STATUS_ACTIVE,
+    )
+    .await;
+    let account_b = make_account(
+        &fixture,
+        "kick-b",
+        Some(PASSWORD),
+        ROLE_SUPER_ADMIN,
+        STATUS_ACTIVE,
+    )
+    .await;
+    let admin_a = queries::users::find_by_id(&fixture.pool, account_a.id)
+        .await
+        .expect("查询超管 A 失败")
+        .expect("超管 A 缺失");
+    let admin_b = queries::users::find_by_id(&fixture.pool, account_b.id)
+        .await
+        .expect("查询超管 B 失败")
+        .expect("超管 B 缺失");
+
+    // A 降 B，B 降 A：审查发现的互踢并发。任一事务提交前，双方各自都能
+    // 观察到「除目标外还有另一个超管」，无条件 UPDATE 将双双通过。
+    let mut joins = Vec::new();
+    for (actor, target_id) in [
+        (admin_a.clone(), account_b.id),
+        (admin_b.clone(), account_a.id),
+    ] {
+        let pool = fixture.pool.clone();
+        joins.push(tokio::spawn(async move {
+            qbotmessager::services::users::admin_update_user(
+                &pool,
+                &actor,
+                target_id,
+                qbotmessager::services::users::AdminUserPatch {
+                    role: Some(ROLE_USER),
+                    status: None,
+                    name: None,
+                },
+                None,
+            )
+            .await
+        }));
+    }
+    let mut succeeded = 0usize;
+    for join in joins {
+        if join.await.expect("降级任务 panic").is_ok() {
+            succeeded += 1;
+        }
+    }
+
+    let active_super: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM users WHERE role = ? AND status = ?")
+            .bind(ROLE_SUPER_ADMIN)
+            .bind(STATUS_ACTIVE)
+            .fetch_all(&fixture.pool)
+            .await
+            .expect("查询超管失败");
+    assert_eq!(active_super.len(), 1, "互踢后必须仍有一个启用超管");
+    assert_eq!(succeeded, 1, "两个并发降级至多一个成功");
 }

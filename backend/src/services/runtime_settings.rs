@@ -788,12 +788,13 @@ impl RuntimeSettings {
         Ok(values)
     }
 
-    /// 把校验过的值写入待提交事务之外（每项独立 upsert，调用方负责错误处理）。
+    /// 把校验过的值整批写进一个事务，任一项失败全部回滚。
     pub async fn persist(
         &self,
         pool: &MySqlPool,
         values: &BTreeMap<String, SettingValue>,
     ) -> Result<(), AppError> {
+        let mut tx = pool.begin().await?;
         let now = Utc::now().naive_utc();
         for (key, value) in values {
             let Some(item) = spec(key) else {
@@ -810,9 +811,10 @@ impl RuntimeSettings {
             .bind(stored)
             .bind(now)
             .bind(now)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
