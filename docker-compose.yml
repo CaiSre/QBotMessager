@@ -35,7 +35,6 @@ services:
     env_file:
       - .env
     environment:
-      # sqlx 的 MySQL URL 协议前缀是 mysql://（不再是 Python 的 mysql+asyncmy://）
       MYSQL_URL: mysql://qbotmessager:${MYSQL_PASSWORD}@db:3306/qbotmessager
     ports:
       - "${APP_PORT:-3000}:3000"

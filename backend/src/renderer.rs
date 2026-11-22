@@ -4,7 +4,7 @@
 //! - msg_type=0 纯文本（content），msg_type=2 Markdown（markdown.content）
 //! - 两者互斥：传 markdown 时 content 必须为空字符串
 //!
-//! 语义与 Python `server/renderer.py` 一致。
+//! 统一消息 → 目标平台文案渲染。
 
 use serde::Serialize;
 

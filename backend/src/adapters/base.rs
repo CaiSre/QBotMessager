@@ -70,3 +70,26 @@ pub trait Adapter: Send + Sync {
     /// 解析原始负载。
     fn parse(&self, payload: &Value, event: &str) -> Result<UnifiedMessage, AdapterError>;
 }
+
+/// 把 JSON 值渲染为展示用文本：字符串原样、其余按 JSON 字面量。
+///
+/// 布尔与 null 在提及列表 / 标题编号里极少出现，渲染成 `true` / `null`
+/// 是合理降级，保持与 JSON 负载一致的文本形式。
+pub fn value_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// JSON 值是否非空（字符串看长度，数组和对象看元素数）。
+pub fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+    }
+}

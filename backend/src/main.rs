@@ -1,6 +1,6 @@
 //! QBotMessager 二进制入口。
 //!
-//! 启动顺序（规格书 9）：dotenvy → tracing（读 `RUST_LOG`）→ 安装 rustls ring
+//! 启动顺序：dotenvy → tracing（读 `RUST_LOG`）→ 安装 rustls ring
 //! provider → `Config::from_env` → MySQL 连接池 → `sqlx::migrate!` → 运行期设置
 //! → `AppState` → Actix 绑定 `0.0.0.0:${PORT:-3000}` → SIGTERM/SIGINT 优雅关停。
 //!

@@ -3,7 +3,7 @@
 //! Webhook 只做校验与入队后立即确认，实际发送由 worker 按频控节奏完成；
 //! 队列不可用时上层降级为同步发送（GitHub 不重投，始终走同步回退）。
 //!
-//! 幂等守卫（原 Redis `saq:sent:{key}`）改为 MySQL 表 `sent_guards`：
+//! 幂等守卫落在 MySQL 表 `sent_guards`：
 //! - key = `{request_id}:{target_label}`；
 //! - TTL 900s；用 `INSERT IGNORE` 判首次；读取失败按「未发送」处理；
 //! - worker 内定时任务清理过期行。
@@ -194,7 +194,7 @@ impl SentGuard {
 
     /// 该目标是否已经在上一轮发送成功。
     ///
-    /// 与 Redis `EXISTS` 一致：过期行即使尚未被清理也视为未发送。
+    /// 过期行即使尚未被清理也视为未发送。
     pub async fn done(&self, guard_key: &str) -> Result<bool, AppError> {
         let row: Option<(NaiveDateTime,)> =
             sqlx::query_as("SELECT expires_at FROM sent_guards WHERE guard_key = ?")
@@ -208,7 +208,7 @@ impl SentGuard {
     pub async fn mark(&self, guard_key: &str) -> Result<(), AppError> {
         let now = Utc::now().naive_utc();
         let expires_at = guard_expiry(now, self.ttl_seconds);
-        // Redis `SET ... EX` 会刷新 TTL；重复标记（例如读取标记失败后的重发）同样刷新过期时间。
+        // 重复标记（例如读取标记失败后的重发）会刷新 TTL。
         sqlx::query(
             "INSERT INTO sent_guards (guard_key, expires_at, created_at) VALUES (?, ?, ?) \
              ON DUPLICATE KEY UPDATE expires_at = VALUES(expires_at)",
@@ -244,7 +244,7 @@ fn guard_expiry(now: NaiveDateTime, ttl_seconds: u64) -> NaiveDateTime {
 
 /// 计算可放进 `jobs.idempotency_key`（`varchar(36)`）的去重键。
 ///
-/// 规格书原始形态是 `push:<sha256(platform:delivery_id)>`（Redis 无长度限制）；
+/// 语义为 `push:<sha256(platform:delivery_id)>`；
 /// MySQL 列只有 36 字符，这里保留完整 SHA-256 的语义，取十六进制摘要前 36 位。
 /// 无 delivery_id 时退化为 `sha256("push:" + request_id)`。
 pub fn dedupe_key(platform: &str, delivery_id: Option<&str>, request_id: &str) -> String {
@@ -320,7 +320,7 @@ mod tests {
             expires_at,
             at(0) + ChronoDuration::seconds(899)
         ));
-        // 到期即失效（Redis EXPIRE 语义：不包含过期时刻）
+        // 到期即失效（不含过期时刻本身）
         assert!(!guard_valid(expires_at, expires_at));
         assert!(!guard_valid(
             expires_at,

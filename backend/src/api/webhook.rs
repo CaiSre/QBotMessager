@@ -1,10 +1,10 @@
 //! Webhook 接收端点（`/webhook`）。
 //!
-//! 负责的端点清单（规格书 5.2）：
+//! 端点清单：
 //! - `POST /webhook/{platform}` —— `platform ∈ {dingtalk,wecom,feishu,github}`
 //! - `POST /webhook/github/{token}` —— GitHub 专用（token 在路径）
 //!
-//! 行为与旧实现 `server/api/webhook.py` 逐项对齐：请求体上限、token 提取顺序、
+//! 行为要点：请求体上限、token 提取顺序、
 //! GitHub 签名校验、平台响应体形状、队列优先与同步降级。
 
 use actix_web::http::StatusCode;
@@ -343,7 +343,7 @@ async fn receive(
 
 // ------------------------------------------------------------------ 辅助函数
 
-/// 平台响应体（规格书 6.9）。
+/// 平台响应体。
 fn platform_response(
     platform: &str,
     status: StatusCode,

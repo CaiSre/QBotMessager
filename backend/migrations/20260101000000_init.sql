@@ -1,12 +1,8 @@
--- 初始 schema：12 张表，与 Alembic head（0005_user_name_unique）完全一致。
+-- 初始 schema：13 张表。
 --
--- 写法说明：全部使用 CREATE TABLE IF NOT EXISTS，索引与唯一约束**内联**在建表语句里。
--- 理由：同一份迁移既能用于空库全量建表，也能用于已有 Alembic 建好的线上库
--- （表已存在 → 跳过，内联索引不会重复执行），无需任何基线打标 hack。
--- 索引不能单独 CREATE INDEX：MySQL 不支持 CREATE INDEX IF NOT EXISTS。
---
--- 外键约束名沿用 Alembic 命名约定 fk_<table>_<column>_<referred_table>，
--- 避免与存量库的约束名冲突。
+-- 写法说明：全部使用 CREATE TABLE IF NOT EXISTS，索引与唯一约束**内联**在建表语句里
+-- （MySQL 不支持 CREATE INDEX IF NOT EXISTS，因此索引随建表原子创建）。
+-- 外键约束名统一 fk_<table>_<column>_<referred_table>。
 
 CREATE TABLE IF NOT EXISTS users (
   id BIGINT NOT NULL AUTO_INCREMENT,
@@ -200,4 +196,20 @@ CREATE TABLE IF NOT EXISTS system_settings (
   updated_at DATETIME NOT NULL,
   created_at DATETIME NOT NULL,
   PRIMARY KEY (`key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 幂等守卫表。
+--
+-- 键 = {request_id}:{target_label}，target_label ∈ group:{group_openid} / user:{openid}；
+-- 用 INSERT IGNORE 判首次，读取失败按「未发送」处理；
+-- 过期行由 worker 内的定时任务清理。
+
+CREATE TABLE IF NOT EXISTS sent_guards (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  guard_key VARCHAR(255) NOT NULL,
+  expires_at DATETIME NOT NULL,
+  created_at DATETIME NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_sent_guards_guard_key (guard_key),
+  KEY ix_sent_guards_expires (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

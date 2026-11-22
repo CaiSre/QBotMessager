@@ -1,6 +1,6 @@
 //! 管理端端点（`/api/admin`）。
 //!
-//! 端点清单（规格书 5.2）：
+//! 端点清单：
 //! - `GET/POST   /api/admin/bot-profiles`；`PATCH/DELETE /api/admin/bot-profiles/{id}`
 //! - `GET/POST   /api/admin/channels`；`PATCH/DELETE /api/admin/channels/{id}`；
 //!   `POST /api/admin/channels/{id}/rotate`
@@ -13,7 +13,7 @@
 //! - `GET/PATCH  /api/admin/settings`
 //! - `GET  /api/admin/stats`
 //!
-//! 权限与响应字段严格对齐旧实现 `server/api/admin.py`：普通登录用户只能管理
+//! 权限边界：普通登录用户只能管理
 //! 自己的机器人与通道、查看自己的日志与统计；用户、邀请码、OAuth 提供方与系统
 //! 设置仅超级管理员可用。
 
@@ -54,7 +54,7 @@ const BOT_SECRET_MAX: usize = 512;
 /// 用户名上限。
 const USER_NAME_MAX: usize = 128;
 
-/// GitHub OAuth 预设值（与 `server/auth/oauth.py` 的 `GITHUB_PRESET` 一致）。
+/// GitHub OAuth 预设值。
 const GITHUB_PRESET_AUTHORIZATION_URL: &str = "https://github.com/login/oauth/authorize";
 const GITHUB_PRESET_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_PRESET_USERINFO_URL: &str = "https://api.github.com/user";
@@ -321,7 +321,7 @@ async fn require_user(state: &AppState, req: &HttpRequest) -> Result<User, AppEr
     }
 }
 
-/// 按字符数校验长度上限（Pydantic 语义）。
+/// 按字符数校验长度上限。
 fn ensure_max_length(label: &str, value: &str, max: usize) -> Result<(), AppError> {
     if value.chars().count() > max {
         return Err(AppError::validation(format!("{label}最长 {max} 个字符")));
@@ -448,7 +448,7 @@ async fn audit_tx(
     .await
 }
 
-/// 时间戳的 Python `isoformat()` 等价形式。
+/// RFC 3339 时间戳（整秒省略小数部分）。
 fn isoformat(value: NaiveDateTime) -> String {
     if value.and_utc().timestamp_subsec_micros() == 0 {
         value.format("%Y-%m-%dT%H:%M:%S").to_string()
@@ -470,7 +470,7 @@ fn json_openids(value: &Value) -> Value {
     }
 }
 
-/// JSON 值的 Python 真值语义（用于 `has_secret`）。
+/// JSON 值是否视为配置了密钥（用于 `has_secret`）。
 fn json_truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -1729,7 +1729,7 @@ async fn patch_settings(
     Ok(HttpResponse::Ok().json(settings_payload(&runtime)))
 }
 
-/// 管理端设置视图（`kind` 使用 Python 端的 `"string"` 拼写）。
+/// 管理端设置视图（`kind` 沿用前端契约的 `"string"` 拼写）。
 fn settings_payload(runtime: &RuntimeSettings) -> Value {
     let groups: Vec<Value> = runtime
         .describe_groups()
@@ -1769,7 +1769,7 @@ fn settings_payload(runtime: &RuntimeSettings) -> Value {
     })
 }
 
-/// 与 Python `Settings.register_enabled` 的环境变量默认值一致。
+/// 未显式设置时关闭注册，与系统设置目录的默认值一致。
 fn register_env_default() -> bool {
     std::env::var("REGISTER_ENABLED")
         .map(|raw| {

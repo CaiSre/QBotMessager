@@ -1,6 +1,6 @@
 //! 系统设置：非敏感运行配置持久化到数据库，并通过内存缓存即时生效。
 //!
-//! 与 Python `server/services/runtime_settings.py` 语义一致：
+//! 运行期系统设置（库表持久化 + 环境变量首启导入）：
 //! - 30 项设置以 `system_settings` 表为准；
 //! - 启动时若库中缺少某项，而同名环境变量的值与默认值不同，则**一次性**写入库
 //!   （来源标记 `environment`），此后运行期只读数据库；
@@ -158,7 +158,7 @@ pub enum SettingSource {
 }
 
 impl SettingSource {
-    /// 与 Python 端一致的来源字符串。
+    /// 来源标识字符串。
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
@@ -669,7 +669,7 @@ impl RuntimeSettings {
     /// 读取库内设置；缺失项把环境变量中的非默认值一次性落库。
     ///
     /// 数据库读取或落库失败时返回错误；单个值非法或密文损坏只告警并退回默认值，
-    /// 与 Python 端一致，避免一项坏数据拖垮整个服务。
+    /// 单项坏数据只告警并回退默认值，避免拖垮整个服务。
     pub async fn load(&mut self, pool: &MySqlPool) -> Result<(), AppError> {
         self.reset_to_defaults();
 
@@ -1125,7 +1125,7 @@ impl RuntimeSettings {
     }
 }
 
-/// 判断文本是否表示真（与 Python 的 `_TRUE_VALUES` 一致）。
+/// 判断文本是否表示真。
 fn truthy(raw: &str) -> bool {
     matches!(
         raw.trim().to_ascii_lowercase().as_str(),

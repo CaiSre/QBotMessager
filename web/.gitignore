@@ -1,2 +1,4 @@
 # 静态导出产物（next build 生成的 HTML/静态资源）
 /out/
+# tsc 增量缓存
+tsconfig.tsbuildinfo

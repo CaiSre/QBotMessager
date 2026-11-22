@@ -2,7 +2,7 @@
 //!
 //! QQ 主动消息频控是账号级（按机器人 AppID）的，因此必须单 worker、单副本运行。
 //!
-//! 语义与 Python `server/services/throttle.py` 一致：
+//! 频控（内存令牌桶）：
 //! - `RateLimiter`：只有记账在锁内完成，等待在锁外进行；
 //! - `AttemptLimiter`：回环或空 IP 只计 `(来源, 账号)` 维度。
 

@@ -1,6 +1,6 @@
 //! 敏感字段的落库加密（Fernet）。
 //!
-//! 与 Python `server/db/crypto.py` 语义一致：
+//!
 //! - `APP_SECRET_KEY` 缺失时降级为明文存储（带 `plain1:` 前缀）；
 //! - 密文带 `enc1:` 前缀；
 //! - 解密结果不得写回 ORM 实体，否则会把明文写回库。
@@ -12,7 +12,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::Rng;
 use thiserror::Error;
 
-/// 生成 `secrets.token_urlsafe(n)` 等价 token（`n` 为随机字节数）。
+/// 生成 `bytes` 字节的 urlsafe-base64 随机 token（无填充）。
 pub fn random_token(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
     rand::rng().fill_bytes(&mut buffer);
@@ -55,7 +55,7 @@ fn build_fernet(key: &str) -> Option<fernet::Fernet> {
 /// 加密敏感字段。
 ///
 /// `key` 为 `None`（未配置 `APP_SECRET_KEY`）时降级为带 `plain1:` 前缀的明文；
-/// 空串保持为空（与 Python 实现一致，避免写入无意义的密文）。
+/// 空串保持为空（避免写入无意义的密文）。
 ///
 /// 密钥格式非法时记录错误日志并同样降级为明文：正常流程下
 /// [`crate::config::Config::from_env`] 已在启动时校验过密钥。
@@ -130,23 +130,22 @@ pub fn mask_secret(value: &str) -> String {
 mod tests {
     use super::*;
 
-    // 由 Python `cryptography.fernet` 生成：Fernet(base64.urlsafe_b64encode(bytes(range(32))))
-    const PY_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
-    const PY_TOKEN: &str = "gAAAAABrAl8u3rbx89t5ksepnGbmqOyv4aIsVCeknGw1n4Hg8FZ2YUDrOCt-CJmdeQO4QuzpYPrgkiYkhBCL2wj626LmzA6CcCRqrb3XekMs_vYnGMJFW80=";
-    const PY_PLAIN: &str = "qbotmessager-secret-probe";
-
-    #[test]
-    fn decrypts_python_generated_ciphertext() {
-        // 跨语言互操作：Rust 必须能解开 Python cryptography.fernet 生成的密文。
-        let stored = format!("{ENC_PREFIX}{PY_TOKEN}");
-        assert_eq!(decrypt_secret(&stored, Some(PY_KEY)).unwrap(), PY_PLAIN);
+    /// 生成一个合法 Fernet 密钥（44 字符 urlsafe-base64，含填充），仅测试用。
+    fn make_key(seed: u8) -> String {
+        let raw = [seed; 32];
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE.encode(raw)
     }
 
     #[test]
     fn round_trip_with_key() {
-        let stored = encrypt_secret("s3cret", Some(PY_KEY));
-        assert!(is_encrypted(&stored));
-        assert_eq!(decrypt_secret(&stored, Some(PY_KEY)).unwrap(), "s3cret");
+        let key = make_key(0x11);
+        let stored = encrypt_secret("s3cret", Some(key.as_str()));
+        assert!(is_encrypted(stored.as_str()));
+        assert_eq!(
+            decrypt_secret(&stored, Some(key.as_str())).unwrap(),
+            "s3cret"
+        );
     }
 
     #[test]
@@ -159,13 +158,15 @@ mod tests {
 
     #[test]
     fn empty_stays_empty() {
-        assert_eq!(encrypt_secret("", Some(PY_KEY)), "");
-        assert_eq!(decrypt_secret("", Some(PY_KEY)).unwrap(), "");
+        let key = make_key(0x11);
+        assert_eq!(encrypt_secret("", Some(key.as_str())), "");
+        assert_eq!(decrypt_secret("", Some(key.as_str())).unwrap(), "");
     }
 
     #[test]
     fn encrypted_without_key_is_an_error() {
-        let stored = format!("{ENC_PREFIX}{PY_TOKEN}");
+        let key = make_key(0x11);
+        let stored = encrypt_secret("s3cret", Some(key.as_str()));
         assert_eq!(
             decrypt_secret(&stored, None).unwrap_err(),
             CryptoError::MissingKey
@@ -174,10 +175,11 @@ mod tests {
 
     #[test]
     fn wrong_key_is_an_error() {
-        let stored = format!("{ENC_PREFIX}{PY_TOKEN}");
-        let other_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let key = make_key(0x11);
+        let other = make_key(0x22);
+        let stored = encrypt_secret("s3cret", Some(key.as_str()));
         assert_eq!(
-            decrypt_secret(&stored, Some(other_key)).unwrap_err(),
+            decrypt_secret(&stored, Some(other.as_str())).unwrap_err(),
             CryptoError::DecryptFailed
         );
     }
@@ -196,9 +198,10 @@ mod tests {
 
     #[test]
     fn plain_text_without_prefix_is_returned_as_is() {
+        let key = make_key(0x11);
         assert_eq!(
-            decrypt_secret("legacy-plain", Some(PY_KEY)).unwrap(),
-            "legacy-plain"
+            decrypt_secret("plain-password", Some(key.as_str())).unwrap(),
+            "plain-password"
         );
     }
 

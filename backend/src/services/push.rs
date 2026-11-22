@@ -3,7 +3,7 @@
 //! Webhook（队列不可用时的同步回退）与 worker 共用这里的逻辑，
 //! 因此任务所需字段全部放在 [`PushJob`] 里，不依赖请求上下文。
 //!
-//! 与 Python `server/services/push.py` 一致：逐目标串行发送，每个目标发送后立即
+//! 逐目标串行发送，每个目标发送后立即
 //! 用短事务写一条日志；只要有一个目标失败且全部错误都可重试，才允许整体重试。
 
 use std::time::Instant;
@@ -19,7 +19,7 @@ use crate::services::queue::SentGuard;
 use crate::services::runtime_settings::RuntimeSettings;
 use crate::services::throttle::RateLimiter;
 
-/// 内容预览的最大字符数（与 Python `text[:200]` 一致）。
+/// 内容预览的最大字符数。
 const PREVIEW_CHARS: usize = 200;
 
 /// 一次推送任务；字段必须可序列化，便于写入队列交给 worker。

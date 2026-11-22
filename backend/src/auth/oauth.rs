@@ -1,6 +1,6 @@
 //! 通用 OAuth2 授权码流程（GitHub 等）。
 //!
-//! 与 Python `server/auth/oauth.py` + `server/api/auth.py` 的 OAuth 分支保持一致：
+//! OAuth2 授权码流程（提供方走 system 欢迎/管理端配置）：
 //! - state = 24 随机字节 → base64url 无填充（32 字符），纯随机、不编码任何信息；
 //! - 双提交 Cookie：`oauth_state` 与 `oauth_provider`，`Max-Age=600`；
 //! - 回调常量时间比对 state，并要求提供方 Cookie 与路径上的 key 一致；
@@ -32,7 +32,7 @@ pub const COOKIE_MAX_AGE_SECONDS: i64 = 600;
 pub const STATE_BYTES: usize = 24;
 /// GitHub 主邮箱兜底地址。
 pub const GITHUB_EMAILS_URL: &str = "https://api.github.com/user/emails";
-/// OAuth 回调路径前缀（与 Python 路由一致）。
+/// OAuth 回调路径前缀。
 pub const CALLBACK_PATH_PREFIX: &str = "/api/auth/oauth/";
 
 /// OAuth 提供方返回的用户信息（已按配置字段名抽取）。
@@ -57,7 +57,7 @@ pub fn new_state() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// 回调路径：`/api/auth/oauth/{key}/callback`，与 Python 完全一致。
+/// 回调路径：`/api/auth/oauth/{key}/callback`。
 pub fn callback_path(provider_key: &str) -> String {
     format!("{CALLBACK_PATH_PREFIX}{provider_key}/callback")
 }
@@ -73,7 +73,7 @@ pub fn redirect_uri(origin: &str, provider_key: &str) -> String {
 
 /// 构造授权跳转地址。
 ///
-/// 参数顺序与 Python `urlencode` 一致：client_id、redirect_uri、response_type、
+/// 参数顺序：client_id、redirect_uri、response_type、
 /// state，最后才是可选的 scope。
 pub fn build_authorize_url(provider: &OAuthProvider, redirect_uri: &str, state: &str) -> String {
     let mut query = form_urlencoded::Serializer::new(String::new());
@@ -89,7 +89,7 @@ pub fn build_authorize_url(provider: &OAuthProvider, redirect_uri: &str, state: 
 
 /// 常量时间比对 state，并校验提供方 Cookie 与路径 key 一致。
 ///
-/// 返回 `400 OAuth state 校验失败` 与 Python 行为一致。
+/// 返回 `400 OAuth state 校验失败`。
 pub fn validate_state(
     state_param: &str,
     cookie_state: &str,
@@ -374,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_path_and_redirect_uri_match_python() {
+    fn callback_path_and_redirect_uri_follow_contract() {
         assert_eq!(callback_path("github"), "/api/auth/oauth/github/callback");
         assert_eq!(
             redirect_uri("https://example.com/", "github"),
@@ -383,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn authorize_url_matches_python_parameter_order() {
+    fn authorize_url_keeps_parameter_order() {
         let url = build_authorize_url(&provider(), "https://example.com/cb", "st ate");
         assert!(url.starts_with("https://github.com/login/oauth/authorize?"));
         let query = url.split_once('?').unwrap().1;
@@ -401,7 +401,7 @@ mod tests {
                 "scope"
             ]
         );
-        // 与 Python quote_plus 一致：空格编码为 `+`。
+        // form 编码：空格编码为 `+`。
         assert!(query.contains("state=st+ate"));
     }
 }

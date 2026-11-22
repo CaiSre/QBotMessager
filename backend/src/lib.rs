@@ -1,6 +1,5 @@
 //! QBotMessager 后端（Rust + Actix Web）。
 //!
-//! 模块布局见迁移规格书第 1 节。
 
 pub mod adapters;
 pub mod api;

@@ -1,14 +1,15 @@
 //! 飞书自定义机器人负载解析。
 //!
-//! 协议与 `server/adapters/feishu.py` 一一对应；正文中的
-//! `<at user_id="x">名字</at>` 会被解析为提及并替换成 `@名字`。
+//! 正文中的 `<at user_id="x">名字</at>` 会被解析为提及并替换成 `@名字`。
 
 use std::sync::OnceLock;
 
 use regex::{Captures, Regex};
 use serde_json::{Map, Value};
 
-use super::base::{Adapter, AdapterError, Attachment, FMT_MARKDOWN, FMT_TEXT, UnifiedMessage};
+use super::base::{
+    Adapter, AdapterError, Attachment, FMT_MARKDOWN, FMT_TEXT, UnifiedMessage, truthy, value_text,
+};
 
 /// 飞书适配器。
 #[derive(Debug, Default, Clone, Copy)]
@@ -381,28 +382,6 @@ fn first_truthy_str<'a>(map: &'a Map<String, Value>, keys: &[&str]) -> Option<&'
     first_truthy_value(map, keys).and_then(Value::as_str)
 }
 
-fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(flag) => *flag,
-        Value::Number(number) => number.as_f64().is_some_and(|value| value != 0.0),
-        Value::String(text) => !text.is_empty(),
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(map) => !map.is_empty(),
-    }
-}
-
-/// 近似 Python `str(value)`。
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Bool(true) => "True".to_string(),
-        Value::Bool(false) => "False".to_string(),
-        Value::Null => "None".to_string(),
-        other => other.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -427,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn post_renders_zh_cn_paragraphs_like_python() {
+    fn post_renders_zh_cn_paragraphs() {
         let message = parse(json!({
             "msg_type": "post",
             "content": {"post": {"zh_cn": {

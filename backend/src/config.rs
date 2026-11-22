@@ -1,6 +1,6 @@
 //! 运行配置：环境变量 + 可选 `.env`。
 //!
-//! 只包含规格书第 3.1 节「仅来自环境变量」的项；
+//! 只包含「仅来自环境变量」的项；
 //! 其余运行期配置放在数据库 `system_settings` 表里，由运行时设置服务读取。
 
 use std::env;
@@ -164,10 +164,7 @@ fn split_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// 从 `OPENID` 读取 openid 列表。
-///
-/// 兼容 JSON 数组（`["a","b"]`）、Python list 字面量（`['a', 'b']`）与单值写法；
-/// 语义与 `server/config.py` 的 `load_openids` 一致。
+/// 从 `OPENID` 读取 openid 列表：JSON 数组（字符串元素）或逗号分隔单值。
 pub fn load_openids(raw: Option<&str>) -> Vec<String> {
     let Some(raw) = raw else {
         return Vec::new();
@@ -178,52 +175,24 @@ pub fn load_openids(raw: Option<&str>) -> Vec<String> {
     }
 
     if raw.starts_with('[') && raw.ends_with(']') {
-        // JSON 数组（含字符串、布尔、数字元素）。
         if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(raw)
         {
             return items
                 .into_iter()
                 .filter_map(|item| match item {
-                    serde_json::Value::String(text) => {
-                        if text.is_empty() {
-                            None
-                        } else {
-                            Some(text)
-                        }
-                    }
-                    serde_json::Value::Number(number) => Some(number.to_string()),
-                    serde_json::Value::Bool(flag) => Some(flag.to_string()),
+                    serde_json::Value::String(text) if !text.is_empty() => Some(text),
                     _ => None,
                 })
                 .collect();
         }
-        // Python list 字面量：逐项去引号。
-        let inner = &raw[1..raw.len() - 1];
-        return inner
-            .split(',')
-            .map(|item| strip_quotes(item.trim()))
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-            .collect();
+        // 形如数组的输入解析失败时按逗号分隔处理，保留原始文本提示用户纠正格式。
+        return split_list(raw);
     }
 
-    // 单值：可能是裸字符串，也可能是带引号的字符串。
-    let value = strip_quotes(raw);
-    if value.is_empty() {
-        Vec::new()
-    } else {
-        vec![value.to_string()]
+    if raw.contains(',') {
+        return split_list(raw);
     }
-}
-
-/// 去掉两端成对的单引号或双引号。
-fn strip_quotes(value: &str) -> &str {
-    for quote in ['"', '\''] {
-        if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
-            return &value[1..value.len() - 1];
-        }
-    }
-    value
+    vec![raw.to_string()]
 }
 
 #[cfg(test)]
@@ -239,18 +208,24 @@ mod tests {
     }
 
     #[test]
-    fn openids_accept_python_literal() {
+    fn openids_accept_comma_separated() {
         assert_eq!(
-            load_openids(Some("['openid1', 'openid2']")),
+            load_openids(Some("openid1, openid2")),
             vec!["openid1", "openid2"]
+        );
+    }
+
+    #[test]
+    fn openids_invalid_array_falls_back_to_split() {
+        assert_eq!(
+            load_openids(Some("openid1, openid2]")),
+            vec!["openid1", "openid2]"]
         );
     }
 
     #[test]
     fn openids_accept_single_value() {
         assert_eq!(load_openids(Some("openid1")), vec!["openid1"]);
-        assert_eq!(load_openids(Some("\"openid1\"")), vec!["openid1"]);
-        assert_eq!(load_openids(Some("'openid1'")), vec!["openid1"]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! 静态资源托管 + SPA 回退 + 安全响应头。
 //!
-//! 解析顺序（规格书 7.3 / 8）：原路径 → `{path}.html` → `{path}/index.html` → 404。
+//! 解析顺序：原路径 → `{path}.html` → `{path}/index.html` → 404。
 //! 安全响应头从旧 `web/next.config.ts` 的 `headers()` 原样搬到 Rust 中间件：
 //! `X-Content-Type-Options`、`X-Frame-Options`、`Referrer-Policy`、
 //! `Permissions-Policy`、`Content-Security-Policy`，作用于每个响应。
@@ -18,7 +18,6 @@ use actix_web::{Error, HttpRequest, HttpResponse, web};
 
 use crate::state::AppState;
 
-/// 迁移自 `web/next.config.ts` 的安全响应头。
 ///
 /// 名称必须全小写：`HeaderName::from_static` 只接受小写（HTTP 头名本身大小写不敏感，
 /// HTTP/2 也要求小写）。

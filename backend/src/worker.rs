@@ -2,7 +2,7 @@
 //!
 //! 与 Web 进程共用 [`AppState`]，但必须单进程运行（QQ 频控是机器人账号级）。
 //!
-//! 规格书要点（6.6）：
+//! 设计要点：
 //! - 任务超时 180s、重试 2 次（最多 3 次尝试）、固定 5s 重试间隔；
 //! - 每分钟同步一次库内设置，让频控参数在 worker 内生效；
 //! - 定期清理 `sent_guards` 过期行。
@@ -39,7 +39,7 @@ pub type WorkerData = Data<Arc<AppState>>;
 
 /// 固定间隔重试策略。
 ///
-/// apalis 自带的 [`apalis::layers::retry::RetryPolicy`] 立即重试；规格书要求固定 5 秒，
+/// apalis 自带的 [`apalis::layers::retry::RetryPolicy`] 立即重试；这里固定间隔 5 秒，
 /// 这里用 tower 的 `Policy` 返回一个 sleep future 实现同样的语义。
 #[derive(Debug, Clone)]
 struct FixedDelayRetryPolicy {

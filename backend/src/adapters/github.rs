@@ -1,12 +1,12 @@
 //! GitHub Webhook 负载解析。
 //!
 //! 事件类型来自 `X-GitHub-Event` 请求头而不是负载本身，因此 `parse` 需要 `event`
-//! 参数；协议与 `server/adapters/github.py` 一一对应。常见事件使用专门格式，
+//! 参数。常见事件使用专门格式，
 //! 其余事件走通用格式，保证任何事件类型都会生成消息。
 
 use serde_json::{Map, Value};
 
-use super::base::{Adapter, AdapterError, FMT_MARKDOWN, UnifiedMessage};
+use super::base::{Adapter, AdapterError, FMT_MARKDOWN, UnifiedMessage, truthy, value_text};
 
 /// 推送事件最多展示的提交数。
 const PUSH_COMMIT_LIMIT: usize = 5;
@@ -71,7 +71,7 @@ const WORKFLOW_STATUS: &[(&str, &str)] = &[
     ("completed", "已完成"),
 ];
 
-/// 通用事件的动作文案（等价于 Python 三个动作表合并后再补充的 `_ACTION_LABELS`）。
+/// 通用事件的动作文案（GitHub 事件负载中 action 字段的中文标签）。
 const EXTRA_ACTION_LABELS: &[(&str, &str)] = &[
     ("created", "创建"),
     ("deleted", "删除"),
@@ -187,7 +187,7 @@ const EVENT_LABELS: &[(&str, &str)] = &[
     ("workflow_run", "工作流运行"),
 ];
 
-/// 通用格式从负载中提取可读主体与链接的候选字段（顺序与 Python 一致）。
+/// 通用格式从负载中提取可读主体与链接的候选字段（按展示优先级排序）。
 const SUBJECT_FIELDS: &[(&str, &[&str])] = &[
     ("pull_request", &["title"]),
     ("issue", &["title"]),
@@ -836,28 +836,6 @@ fn first_truthy_str<'a>(map: Option<&'a Map<String, Value>>, keys: &[&str]) -> O
         .filter_map(|key| map.get(*key))
         .find(|value| truthy(value))
         .and_then(Value::as_str)
-}
-
-fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(flag) => *flag,
-        Value::Number(number) => number.as_f64().is_some_and(|value| value != 0.0),
-        Value::String(text) => !text.is_empty(),
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(map) => !map.is_empty(),
-    }
-}
-
-/// 近似 Python `str(value)`，用于标题里的数字编号。
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Bool(true) => "True".to_string(),
-        Value::Bool(false) => "False".to_string(),
-        Value::Null => "None".to_string(),
-        other => other.to_string(),
-    }
 }
 
 fn take_chars(text: &str, limit: usize) -> String {

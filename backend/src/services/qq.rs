@@ -1,6 +1,6 @@
 //! QQ 机器人 HTTP 客户端：token 缓存、消息发送、错误分类与重试。
 //!
-//! 语义与 Python `server/services/qq.py` 一致：
+//! QQ 机器人 API 客户端：
 //! - token 按 `bot:<id>` 缓存，提前 60 秒刷新，每个 key 独立锁 + 双检；
 //! - HTTP 401 清缓存并重试一次；
 //! - 错误码提取顺序 `code` → `err_code` → `errcode`，都没有时用 `http_{status}`；
@@ -358,7 +358,7 @@ impl QqClient {
     }
 }
 
-/// `expires_in` 秒数；缺失、为零或非法时回退 7200（与 Python `or 7200` 一致）。
+/// `expires_in` 秒数；缺失、为零或非法时回退 7200。
 fn token_ttl(data: &Value) -> i64 {
     let seconds = match data.get("expires_in") {
         Some(Value::Number(number)) => number
@@ -400,7 +400,7 @@ fn retry_after_value(raw: Option<&str>) -> Option<f64> {
 
 /// 提取平台错误码；顺序 `code` → `err_code` → `errcode`。
 ///
-/// Python 端用真值判断决定是否回退到 `http_{status}`，这里保持一致：
+/// 接口返回非字符串消息时回退到 `http_{status}`：
 /// `null`、`0`、空串与空容器都视为没有错误码。
 fn extract_code(body: &Value) -> Option<String> {
     for key in ["code", "err_code", "errcode"] {

@@ -38,7 +38,7 @@ pub fn hash_password(password: &str) -> Result<String, AppError> {
 
 /// 用给定 salt 与轮数生成密码哈希。
 ///
-/// 固定 salt 的变体只用于测试与迁移（需要复现历史哈希）。
+/// 固定 salt 与轮数的变体，仅测试使用（生成确定性哈希）。
 pub fn hash_password_with(password: &str, salt: &[u8], rounds: u32) -> String {
     let mut digest = [0u8; DIGEST_LEN];
     pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, rounds, &mut digest);
@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_format_matches_python() {
+    fn stored_format_is_pbkdf2_sha256_django_style() {
         let stored = hash_password_with("s3cret", b"0123456789abcdef", 600_000);
         let re = Regex::new(r"^pbkdf2_sha256\$\d+\$[A-Za-z0-9+/]+=*\$[A-Za-z0-9+/]+=*$").unwrap();
         assert!(re.is_match(&stored), "{stored}");

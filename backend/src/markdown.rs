@@ -3,7 +3,7 @@
 //! QQ 的 Markdown 支持标题、加粗/斜体、链接、列表、引用、分割线、行内代码，
 //! 不支持颜色、表格与 HTML 标签；这里只输出最小公共子集，避免整条消息静默失效。
 //!
-//! 语义与 Python `server/markdown.py` 一一对应（含截断后缀的长度语义）。
+//! 语义按字符计数；超长内容截断并追加固定后缀。
 
 use std::sync::OnceLock;
 
@@ -183,29 +183,21 @@ pub fn sanitize_text(text: &str, max_len: Option<usize>) -> String {
     truncate(content, max_len)
 }
 
-/// 超长时截断并追加固定后缀。
+/// 超长时截断并追加固定后缀，保证最终输出不超过 `max_len` 字符。
 ///
-/// 截断点为 `max_len - 后缀长度`；与 Python 一致，
-/// 当 `max_len` 小于后缀长度时按 Python 的负数切片语义处理。
+/// 设置目录已把 `markdown_max_len` / `text_max_len` 限制在至少 1；
+/// 后缀长度远小于该下限，此处按 `saturating_sub` 处理即可。
 fn truncate(content: &str, max_len: Option<usize>) -> String {
     let Some(max_len) = max_len else {
         return content.to_string();
     };
-    if max_len == 0 {
-        return content.to_string();
-    }
     let chars: Vec<char> = content.chars().collect();
     if chars.len() <= max_len {
         return content.to_string();
     }
     let suffix_len = TRUNCATION_SUFFIX.chars().count();
-    let cut = max_len as isize - suffix_len as isize;
-    let end = if cut < 0 {
-        (chars.len() as isize + cut).max(0) as usize
-    } else {
-        cut as usize
-    };
-    let mut out: String = chars[..end.min(chars.len())].iter().collect();
+    let end = max_len.saturating_sub(suffix_len).min(chars.len());
+    let mut out: String = chars[..end].iter().collect();
     out.push_str(TRUNCATION_SUFFIX);
     out
 }
@@ -242,6 +234,13 @@ mod tests {
         let cleaned = sanitize_markdown(&"a".repeat(100), Some(20));
         assert!(cleaned.ends_with("（内容过长已截断）"));
         assert_eq!(cleaned.chars().count(), 20);
+    }
+
+    #[test]
+    fn tiny_limit_still_emits_suffix() {
+        // 设置目录的长度下限是 1：此时保留后缀本身，不再模拟负数切片。
+        let cleaned = sanitize_markdown("内容", Some(1));
+        assert!(cleaned.ends_with(TRUNCATION_SUFFIX));
     }
 
     #[test]

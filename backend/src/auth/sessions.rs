@@ -1,6 +1,6 @@
 //! 服务端会话：Cookie 只保存随机 token，数据库只保存其 SHA-256。
 //!
-//! 兼容约束（规格书 6.3）：
+//! 会话 Cookie 约定：
 //! - token = 32 随机字节 → base64url 无填充（43 字符）；
 //! - 库内 `sessions.token_hash` = `SHA-256(token)` 的 64 位小写十六进制；
 //! - Cookie：`HttpOnly; SameSite=Lax; Path=/; Max-Age=ttl*3600`，
@@ -81,7 +81,7 @@ pub async fn create_session(
     let token = new_session_token();
     let now = Utc::now().naive_utc();
     let expires_at = now + ChronoDuration::hours(ttl_hours);
-    // 与 Python 一致：UA 按字符截断到 255，空串落库为 NULL。
+    // UA 按字符截断到 255，空串落库为 NULL。
     let user_agent = user_agent
         .map(|value| value.chars().take(USER_AGENT_MAX).collect::<String>())
         .filter(|value| !value.is_empty());

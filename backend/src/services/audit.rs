@@ -1,6 +1,6 @@
 //! 后台写操作审计。
 //!
-//! 写入语义与 Python `server/services/audit.py` 一致：
+//! 写入语义：
 //! `actor` 为空表示系统操作，`target_id` 统一转成字符串，`detail` 存 JSON。
 //!
 //! 查询按 `id` 倒序分页，支持动作、操作者、目标、关键词与时间区间过滤；

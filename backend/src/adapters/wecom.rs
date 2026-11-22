@@ -1,7 +1,6 @@
 //! 企业微信「消息推送」负载解析。
 //!
-//! 协议与 `server/adapters/wecom.py` 一一对应；正文中的 `<@all>` / `<@userid>`
-//! 会被解析为提及并从正文移除。
+//! 正文中的 `<@all>` / `<@userid>` 会被解析为提及并从正文移除。
 
 use std::sync::OnceLock;
 
@@ -10,7 +9,9 @@ use serde_json::{Map, Value};
 
 use crate::markdown::degrade_tables;
 
-use super::base::{Adapter, AdapterError, Attachment, FMT_MARKDOWN, FMT_TEXT, UnifiedMessage};
+use super::base::{
+    Adapter, AdapterError, Attachment, FMT_MARKDOWN, FMT_TEXT, UnifiedMessage, truthy, value_text,
+};
 
 /// 企业微信适配器。
 #[derive(Debug, Default, Clone, Copy)]
@@ -336,28 +337,6 @@ fn first_truthy<'a>(map: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Va
         .find(|value| truthy(value))
 }
 
-fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(flag) => *flag,
-        Value::Number(number) => number.as_f64().is_some_and(|value| value != 0.0),
-        Value::String(text) => !text.is_empty(),
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(map) => !map.is_empty(),
-    }
-}
-
-/// 近似 Python `str(value)`，用于提及列表。
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Bool(true) => "True".to_string(),
-        Value::Bool(false) => "False".to_string(),
-        Value::Null => "None".to_string(),
-        other => other.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -404,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_v2_degrades_tables_like_python() {
+    fn markdown_v2_degrades_tables() {
         let message = parse(json!({
             "type": "markdown_v2",
             "markdown_v2": {"content": "|指标|值|\n|---|:---:|\n|磁盘|90%|"}

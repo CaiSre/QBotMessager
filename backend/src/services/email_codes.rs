@@ -3,7 +3,7 @@
 //! 验证码只保存 PBKDF2 哈希；同一邮箱同一用途同时只有最新一条有效，
 //! 过期、尝试次数用尽或校验成功后立即作废。
 //!
-//! 语义与 Python `server/services/email_codes.py` 一致：冷却与小时配额超限都映射为
+//! 冷却与小时配额超限都映射为
 //! 429（带 `Retry-After`），由 [`crate::error::AppError::rate_limited`] 统一表达。
 
 use chrono::{Duration, NaiveDateTime, Utc};
@@ -209,7 +209,7 @@ pub async fn discard_latest(pool: &MySqlPool, email: &str, purpose: &str) -> Res
 
 /// 距离可以再次发送还需等待的秒数；`<= 0` 表示已经可以发送。
 ///
-/// 与 Python 的 `int(total_seconds())` 一致：向零截断，不足 1 秒按 0 处理。
+/// 向零截断，不足 1 秒按 0 处理。
 fn too_frequent_wait(created_at: NaiveDateTime, now: NaiveDateTime, resend_seconds: u64) -> i64 {
     let resend_seconds = i64::try_from(resend_seconds).unwrap_or(i64::MAX);
     (created_at + Duration::seconds(resend_seconds) - now).num_seconds()
@@ -240,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn purpose_labels_match_python() {
+    fn purpose_labels_are_chinese() {
         assert_eq!(purpose_label(PURPOSE_REGISTER), "注册账号");
         assert_eq!(purpose_label(PURPOSE_RESET_PASSWORD), "重置密码");
         assert_eq!(purpose_label(PURPOSE_SET_PASSWORD), "设置登录密码");
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn max_attempts_matches_python() {
+    fn max_attempts_is_five() {
         assert_eq!(MAX_ATTEMPTS, 5);
     }
 }

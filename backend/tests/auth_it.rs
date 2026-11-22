@@ -1,15 +1,16 @@
 //! 认证相关集成测试。
 //!
-//! 移植自旧 pytest 套件：
-//! - `tests/test_auth_api.py`（登录/注册/邀请码/权限/限速/会话）
-//! - `tests/test_account_api.py`（个人中心改名/改邮箱/改密）
-//! - `tests/test_email_codes_api.py`（邮箱验证码、密码重置、SMTP 密文）
-//! - `tests/test_oauth_api.py`（OAuth state、state 校验、邮箱可信度、密钥不落明文）
+//! 覆盖范围：登录 / 注册 / 邀请码 / 限速 / 会话管理、个人中心（改名、改邮箱、
+//! 改密）、邮箱验证码与密码重置（SMTP 密文）、OAuth state 流转与邮箱可信度、
+//! Passkey 注册与断言。
 //!
 //! 驱动方式：`actix_web::test::init_service` + `TestRequest`，数据库为真实 MySQL。
-//! 进程内只执行一次 `sqlx::migrate!`（`tokio::sync::OnceCell`），并用全局互斥锁
-//! 串行化测试：`system_settings` 与登录失败计数都是进程级/全局状态，测试之间
-//! 不能并行改写。测试数据全部带随机前缀，避免互相干扰。
+//! 进程内只执行一次 `sqlx::migrate!`，用全局互斥锁串行化测试：`system_settings`
+//! 与登录失败计数是进程级/全局状态，测试之间不能并行改写；测试数据全部带
+//! 随机前缀，避免互相干扰。
+//!
+//! Passkey 登录用 p256 产生真实 ES256 签名（`passkey_login_succeeds_with_real_signature`），
+//! 注册走测试构造的 attestation 对象。
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -438,7 +439,6 @@ fn find_setting<'a>(payload: &'a Value, key: &str) -> &'a Value {
 
 #[actix_web::test]
 async fn requires_login() {
-    // 移植 test_auth_api.py::test_requires_login
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -457,7 +457,6 @@ async fn requires_login() {
 
 #[actix_web::test]
 async fn login_and_logout() {
-    // 移植 test_auth_api.py::test_login_logout
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -509,7 +508,6 @@ async fn login_and_logout() {
 
 #[actix_web::test]
 async fn login_by_username_and_rejects_bad_credentials() {
-    // 移植 test_auth_api.py::test_login_by_username
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -568,7 +566,6 @@ async fn login_by_username_and_rejects_bad_credentials() {
 
 #[actix_web::test]
 async fn login_rate_limit_and_reset_after_success() {
-    // 移植 test_auth_api.py::test_login_rate_limit 与 test_success_clears_counter
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -615,7 +612,6 @@ async fn login_rate_limit_and_reset_after_success() {
 
 #[actix_web::test]
 async fn secure_cookie_on_https() {
-    // 移植 test_auth_api.py::test_secure_cookie_on_https
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -704,7 +700,6 @@ async fn session_expiry_and_revocation() {
 
 #[actix_web::test]
 async fn register_disabled_by_default() {
-    // 移植 test_auth_api.py::test_register_disabled_by_default
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -746,7 +741,6 @@ async fn register_disabled_by_default() {
 
 #[actix_web::test]
 async fn register_with_invite_creates_user_scope_session() {
-    // 移植 test_auth_api.py::test_register_with_invite
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -792,7 +786,6 @@ async fn register_with_invite_creates_user_scope_session() {
 
 #[actix_web::test]
 async fn register_duplicate_username_case_insensitive() {
-    // 移植 test_auth_api.py::test_register_duplicate_username
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -828,7 +821,6 @@ async fn register_duplicate_username_case_insensitive() {
 
 #[actix_web::test]
 async fn register_generates_unique_default_name() {
-    // 移植 test_auth_api.py::test_register_unique_default_username
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -875,7 +867,6 @@ async fn register_generates_unique_default_name() {
 
 #[actix_web::test]
 async fn invite_edge_cases() {
-    // 移植 test_auth_api.py::test_expired_invite 等边界用例
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -952,7 +943,6 @@ async fn invite_edge_cases() {
 
 #[actix_web::test]
 async fn invite_max_uses_is_atomic_under_concurrency() {
-    // 移植 test_auth_api.py::test_invite_max_uses_concurrency
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1019,7 +1009,6 @@ async fn invite_max_uses_is_atomic_under_concurrency() {
 
 #[actix_web::test]
 async fn database_unique_username_index() {
-    // 移植 test_auth_api.py::test_db_unique_username
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let name = format!("{}-Uniq", fixture.prefix);
@@ -1064,7 +1053,6 @@ async fn database_unique_username_index() {
 
 #[actix_web::test]
 async fn cross_user_resource_isolation() {
-    // 移植 test_auth_api.py::test_cross_user_resource_isolation
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1123,7 +1111,6 @@ async fn cross_user_resource_isolation() {
 
 #[actix_web::test]
 async fn admin_rename_conflict_and_self_protection() {
-    // 移植 test_auth_api.py::test_admin_rename_conflict /
     // test_super_admin_cannot_change_own_role_or_status
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
@@ -1170,7 +1157,6 @@ async fn admin_rename_conflict_and_self_protection() {
 
 #[actix_web::test]
 async fn profile_name_update() {
-    // 移植 test_account_api.py::test_update_name
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1213,7 +1199,6 @@ async fn profile_name_update() {
 
 #[actix_web::test]
 async fn profile_name_conflict_case_insensitive() {
-    // 移植 test_account_api.py::test_update_name_conflict
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1247,7 +1232,6 @@ async fn profile_name_conflict_case_insensitive() {
 
 #[actix_web::test]
 async fn profile_email_update_requires_password() {
-    // 移植 test_account_api.py::test_update_email / test_email_conflict
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1340,7 +1324,6 @@ async fn profile_email_update_requires_password() {
 
 #[actix_web::test]
 async fn profile_password_change_revokes_other_sessions() {
-    // 移植 test_account_api.py::test_change_password
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1431,7 +1414,6 @@ async fn profile_password_change_revokes_other_sessions() {
 
 #[actix_web::test]
 async fn oauth_account_sets_password_without_current() {
-    // 移植 test_account_api.py::test_oauth_account_set_password
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1468,7 +1450,6 @@ async fn oauth_account_sets_password_without_current() {
 
 #[actix_web::test]
 async fn oauth_account_sets_password_requires_code_when_mail_configured() {
-    // 移植 test_email_codes_api.py::test_oauth_account_set_password_requires_code
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1516,7 +1497,6 @@ async fn oauth_account_sets_password_requires_code_when_mail_configured() {
 
 #[actix_web::test]
 async fn mail_unconfigured_providers_and_errors() {
-    // 移植 test_email_codes_api.py::test_smtp_unconfigured
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1590,7 +1570,6 @@ async fn mail_unconfigured_providers_and_errors() {
 
 #[actix_web::test]
 async fn smtp_password_is_encrypted_and_audited() {
-    // 移植 test_email_codes_api.py::test_smtp_password_encrypted
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1655,7 +1634,6 @@ async fn smtp_password_is_encrypted_and_audited() {
 
 #[actix_web::test]
 async fn register_requires_email_code_when_mail_configured() {
-    // 移植 test_email_codes_api.py::test_register_requires_email_code
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1732,7 +1710,6 @@ async fn register_requires_email_code_when_mail_configured() {
 
 #[actix_web::test]
 async fn email_code_resend_cooldown_and_hourly_quota() {
-    // 移植 test_email_codes_api.py::test_email_code_cooldown
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1837,7 +1814,6 @@ async fn email_code_resend_cooldown_and_hourly_quota() {
 
 #[actix_web::test]
 async fn password_reset_with_email_code() {
-    // 移植 test_email_codes_api.py::test_reset_password_with_code
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -2099,7 +2075,6 @@ async fn oauth_state_cookie_validation() {
 
 #[actix_web::test]
 async fn oauth_login_keeps_secret_encrypted_and_uses_plaintext() {
-    // 移植 test_oauth_api.py::test_client_secret_stays_encrypted
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -2208,7 +2183,6 @@ async fn oauth_login_keeps_secret_encrypted_and_uses_plaintext() {
 
 #[actix_web::test]
 async fn oauth_untrusted_email_cannot_take_over_account() {
-    // 移植 test_oauth_api.py::test_untrusted_provider_cannot_take_over
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -2280,7 +2254,6 @@ async fn oauth_untrusted_email_cannot_take_over_account() {
 
 #[actix_web::test]
 async fn oauth_trusted_email_links_existing_account() {
-    // 移植 test_oauth_api.py::test_trusted_provider_links_account
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -2365,7 +2338,6 @@ async fn oauth_trusted_email_links_existing_account() {
 
 #[actix_web::test]
 async fn oauth_github_preset_defaults_email_verified() {
-    // 移植 test_oauth_api.py::test_github_preset_email_verified
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -2448,7 +2420,6 @@ async fn oauth_github_preset_defaults_email_verified() {
 
 #[actix_web::test]
 async fn oauth_login_does_not_break_password_login() {
-    // 移植 test_oauth_api.py::test_admin_password_still_works
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -2628,6 +2599,65 @@ fn assertion_credential(
     })
 }
 
+/// 用 p256 生成密钥并产生真实 ES256 断言（DER 签名）。
+///
+/// 返回 (COSE 公钥字节, 凭据 JSON)。签名原文 = authenticatorData || SHA256(clientDataJSON)。
+fn signed_assertion_credential(
+    challenge: &str,
+    rp_id: &str,
+    origin: &str,
+    credential_id: &[u8],
+    sign_count: u32,
+    signing_key: &p256::ecdsa::SigningKey,
+) -> (Vec<u8>, Value) {
+    let client_data = json!({
+        "type": "webauthn.get",
+        "challenge": challenge,
+        "origin": origin,
+        "crossOrigin": false,
+    });
+    let client_data_json = serde_json::to_vec(&client_data).unwrap();
+    let mut auth_data = sha256(rp_id.as_bytes());
+    auth_data.push(0x01); // UP
+    auth_data.extend_from_slice(&sign_count.to_be_bytes());
+
+    let client_hash = sha256(&client_data_json);
+    let signature: p256::ecdsa::Signature = {
+        use p256::ecdsa::signature::Signer as _;
+        signing_key.sign(&[auth_data.as_slice(), client_hash.as_slice()].concat())
+    };
+    let der = signature.to_der();
+
+    (
+        cose_from_signing_key(signing_key),
+        json!({
+            "id": b64(credential_id),
+            "rawId": b64(credential_id),
+            "response": {
+                "authenticatorData": b64(&auth_data),
+                "clientDataJSON": b64(&client_data_json),
+                "signature": b64(der.as_bytes()),
+                "userHandle": null,
+            },
+            "type": "public-key",
+        }),
+    )
+}
+
+/// 由 p256 私钥导出 ES256 COSE 公钥 CBOR 字节（kty=2, alg=-7, crv=1, x, y）。
+fn cose_from_signing_key(signing_key: &p256::ecdsa::SigningKey) -> Vec<u8> {
+    let point = signing_key.verifying_key().to_sec1_point(false);
+    let x: &[u8] = &point.as_bytes()[1..33];
+    let y: &[u8] = &point.as_bytes()[33..65];
+    cbor_map(&[
+        (cbor_int(1), cbor_int(2)),  // kty: EC2
+        (cbor_int(3), cbor_int(-7)), // alg: ES256
+        (cbor_int(-1), cbor_int(1)), // crv: P-256
+        (cbor_int(-2), cbor_bytes(x)),
+        (cbor_int(-3), cbor_bytes(y)),
+    ])
+}
+
 async fn insert_passkey(fixture: &Fixture, user_id: i64, credential_id: &[u8], sign_count: i64) {
     sqlx::query(
         "INSERT INTO webauthn_credentials \
@@ -2662,7 +2692,6 @@ macro_rules! passkey_begin_macro {
 
 #[actix_web::test]
 async fn passkey_register_stores_single_device() {
-    // 移植 test_auth_api.py::test_passkey_register_stores_device_type
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -2997,4 +3026,82 @@ async fn passkey_login_rejects_unknown_and_rollback() {
     );
     let reply = assert_status!(reply, StatusCode::BAD_REQUEST);
     assert_eq!(reply.detail(), "登录会话已过期，请重试");
+}
+
+/// Passkey 登录成功全路径：真实 P-256 签名 → 下发会话 → 回写签名计数。
+#[tokio::test]
+async fn passkey_login_succeeds_with_real_signature() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let account = make_account(&fixture, "pkok", Some(PASSWORD), ROLE_USER, STATUS_ACTIVE).await;
+    fixture.configure_webauthn();
+
+    // 生成真实 P-256 密钥并把 COSE 公钥写入凭据表（计数 0：浏览器首登即此状态）。
+    let signing_key =
+        p256::ecdsa::SigningKey::from_slice(&sha256(format!("seed-{}", fixture.prefix).as_bytes()))
+            .expect("构造 P-256 私钥失败");
+    let public_key = cose_from_signing_key(&signing_key);
+    let credential_id = format!("signed-cred-{}", fixture.prefix).into_bytes();
+    sqlx::query(
+        "INSERT INTO webauthn_credentials          (user_id, credential_id, public_key, sign_count, aaguid, transports, device_type,           backed_up, label, last_used_at, created_at)          VALUES (?, ?, ?, 0, '11111111-1111-1111-1111-111111111111', NULL, 'single_device',           FALSE, '测试凭据', NULL, ?)",
+    )
+    .bind(account.id)
+    .bind(&credential_id)
+    .bind(&public_key)
+    .bind(Utc::now().naive_utc())
+    .execute(&fixture.pool)
+    .await
+    .expect("插入签名凭据失败");
+
+    let (begin, challenge, _) = passkey_begin_macro!(app, "/api/auth/passkey/login/begin", &[]);
+    let (_, credential) = signed_assertion_credential(
+        &challenge,
+        "passkey.example",
+        "https://passkey.example",
+        &credential_id,
+        3,
+        &signing_key,
+    );
+    let reply = send!(
+        app,
+        post_json_with(
+            "/api/auth/passkey/login/finish",
+            &json!({"credential": credential}),
+            &[
+                (
+                    "webauthn_challenge",
+                    begin.cookie("webauthn_challenge").unwrap().as_str()
+                ),
+                (
+                    "webauthn_state",
+                    begin.cookie("webauthn_state").unwrap().as_str()
+                ),
+            ]
+        )
+    );
+    let reply = assert_status!(reply, StatusCode::OK);
+    assert_eq!(reply.json(), json!({"ok": true}));
+    let sid = reply.cookie("sid").expect("登录成功必须下发会话");
+    assert!(!sid.is_empty());
+
+    // 会话确实可用。
+    let me = send!(app, get_with("/api/auth/me", &[("sid", sid.as_str())]));
+    let me = assert_status!(me, StatusCode::OK);
+    assert_eq!(me.json()["email"], json!(account.email));
+
+    // 签名计数回写为断言值 3。
+    let stored: (i64,) =
+        sqlx::query_as("SELECT sign_count FROM webauthn_credentials WHERE user_id = ?")
+            .bind(account.id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.0, 3);
+
+    // 临时 Cookie 被清理（Max-Age=0 的删除指令）。
+    for name in ["webauthn_challenge", "webauthn_state"] {
+        let line = reply.raw_cookie(name).expect("成功后应清除临时 Cookie");
+        assert!(line.contains("Max-Age=0"), "Cookie 未被删除：{line}");
+    }
 }

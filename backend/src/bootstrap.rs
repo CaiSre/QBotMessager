@@ -1,6 +1,6 @@
 //! 首次启动引导：初始超级管理员，并把环境变量中的 QQ 凭据导入为默认机器人与通道。
 //!
-//! 迁移自 `server/db/bootstrap.py`，语义保持一致：
+//! 语义：
 //! - `BOOTSTRAP_ADMIN_EMAIL` 与 `BOOTSTRAP_ADMIN_PASSWORD` 同时非空才创建；
 //! - 邮箱已存在时不改密码；仅当系统没有任何启用的超管时把该账号提升为超管；
 //! - 仅当该管理员还没有机器人、且 `QQ_APPID` / `QQ_APP_SECRET` 同时非空时导入机器人

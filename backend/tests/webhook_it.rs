@@ -1,19 +1,15 @@
 //! Webhook / Markdown 渲染 / 消息体转换集成测试。
 //!
-//! 移植自旧 pytest 套件：
-//! - `tests/test_webhook_api.py`（18 个用例）
-//! - `tests/test_markdown.py`（4 个用例）
-//! - `tests/test_renderer.py`（5 个用例）
-//! - `tests/test_adapters.py`（21 个用例）
+//! 覆盖范围：通道鉴权与投递去重、四平台适配器解析、Markdown 清洗与
+//! 渲染降级、推送日志写入与频控。
 //!
 //! 驱动方式：`actix_web::test::init_service` + `TestRequest`，数据库为真实 MySQL。
 //! 出站 QQ 请求改为本进程内的 Actix mock（`127.0.0.1:0`），机器人 `qq_host`
 //! 直接指向 mock，从而不触达真实 QQ 接口。进程内只执行一次 `sqlx::migrate!`，
 //! 并用全局互斥锁串行化数据库 / 运行期设置相关用例；每个用例使用随机前缀。
 //!
-//! 与 pytest 的有意差异：队列去重键在 MySQL `jobs.idempotency_key`（varchar(36)）
-//! 中存为 SHA-256 十六进制前 36 位，而旧实现是 `push:<...>` 前缀（Redis 无长度限制），
-//! 因此队列用例断言 36 位十六进制键而不是 `push:` 前缀。
+//! 队列去重键存于 MySQL `jobs.idempotency_key`（varchar(36)），为 SHA-256
+//! 十六进制的前 36 位。
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -503,7 +499,6 @@ async fn clear_push_jobs(pool: &MySqlPool) {
 
 #[actix_web::test]
 async fn text_pushes_to_default_openid() {
-    // 移植 test_webhook_api.py::test_text_pushes_to_default_openid
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -538,7 +533,6 @@ async fn text_pushes_to_default_openid() {
 
 #[actix_web::test]
 async fn markdown_uses_msg_type_2() {
-    // 移植 test_webhook_api.py::test_markdown_uses_msg_type_2
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -565,7 +559,6 @@ async fn markdown_uses_msg_type_2() {
 
 #[actix_web::test]
 async fn request_target_overrides_default() {
-    // 移植 test_webhook_api.py::test_request_target_overrides_default
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -597,7 +590,6 @@ async fn request_target_overrides_default() {
 
 #[actix_web::test]
 async fn push_logs_recorded() {
-    // 移植 test_webhook_api.py::test_push_logs_recorded
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -636,7 +628,6 @@ async fn push_logs_recorded() {
 
 #[actix_web::test]
 async fn failure_returns_502_and_logs_error() {
-    // 移植 test_webhook_api.py::test_failure_returns_502_and_logs_error
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -677,7 +668,6 @@ async fn failure_returns_502_and_logs_error() {
 
 #[actix_web::test]
 async fn rejects_bad_token_platform_and_body() {
-    // 移植 test_webhook_api.py::test_rejects_bad_token_platform_and_body
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -722,7 +712,6 @@ async fn rejects_bad_token_platform_and_body() {
 
 #[actix_web::test]
 async fn authorization_bearer_token_accepted() {
-    // 移植 test_webhook_api.py::test_authorization_bearer_token_accepted
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -756,7 +745,6 @@ async fn authorization_bearer_token_accepted() {
 
 #[actix_web::test]
 async fn query_token_rejected_by_default() {
-    // 移植 test_webhook_api.py::test_query_token_rejected_by_default
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -778,7 +766,6 @@ async fn query_token_rejected_by_default() {
 
 #[actix_web::test]
 async fn query_token_allowed_when_enabled() {
-    // 移植 test_webhook_api.py::test_query_token_allowed_when_enabled
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -801,7 +788,6 @@ async fn query_token_allowed_when_enabled() {
 
 #[actix_web::test]
 async fn missing_target_returns_400() {
-    // 移植 test_webhook_api.py::test_missing_target_returns_400
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -839,7 +825,6 @@ fn ping_payload() -> Value {
 
 #[actix_web::test]
 async fn github_signed_ping_pushes_and_logs() {
-    // 移植 test_webhook_api.py::test_github_signed_ping_pushes_and_logs
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -872,7 +857,6 @@ async fn github_signed_ping_pushes_and_logs() {
 
 #[actix_web::test]
 async fn github_rejects_missing_or_bad_signature() {
-    // 移植 test_webhook_api.py::test_github_rejects_missing_or_bad_signature
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -909,7 +893,6 @@ async fn github_rejects_missing_or_bad_signature() {
 
 #[actix_web::test]
 async fn github_arbitrary_event_pushes_and_logs() {
-    // 移植 test_webhook_api.py::test_github_arbitrary_event_pushes_and_logs
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -946,7 +929,6 @@ async fn github_arbitrary_event_pushes_and_logs() {
 
 #[actix_web::test]
 async fn github_without_path_token_is_rejected() {
-    // 移植 test_webhook_api.py::test_github_without_path_token_is_rejected
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -966,7 +948,6 @@ async fn github_without_path_token_is_rejected() {
 
 #[actix_web::test]
 async fn github_rotate_replaces_token_and_secret() {
-    // 移植 test_webhook_api.py::test_github_rotate_replaces_token_and_secret
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1025,7 +1006,6 @@ async fn github_rotate_replaces_token_and_secret() {
 
 #[actix_web::test]
 async fn queue_accepts_before_any_send() {
-    // 移植 test_webhook_api.py::test_queue_accepts_before_any_send
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup_with_queue(Some(20)).await;
     clear_push_jobs(&fixture.pool).await;
@@ -1068,7 +1048,6 @@ async fn queue_accepts_before_any_send() {
 
 #[actix_web::test]
 async fn queue_duplicate_delivery_is_acked() {
-    // 移植 test_webhook_api.py::test_queue_duplicate_delivery_is_acked
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup_with_queue(Some(20)).await;
     clear_push_jobs(&fixture.pool).await;
@@ -1113,7 +1092,6 @@ async fn queue_duplicate_delivery_is_acked() {
 
 #[actix_web::test]
 async fn queue_full_asks_sender_to_retry() {
-    // 移植 test_webhook_api.py::test_queue_full_asks_sender_to_retry
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup_with_queue(Some(0)).await;
     let app = app!(fixture.state.clone());
@@ -1202,7 +1180,6 @@ async fn webhook_applies_text_length_limit() {
 
 #[test]
 fn degrades_table_to_list() {
-    // 移植 test_markdown.py::test_degrades_table_to_list
     let content = "指标|值\n|磁盘|90%|\n|CPU|12%|\n";
     assert!(degrade_tables(content).starts_with("指标|值"));
 
@@ -1215,7 +1192,6 @@ fn degrades_table_to_list() {
 
 #[test]
 fn strips_html_and_images() {
-    // 移植 test_markdown.py::test_strips_html_and_images
     let content = "<font color=\"warning\">警告</font>\n![图](https://img.example.com/a.png)";
     let cleaned = sanitize_markdown(content, None);
     assert!(!cleaned.contains("<font"));
@@ -1226,7 +1202,6 @@ fn strips_html_and_images() {
 
 #[test]
 fn truncates_with_suffix() {
-    // 移植 test_markdown.py::test_truncates_with_suffix
     let cleaned = sanitize_markdown(&"a".repeat(100), Some(20));
     assert!(cleaned.ends_with("（内容过长已截断）"));
     assert_eq!(cleaned.chars().count(), 20);
@@ -1234,7 +1209,6 @@ fn truncates_with_suffix() {
 
 #[test]
 fn sanitize_text_removes_control_chars_and_blank_lines() {
-    // 移植 test_markdown.py::test_sanitize_text_removes_control_chars_and_blank_lines
     let raw = "第一行\x00\n\n\n\n第二行\r\n";
     assert_eq!(sanitize_text(raw, None), "第一行\n\n第二行");
 }
@@ -1243,7 +1217,6 @@ fn sanitize_text_removes_control_chars_and_blank_lines() {
 
 #[test]
 fn markdown_message_uses_msg_type_2_with_empty_content() {
-    // 移植 test_renderer.py::test_markdown_message_uses_msg_type_2_with_empty_content
     let payload = render_qq(&UnifiedMessage::markdown("**磁盘** 90%").with_title("告警"));
     assert_eq!(payload.msg_type, MSG_TYPE_MARKDOWN);
     let body = payload.to_dict();
@@ -1257,7 +1230,6 @@ fn markdown_message_uses_msg_type_2_with_empty_content() {
 
 #[test]
 fn text_message_uses_msg_type_0() {
-    // 移植 test_renderer.py::test_text_message_uses_msg_type_0
     let payload = render_qq(&UnifiedMessage::text("内容").with_title("标题"));
     assert_eq!(payload.msg_type, MSG_TYPE_TEXT);
     let body = payload.to_dict();
@@ -1268,21 +1240,18 @@ fn text_message_uses_msg_type_0() {
 
 #[test]
 fn markdown_empty_after_sanitize_falls_back_to_text() {
-    // 移植 test_renderer.py::test_markdown_empty_after_sanitize_falls_back_to_text
     let payload = render_qq(&UnifiedMessage::markdown("<div></div>"));
     assert_eq!(payload.msg_type, MSG_TYPE_TEXT);
 }
 
 #[test]
 fn empty_message_gets_placeholder() {
-    // 移植 test_renderer.py::test_empty_message_gets_placeholder
     let payload = render_qq(&UnifiedMessage::text(""));
     assert_eq!(payload.content, "（消息内容为空）");
 }
 
 #[test]
 fn truncation_limits() {
-    // 移植 test_renderer.py::test_truncation_limits
     let payload = render_qq_with_limits(&UnifiedMessage::markdown("字".repeat(500)), 100, 2000);
     assert!(payload.markdown.is_some());
     assert_eq!(payload.markdown.as_ref().unwrap().chars().count(), 100);
@@ -1328,7 +1297,6 @@ fn assert_ignored(result: Result<UnifiedMessage, AdapterError>) {
 
 #[test]
 fn dingtalk_text_with_mentions() {
-    // 移植 test_adapters.py::test_dingtalk_text_with_mentions
     let message = parse_platform(
         "dingtalk",
         &json!({
@@ -1346,7 +1314,6 @@ fn dingtalk_text_with_mentions() {
 
 #[test]
 fn dingtalk_markdown_keeps_title_separate() {
-    // 移植 test_adapters.py::test_dingtalk_markdown_keeps_title_separate
     let message = parse_platform(
         "dingtalk",
         &json!({
@@ -1365,7 +1332,6 @@ fn dingtalk_markdown_keeps_title_separate() {
 
 #[test]
 fn dingtalk_link_and_action_card() {
-    // 移植 test_adapters.py::test_dingtalk_link_and_action_card
     let link = parse_platform(
         "dingtalk",
         &json!({
@@ -1403,7 +1369,6 @@ fn dingtalk_link_and_action_card() {
 
 #[test]
 fn dingtalk_feed_card_and_unknown_type() {
-    // 移植 test_adapters.py::test_dingtalk_feed_card_and_unknown_type
     let feed = parse_platform(
         "dingtalk",
         &json!({
@@ -1425,7 +1390,6 @@ fn dingtalk_feed_card_and_unknown_type() {
 
 #[test]
 fn wecom_text_strips_mention_tags() {
-    // 移植 test_adapters.py::test_wecom_text_strips_mention_tags
     let message = parse_platform(
         "wecom",
         &json!({
@@ -1450,7 +1414,6 @@ fn wecom_text_strips_mention_tags() {
 
 #[test]
 fn wecom_markdown_v2_degrades_tables() {
-    // 移植 test_adapters.py::test_wecom_markdown_v2_degrades_tables
     let message = parse_platform(
         "wecom",
         &json!({
@@ -1465,7 +1428,6 @@ fn wecom_markdown_v2_degrades_tables() {
 
 #[test]
 fn wecom_news_image_and_template_card() {
-    // 移植 test_adapters.py::test_wecom_news_image_and_template_card
     let news = parse_platform(
         "wecom",
         &json!({
@@ -1508,7 +1470,6 @@ fn wecom_news_image_and_template_card() {
 
 #[test]
 fn wecom_unknown_type() {
-    // 移植 test_adapters.py::test_wecom_unknown_type
     assert_payload_error(parse_platform(
         "wecom",
         &json!({"msgtype": "video", "video": {"media_id": "x"}}),
@@ -1519,7 +1480,6 @@ fn wecom_unknown_type() {
 
 #[test]
 fn feishu_text_replaces_at_tags() {
-    // 移植 test_adapters.py::test_feishu_text_replaces_at_tags
     let message = parse_platform(
         "feishu",
         &json!({"msg_type": "text", "content": {"text": "hi <at user_id=\"ou_1\">张三</at>"}}),
@@ -1532,7 +1492,6 @@ fn feishu_text_replaces_at_tags() {
 
 #[test]
 fn feishu_post_renders_inline_elements() {
-    // 移植 test_adapters.py::test_feishu_post_renders_inline_elements
     let message = parse_platform(
         "feishu",
         &json!({
@@ -1568,7 +1527,6 @@ fn feishu_post_renders_inline_elements() {
 
 #[test]
 fn feishu_interactive_card() {
-    // 移植 test_adapters.py::test_feishu_interactive_card
     let message = parse_platform(
         "feishu",
         &json!({
@@ -1588,7 +1546,6 @@ fn feishu_interactive_card() {
 
 #[test]
 fn feishu_share_chat_and_post_media_tags() {
-    // 移植 test_adapters.py::test_feishu_share_chat_and_post_media_tags
     let share = parse_platform(
         "feishu",
         &json!({"msg_type": "share_chat", "content": {"share_chat_id": "oc_1"}}),
@@ -1621,7 +1578,6 @@ fn feishu_share_chat_and_post_media_tags() {
 
 #[test]
 fn feishu_unknown_type() {
-    // 移植 test_adapters.py::test_feishu_unknown_type
     assert_payload_error(parse_platform(
         "feishu",
         &json!({"msg_type": "audio", "content": {}}),
@@ -1650,7 +1606,6 @@ fn github_payload_with(extra: Value) -> Value {
 
 #[test]
 fn github_ping() {
-    // 移植 test_adapters.py::test_github_ping
     let message = parse_event(
         "github",
         "ping",
@@ -1675,7 +1630,6 @@ fn github_ping() {
 
 #[test]
 fn github_push_lists_commits_and_compare() {
-    // 移植 test_adapters.py::test_github_push_lists_commits_and_compare
     let commits = (0..7)
         .map(|index| {
             json!({
@@ -1709,7 +1663,6 @@ fn github_push_lists_commits_and_compare() {
 
 #[test]
 fn github_push_deleted_branch() {
-    // 移植 test_adapters.py::test_github_push_deleted_branch
     let message = parse_event(
         "github",
         "push",
@@ -1732,7 +1685,6 @@ fn github_push_deleted_branch() {
 
 #[test]
 fn github_pull_request_merged_uses_merger() {
-    // 移植 test_adapters.py::test_github_pull_request_merged_uses_merger
     let message = parse_event(
         "github",
         "pull_request",
@@ -1757,7 +1709,6 @@ fn github_pull_request_merged_uses_merger() {
 
 #[test]
 fn github_issues_and_release() {
-    // 移植 test_adapters.py::test_github_issues_and_release
     let issue = parse_event(
         "github",
         "issues",
@@ -1807,7 +1758,6 @@ fn github_issues_and_release() {
 
 #[test]
 fn github_workflow_run_completed_only() {
-    // 移植 test_adapters.py::test_github_workflow_run_completed_only
     let message = parse_event(
         "github",
         "workflow_run",
@@ -1843,7 +1793,6 @@ fn github_workflow_run_completed_only() {
 
 #[test]
 fn github_workflow_job_status() {
-    // 移植 test_adapters.py::test_github_workflow_job_status
     let message = parse_event(
         "github",
         "workflow_job",
@@ -1889,7 +1838,6 @@ fn github_workflow_job_status() {
 
 #[test]
 fn github_generic_event_and_missing_header() {
-    // 移植 test_adapters.py::test_github_generic_event_and_missing_header
     let message = parse_event(
         "github",
         "deployment",

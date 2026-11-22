@@ -1,10 +1,12 @@
 //! 钉钉自定义机器人负载解析。
 //!
-//! 协议与 `server/adapters/dingtalk.py` 一一对应；@ 信息位于请求体顶层 `at` 对象中。
+//! @ 信息位于请求体顶层 `at` 对象中。
 
 use serde_json::{Map, Value};
 
-use super::base::{Adapter, AdapterError, Attachment, FMT_MARKDOWN, FMT_TEXT, UnifiedMessage};
+use super::base::{
+    Adapter, AdapterError, Attachment, FMT_MARKDOWN, FMT_TEXT, UnifiedMessage, truthy, value_text,
+};
 
 /// 钉钉适配器。
 #[derive(Debug, Default, Clone, Copy)]
@@ -242,28 +244,6 @@ fn first_truthy<'a>(map: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Va
         .find(|value| truthy(value))
 }
 
-fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(flag) => *flag,
-        Value::Number(number) => number.as_f64().is_some_and(|value| value != 0.0),
-        Value::String(text) => !text.is_empty(),
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(map) => !map.is_empty(),
-    }
-}
-
-/// 近似 Python `str(value)`，用于错误信息与提及列表。
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Bool(true) => "True".to_string(),
-        Value::Bool(false) => "False".to_string(),
-        Value::Null => "None".to_string(),
-        other => other.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -275,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn text_appends_mentions_in_python_order() {
+    fn text_appends_mentions_in_payload_order() {
         let message = parse(json!({
             "msgtype": "text",
             "text": {"content": "  磁盘告警  "},

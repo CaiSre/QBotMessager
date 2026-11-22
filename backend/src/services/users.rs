@@ -1,6 +1,6 @@
 //! 账号、登录与个人资料业务逻辑。
 //!
-//! 语义与 Python `server/api/auth.py`、`server/api/admin.py` 保持一致：
+//! 用户注册 / 资料修改 / 密码与凭据校验：
 //! 校验顺序、中文错误信息、HTTP 状态码、唯一性判定（`LOWER(name)`）与事务边界
 //! 都不改变。密码哈希统一走 [`crate::auth::passwords`]（PBKDF2 600000 轮，
 //! 异步变体内部使用 `spawn_blocking`）。
@@ -56,7 +56,7 @@ pub struct AdminUserPatch<'a> {
     pub role: Option<&'a str>,
     /// 状态。
     pub status: Option<&'a str>,
-    /// 用户名（会做 `strip`，允许置空，与 Python 一致）。
+    /// 用户名（会做 `strip`，允许置空）。
     pub name: Option<&'a str>,
 }
 
@@ -71,12 +71,12 @@ pub struct AuthSession {
     pub token: String,
 }
 
-/// 邮箱规范化：去首尾空白并转小写（与 Python `_EmailModel` 一致）。
+/// 邮箱规范化：去首尾空白并转小写。
 pub fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
-/// 邮箱格式校验，等价于 Python 的 `^[^@\s]+@[^@\s]+\.[^@\s]+$`。
+/// 邮箱格式校验：本地部分、域名与 TLD 均不含空白与 `@`。
 pub fn is_valid_email(email: &str) -> bool {
     let mut parts = email.split('@');
     let Some(local) = parts.next() else {
@@ -122,8 +122,7 @@ pub fn validate_password(password: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 校验个人资料里的用户名：先按原始长度对应 Pydantic 的 `max_length`，
-/// 再 `strip` 并要求非空（与 Python `NameIn` 一致）。
+/// 校验个人资料里的用户名：先按原始长度校验上限，再做 `strip` 并要求非空。
 pub fn validate_name(raw: &str) -> Result<String, AppError> {
     if raw.chars().count() > NAME_MAX {
         return Err(AppError::validation(format!(
@@ -144,7 +143,7 @@ pub fn is_super_admin(user: &User) -> bool {
 
 /// 管理端权限校验：先要求账号启用，再要求超级管理员。
 ///
-/// 与 Python 的 `current_user` + `require_super_admin` 组合一致。
+/// 需要超管角色。
 pub fn require_super_admin(actor: &User) -> Result<(), AppError> {
     if actor.status != STATUS_ACTIVE {
         return Err(AppError::forbidden("账号已停用"));
@@ -204,7 +203,7 @@ pub async fn register(
     ip: Option<&str>,
     user_agent: Option<&str>,
 ) -> Result<AuthSession, AppError> {
-    // 与 FastAPI 一样，字段校验先于业务开关检查。
+    // 字段校验先于业务开关检查。
     let email = normalize_email(input.email);
     validate_email(&email)?;
     validate_password(input.password)?;
@@ -311,7 +310,7 @@ pub async fn register(
 
 /// 校验登录凭据；成功时重置该 (IP, 账号) 的失败计数。
 ///
-/// 顺序与 Python 一致：限速检查 → 查账号 → 校验密码 → 检查状态。
+/// 顺序：限速检查 → 查账号 → 校验密码 → 检查状态。
 pub async fn authenticate(
     pool: &MySqlPool,
     limiter: &AttemptLimiter,
@@ -366,7 +365,7 @@ pub async fn authenticate(
         limiter.record_failure(ip, &account);
         return Err(AppError::unauthorized("用户名或密码错误"));
     }
-    // 与 Python 一致：密码正确后才暴露停用状态。
+    // 密码正确后才暴露停用状态，避免账号枚举。
     if user.status != STATUS_ACTIVE {
         return Err(AppError::forbidden("账号已停用"));
     }
@@ -398,7 +397,7 @@ pub async fn list_users(pool: &MySqlPool, actor: &User) -> Result<Vec<User>, App
 
 /// 管理端修改账号：角色、状态、用户名；返回更新后的账号。
 ///
-/// 权限与保护规则与 Python 完全一致：不能修改自己的角色/状态；
+/// 权限与保护规则：不能修改自己的角色/状态；
 /// 降级或停用超级管理员时，系统必须仍保留至少一个启用的超级管理员。
 pub async fn admin_update_user(
     pool: &MySqlPool,
@@ -596,7 +595,7 @@ pub async fn reset_password(
     validate_password(new_password)?;
 
     if !mail::is_configured(settings) {
-        // Python 返回 503「邮件服务未配置」；错误类型里只有 DatabaseBusy 映射 503，
+        // 邮件服务未配置返回 503；错误类型里只有 DatabaseBusy 映射 503，
         // 这里沿用该变体以保证状态码与响应体一致。
         return Err(AppError::database_busy("邮件服务未配置"));
     }
@@ -696,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn email_format_matches_python_regex() {
+    fn email_format_rejects_bad_addresses() {
         for valid in [
             "bob@example.com",
             "a.b+c@sub.example.com",
@@ -722,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_email_reports_python_message() {
+    fn validate_email_reports_chinese_message() {
         assert_eq!(
             validate_email("not-an-email").unwrap_err().detail(),
             "邮箱格式非法"
@@ -741,7 +740,7 @@ mod tests {
         assert!(validate_password(&"x".repeat(PASSWORD_MAX)).is_ok());
         assert!(validate_password("1234567").is_err());
         assert!(validate_password(&"x".repeat(PASSWORD_MAX + 1)).is_err());
-        // 按字符计数，与 Python 的 len(str) 一致
+        // 按字符计数
         assert!(validate_password(&"密".repeat(PASSWORD_MIN)).is_ok());
     }
 

@@ -37,7 +37,7 @@ pub struct AppState {
     pub login_limiter: AttemptLimiter,
     /// 推送队列；`None` 表示未启用，Webhook 走同步发送。
     pub queue: Option<Arc<PushQueue>>,
-    /// 推送幂等守卫（代替原 Redis `saq:sent:*`）。
+    /// 推送幂等守卫
     pub sent_guard: SentGuard,
     /// 版本号，用于 `/healthz` 与 `/readyz`。
     pub version: String,

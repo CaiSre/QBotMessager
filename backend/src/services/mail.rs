@@ -3,7 +3,7 @@
 //! 参数来自运行期系统设置；发送使用 lettre 的异步 tokio 传输，
 //! 不阻塞 actix worker。未填写服务器或发件人时视为未启用。
 //!
-//! 与 Python `server/services/mail.py` 一致：
+//! 邮件发送（lettre SMTP）：
 //! - `security ∈ {starttls, ssl, none}`；
 //! - 仅当 `smtp_username` 非空时登录；
 //! - 未配置时返回 [`MailError::NotConfigured`]（API 层映射为 503「邮件服务未配置」）。
@@ -162,7 +162,7 @@ fn sender(settings: &RuntimeSettings) -> &str {
 
 /// 解析 SMTP 密码。
 ///
-/// 运行期设置缓存里的敏感项通常已是明文；这里按规格书 6.2 的三分支兼容：
+/// 运行期设置缓存里的敏感项通常已是明文；按三分支处理：
 /// `enc1:` 需要主密钥（缓存层已解密，出现密文说明数据来源异常，按发送失败处理）、
 /// `plain1:` 去前缀、其它原样使用。
 fn resolve_password(raw: &str) -> Result<String, MailError> {
@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn render_code_email_matches_python_shape() {
+    fn render_code_email_has_subject_and_code() {
         let (subject, text, html) = render_code_email("123456", "注册账号", 10);
         assert_eq!(subject, "QBotMessager 验证码");
         assert!(text.contains("您的QBotMessager验证码是 123456，10 分钟内有效。"));

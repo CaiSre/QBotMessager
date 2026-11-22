@@ -1,12 +1,11 @@
 //! 数据库行结构体（`sqlx::FromRow`）。
 //!
-//! 12 张表与 `server/db/models.py` 一一对应。
 //! 时间列统一用 `chrono::NaiveDateTime`：MySQL `DATETIME` 无时区，按 UTC 解释。
 
 use chrono::NaiveDateTime;
 use serde_json::Value;
 
-/// 角色与状态取值（与 Python 完全一致）。
+/// 角色与状态取值（数据库枚举字符串）。
 pub const ROLE_SUPER_ADMIN: &str = "super_admin";
 pub const ROLE_USER: &str = "user";
 /// 全部合法角色。
@@ -316,7 +315,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn constants_match_python() {
+    fn constants_are_stable() {
         assert_eq!(ROLE_SUPER_ADMIN, "super_admin");
         assert_eq!(ROLE_USER, "user");
         assert_eq!(STATUS_ACTIVE, "active");

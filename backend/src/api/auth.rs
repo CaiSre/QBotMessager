@@ -1,12 +1,12 @@
 //! 认证相关端点（`/api/auth`）。
 //!
-//! 与旧实现 `server/api/auth.py` 逐字段对齐，包括：
+//! 约定：
 //! - 响应体字段、状态码与中文错误信息；
 //! - 会话 / OAuth / Passkey 的 Cookie 全部通过 [`crate::auth`] 下的子模块构造；
 //! - 登录失败限速复用 [`crate::services::throttle::AttemptLimiter`]；
 //! - 请求体解析失败统一返回 422（400 用于请求体过大），`detail` 为中文。
 //!
-//! 端点清单（规格书 5.2）：
+//! 端点清单：
 //! - `GET  /api/auth/providers`
 //! - `GET  /api/auth/me`
 //! - `PATCH /api/auth/me/name`、`PATCH /api/auth/me/email`、
@@ -77,8 +77,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
 
 // --------------------------------------------------------------------------- 请求体
 //
-// 字段约束与 `server/api/auth.py` 的 Pydantic 模型一致；这里只负责反序列化，
-// 业务校验在各自的辅助函数或 services 中完成（失败返回 422，信息为中文）。
+// 请求体只负责反序列化；业务校验在各自的辅助函数或 services 中完成
+// （失败返回 422，信息为中文）。
 
 /// 登录：账号（用户名或邮箱）与密码。
 #[derive(Debug, Deserialize)]
@@ -144,7 +144,7 @@ struct PasskeyFinishIn {
     credential: Value,
 }
 
-/// OAuth 回调查询参数；缺失时按空串处理，与 FastAPI 默认值一致。
+/// OAuth 回调查询参数；缺失时按空串处理。
 #[derive(Debug, Deserialize)]
 struct OAuthCallbackQuery {
     #[serde(default)]
@@ -155,8 +155,8 @@ struct OAuthCallbackQuery {
 
 /// 请求体解析错误的统一映射。
 ///
-/// Pydantic 的校验失败是 422，这里保持一致；请求体过大映射为 400，
-/// `detail` 一律使用中文，前端 `detailOf()` 只取字符串分支。
+/// 校验失败返回 422；请求体过大映射为 400；`detail` 一律使用中文，
+/// 前端 `detailOf()` 只取字符串分支。
 fn json_config() -> web::JsonConfig {
     web::JsonConfig::default().error_handler(|err, _req| json_payload_error(err).into())
 }
@@ -299,7 +299,7 @@ async fn request_email_code(
     state: web::Data<AppState>,
     body: web::Json<EmailCodeIn>,
 ) -> Result<HttpResponse, AppError> {
-    // 与 FastAPI 一致：请求体校验先于业务开关与邮件配置检查。
+    // 请求体校验先于业务开关与邮件配置检查。
     let email = validate_email_input(&body.email)?;
     validate_email_code_purpose(&body.purpose)?;
 
@@ -576,7 +576,7 @@ async fn oauth_callback(
         return Err(AppError::forbidden("账号不可用"));
     }
 
-    // 新绑定的 identity 在账号确认可用之后写入，行为与 Python 事务回滚一致。
+    // 新绑定的 identity 在账号确认可用之后写入失败时整体放弃。
     if !identity_exists {
         queries::oauth::insert_identity(
             &state.pool,
@@ -953,7 +953,7 @@ async fn send_code(
     Ok(code_response(settings))
 }
 
-/// 邮箱格式与长度校验（对应 Pydantic `_EmailModel`），返回规范化后的邮箱。
+/// 邮箱格式与长度校验，返回规范化后的邮箱。
 fn validate_email_input(raw: &str) -> Result<String, AppError> {
     let length = raw.chars().count();
     if length < 3 {
@@ -970,7 +970,7 @@ fn validate_email_input(raw: &str) -> Result<String, AppError> {
     Ok(email)
 }
 
-/// 邮箱验证码用途（Pydantic `Literal["register", "reset_password"]`）。
+/// 邮箱验证码用途（`register` 或 `reset_password`）。
 fn validate_email_code_purpose(purpose: &str) -> Result<(), AppError> {
     match purpose {
         email_codes::PURPOSE_REGISTER | email_codes::PURPOSE_RESET_PASSWORD => Ok(()),
@@ -980,7 +980,7 @@ fn validate_email_code_purpose(purpose: &str) -> Result<(), AppError> {
     }
 }
 
-/// 重置密码验证码长度（Pydantic `min_length=4, max_length=12`）。
+/// 重置密码验证码长度（4 到 12 字符）。
 fn validate_code_field(code: &str) -> Result<(), AppError> {
     let length = code.chars().count();
     if !(4..=12).contains(&length) {
@@ -989,7 +989,7 @@ fn validate_code_field(code: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 邮箱验证码字段长度（Pydantic `max_length=12`）。
+/// 邮箱验证码字段长度（最长 12 字符）。
 fn validate_email_code_field(code: &str) -> Result<(), AppError> {
     if code.chars().count() > 12 {
         return Err(AppError::validation("邮箱验证码最长 12 个字符"));
@@ -997,7 +997,7 @@ fn validate_email_code_field(code: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 可选当前密码字段长度（Pydantic `max_length=256`）。
+/// 可选当前密码字段长度（最长 256 字符）。
 fn validate_optional_password(password: &str) -> Result<(), AppError> {
     if password.chars().count() > users::PASSWORD_MAX {
         return Err(AppError::validation(format!(
@@ -1231,7 +1231,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn email_code_purpose_accepts_only_python_literals() {
+    fn email_code_purpose_accepts_only_known_purposes() {
         assert!(validate_email_code_purpose("register").is_ok());
         assert!(validate_email_code_purpose("reset_password").is_ok());
         // set_password 只能通过 `/me/password-code` 触发。
@@ -1245,7 +1245,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_code_length_matches_pydantic() {
+    fn reset_code_length_bounds() {
         assert!(validate_code_field("1234").is_ok());
         assert!(validate_code_field("123456789012").is_ok());
         assert!(validate_code_field("123").is_err());
@@ -1309,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn code_response_matches_python_fields() {
+    fn code_response_matches_api_contract() {
         let settings = RuntimeSettings::new(None);
         let payload = code_response(&settings);
         assert_eq!(payload["ok"], json!(true));

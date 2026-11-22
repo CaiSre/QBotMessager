@@ -10,7 +10,7 @@
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img alt="License: AGPL v3" src="https://img.shields.io/badge/License-AGPL_v3-blue"></a>
 </p>
 
-<p align="center">面向钉钉、企业微信、飞书与 GitHub 的统一消息接入层：Rust 单二进制同时托管静态控制台与 API，全异步链路即时完成转换与推送，Access Token 常驻缓存、失效即刷；账号级频控与退避重试保障高峰下的稳定吞吐，多用户控制台按归属隔离机器人、通道与推送日志，敏感凭据以 Fernet 加密入库。</p>
+<p align="center">面向钉钉、企业微信、飞书与 GitHub 的统一消息接入层：基于 Actix Web 的全 Rust 原生异步架构，单二进制托管静态控制台与 API，Tokio 全异步链路即时完成转换与推送，Access Token 常驻缓存、失效即刷；账号级频控与退避重试保障高峰稳定吞吐，多用户控制台按归属隔离资源，敏感凭据 Fernet 加密入库。</p>
 
 ## 目录
 
@@ -39,8 +39,8 @@
   - 飞书：text / post / image / share_chat / interactive
   - GitHub：全部事件类型；ping / push / pull_request / issues / release / workflow_run / workflow_job 使用专门格式，其余事件使用通用格式
 - **QQ 推送**：支持 `msg_type=0` 纯文本与 `msg_type=2` Markdown，支持用户与群目标、账号级频控、401 自动刷新、5xx 与超频退避重试。
-- **推送队列**：队列与业务库共用 MySQL（apalis），Webhook 入队即确认，由进程内 worker 按频控节奏发送，推送方不会因等待 QQ 响应而超时重投；重复投递按平台投递 ID 去重。
-- **单进程同服**：Rust 二进制同时提供 API、Webhook 与 Next.js 静态导出产物，运行镜像里没有 Node、Python、Redis 或 supervisord。
+- **推送队列**：队列与业务库内嵌在同一 MySQL（apalis），Webhook 入队即确认，进程内 worker 按频控节奏发送，推送方不会因等待 QQ 响应而超时重投；重复投递按平台投递 ID 去重。
+- **轻量单进程**：全 Rust 原生实现，单二进制同时提供 API、Webhook 与 Next.js 静态导出产物；无需 Node、Redis 或 supervisord，Alpine 运行时内存占用低，启动即就绪。
 - **多用户隔离**：每个用户独立管理自己的机器人、通道与推送日志，数据按 `owner_user_id` 隔离。
 - **明暗主题**：默认跟随系统，控制台侧边栏与登录页可手动切换，并记住选择。
 - **超级管理员**：可见并管理全部用户的资源；用户账号、邀请码、注册开关与 OAuth2 提供方仅超管可操作。
@@ -53,16 +53,16 @@
 
 | 层次 | 选型 |
 |---|---|
-| 后端 | Rust 1.100、Actix Web 4、sqlx 0.9（MySQL、编译期迁移）、reqwest + rustls（ring，无 OpenSSL） |
+| 后端 | Rust 1.100、Actix Web 4、sqlx 0.9（MySQL、编译期校验 SQL 与内嵌迁移）、reqwest + rustls（ring，无 OpenSSL） |
 | 数据库 | MySQL 8.4；队列表与业务表同库 |
 | 队列 | apalis + apalis-mysql；进程内 worker，无额外中间件 |
 | 前端 | Next.js 16（App Router、静态导出）、React 19、Tailwind CSS v4、shadcn/ui；Bun 构建 |
 | 部署 | 多阶段构建：Bun 构建前端 → Rust musl 静态二进制 → Alpine 运行时单进程 |
-| 测试 | `cargo test`（单元 + 四组 MySQL 集成测试）、`bun run typecheck` / `bun run build` |
+| 测试 | `cargo test`（单元 + 四组 MySQL 集成测试，含真实 ES256 签名的 Passkey 全路径）、`bun run typecheck` / `bun run build` |
 
 ## 系统架构
 
-单个容器内只有一个进程：Rust 二进制监听 3000 端口，同服托管静态控制台与 API。
+单个容器内只有一个进程：静态链接的 Rust 二进制监听 3000 端口，同服托管静态控制台与 API。Actix Web 的类型安全提取器在编译期约束请求负载，worker 线程按 CPU 核数自适应（默认最多 2，控制常驻内存），优雅退出时先把队列任务跑完。
 
 ```text
 浏览器 / 推送方
@@ -79,8 +79,8 @@ MySQL 8.4（业务表 + apalis 队列表）
 ```
 
 - 启动时执行 `sqlx::migrate!` 内嵌迁移（幂等），无需额外迁移容器或命令。
-- Webhook 只做校验与入队，worker 按机器人频控发送并写入推送日志；幂等守卫由原 Redis 改为 MySQL 表。
-- 后端启动时执行幂等引导：创建超级管理员，并在提供 `QQ_APPID` / `QQ_APP_SECRET` 时导入默认机器人及三条通道（GitHub 通道需手动创建）。
+- Webhook 只做校验与入队，worker 按机器人频控节奏发送并写入推送日志；幂等守卫同样落在 MySQL 表，全链路无外部中间件。
+- 启动时执行幂等引导：超管已存在则跳过；提供 `QQ_APPID` / `QQ_APP_SECRET` 时导入默认机器人与三条通道，不覆盖已有配置。
 
 ## 快速开始
 
@@ -103,7 +103,7 @@ BOOTSTRAP_ADMIN_EMAIL=admin@example.com
 BOOTSTRAP_ADMIN_PASSWORD=请替换为强密码
 ```
 
-> 对外地址、会话、限速与 QQ 推送等非敏感配置已改为数据库持久化，登录后在「系统设置」中修改即可，重建容器无需再提供。若旧部署的 `.env` 中仍有这些变量，首次启动会导入数据库，之后以数据库为准。
+> 对外地址、会话、限速与 QQ 推送等非敏感配置持久化在数据库中，登录后在「系统设置」修改，保存即生效，重建容器无需再提供 env。
 
 生成 `APP_SECRET_KEY`（32 字节随机数的 base64url 形式）：
 
@@ -238,7 +238,7 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 | `user` | 仅管理本人创建的机器人、通道与推送日志 |
 
 - 注册需邀请码，注册用户固定为 `user`；邀请码由超级管理员签发，可限定邮箱、次数与有效期。
-- 用户名全局唯一（忽略大小写），可用于登录；未填写时按邮箱前缀自动生成，冲突时追加 `-2`、`-3` 等后缀。数据库对 `lower(name)` 建唯一索引兜底，迁移时会自动清理历史重名。
+- 用户名全局唯一（忽略大小写），可用于登录；未填写时按邮箱前缀自动生成，冲突时追加 `-2`、`-3` 等后缀。数据库对 `lower(name)` 建唯一索引兜底。
 - 系统至少保留一个启用的超级管理员，且不能修改自己的角色或账号状态。
 - OAuth2 提供方默认「邮箱不可信」：只有提供方确认验证过邮箱归属（或接口返回了已验证标记）时，才会用同邮箱自动关联已有本地账号；否则要求用户改用密码登录，避免冒名接管。GitHub 预设默认信任。
 
@@ -287,7 +287,7 @@ cd web
 bun run dev
 ```
 
-> 前端已改为静态导出，开发服务器不再反代 `/api` 与 `/webhook`；接口联调请先 `bun run build`，再访问 Rust 服务的 3000 端口。
+> 前端为静态导出，开发服务器不反代 `/api` 与 `/webhook`；接口联调请先 `bun run build`，再访问 Rust 服务的 3000 端口。
 
 ### 测试
 
@@ -333,7 +333,7 @@ bun run build
 - 不要将 MySQL 端口暴露到公网（compose 未映射 3306）。
 - Webhook token 具有推送权限，泄露后请在「机器人 → 通道」中立即轮换。GitHub 通道的 URL token 与 Secret 相互独立：token 泄露不足以伪造投递，但仍应同时轮换并同步更新 GitHub 配置。
 - 邀请码按需签发并限定邮箱与有效期，注册入口用完即关。
-- 登录失败限速按 (来源地址, 账号) 计数：沿用旧代理部署时请设置 `TRUST_PROXY=true` 以取得真实客户端地址。
+- 登录失败限速按 (来源地址, 账号) 计数：部署在反向代理之后时设置 `TRUST_PROXY=true` 以取得真实客户端地址。
 
 ## 已知限制
 

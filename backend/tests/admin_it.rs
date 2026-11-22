@@ -1,11 +1,12 @@
 //! 管理端集成测试。
 //!
-//! 移植自旧 pytest 套件中与管理端相关的用例：
-//! - `tests/test_admin_api.py`（统计时区、机器人 QQ 主机白名单）
-//! - `tests/test_settings_api.py`（设置目录、持久化、校验、即时生效）
-//! - `tests/test_auth_api.py`（权限拒绝、资源隔离、用户管理、邀请码）
-//! - `tests/test_oauth_api.py`（提供方 CRUD、密钥回显掩码、GitHub 预设）
-//! - `tests/test_webhook_api.py`（推送日志分页/过滤、通道轮换）
+//! 覆盖范围：
+//! - 统计接口（时区、平台分布）
+//! - 通道与机器人的 QQ 主机白名单、通道凭据轮换
+//! - 系统设置目录导出、持久化、校验与即时生效
+//! - 用户管理（角色与状态保护、邀请码）与资源隔离
+//! - OAuth 提供方 CRUD、密钥回显掩码、GitHub 预设
+//! - 推送日志分页 / 过滤
 //!
 //! 驱动方式：`actix_web::test::init_service` + `TestRequest`，数据库为真实 MySQL。
 //! 进程内只执行一次 `sqlx::migrate!`，并用全局互斥锁串行化测试：
@@ -385,7 +386,6 @@ async fn insert_push_log(
 
 #[actix_web::test]
 async fn requires_login_returns_401() {
-    // 移植 test_auth_api.py::test_requires_login（管理端部分）
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -426,7 +426,6 @@ async fn requires_login_returns_401() {
 
 #[actix_web::test]
 async fn non_super_admin_is_scoped_and_forbidden() {
-    // 移植 test_auth_api.py::test_invite_register_and_user_scope（权限部分）
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -538,7 +537,6 @@ async fn non_super_admin_is_scoped_and_forbidden() {
 
 #[actix_web::test]
 async fn bot_create_validates_qq_host_allowlist() {
-    // 移植 test_admin_api.py::test_create_bot_accepts_allowlisted_qq_host
     // 与 test_create_bot_rejects_qq_host_outside_allowlist
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
@@ -755,7 +753,6 @@ async fn bot_profile_crud_and_secret_masking() {
 
 #[actix_web::test]
 async fn bot_ownership_isolation() {
-    // 移植 test_auth_api.py::test_cross_user_resources_isolated（机器人部分）
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -864,7 +861,6 @@ async fn bot_ownership_isolation() {
 
 #[actix_web::test]
 async fn channel_crud_rotate_and_secret() {
-    // 移植 test_webhook_api.py::test_github_rotate_replaces_token_and_secret
     // 以及 test_admin_api.py 中的通道 CRUD 契约
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
@@ -1041,7 +1037,6 @@ async fn channel_crud_rotate_and_secret() {
 
 #[actix_web::test]
 async fn logs_pagination_and_filters() {
-    // 移植 test_webhook_api.py 中的日志查询契约（test_push_logs_recorded/
     // test_failure_returns_502_and_logs_error 的读取侧）
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
@@ -1211,7 +1206,6 @@ async fn logs_pagination_and_filters() {
 
 #[actix_web::test]
 async fn users_list_and_patch() {
-    // 移植 test_auth_api.py::test_admin_update_username_unique
     // 与 test_super_admin_cannot_change_own_role_or_status
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
@@ -1345,7 +1339,6 @@ async fn users_list_and_patch() {
 
 #[actix_web::test]
 async fn invites_crud_and_validation() {
-    // 移植 test_auth_api.py 中邀请码管理端契约（创建、列表、撤销、校验）
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1424,7 +1417,6 @@ async fn invites_crud_and_validation() {
 
 #[actix_web::test]
 async fn oauth_provider_crud_and_secret_masking() {
-    // 移植 test_oauth_api.py 中的提供方管理契约与密钥不回显断言
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1637,7 +1629,6 @@ async fn oauth_provider_crud_and_secret_masking() {
 
 #[actix_web::test]
 async fn oauth_github_preset_trusts_email() {
-    // 移植 test_oauth_api.py::test_github_preset_trusts_emails
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1753,7 +1744,6 @@ async fn oauth_github_preset_trusts_email() {
 
 #[actix_web::test]
 async fn settings_catalog_patch_and_secret() {
-    // 移植 test_settings_api.py::test_settings_catalog_and_env_seed（目录部分）
     // 与 test_settings_patch_persists_and_returns、test_settings_reload_from_database
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
@@ -1838,7 +1828,6 @@ async fn settings_catalog_patch_and_secret() {
 
 #[actix_web::test]
 async fn settings_env_seed_imports_non_default() {
-    // 移植 test_settings_api.py::test_settings_catalog_and_env_seed（环境变量导入）
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
 
@@ -1869,7 +1858,6 @@ async fn settings_env_seed_imports_non_default() {
 
 #[actix_web::test]
 async fn settings_invalid_values_are_rejected() {
-    // 移植 test_settings_api.py::test_settings_reject_invalid_values
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1905,7 +1893,6 @@ async fn settings_invalid_values_are_rejected() {
 
 #[actix_web::test]
 async fn settings_public_base_url_applies_immediately() {
-    // 移植 test_settings_api.py::test_public_base_url_applies_immediately
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -1981,7 +1968,6 @@ async fn settings_public_base_url_applies_immediately() {
 
 #[actix_web::test]
 async fn settings_login_limiter_applies_immediately() {
-    // 移植 test_settings_api.py::test_login_limiter_applies_immediately
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
     let app = app!(fixture.state.clone());
@@ -2040,7 +2026,6 @@ async fn settings_login_limiter_applies_immediately() {
 
 #[actix_web::test]
 async fn stats_today_follows_timezone_and_trend() {
-    // 移植 test_admin_api.py::test_stats_today_follows_configured_timezone；
     // `_local_midnight_utc` 是私有函数，改为通过 HTTP + UTC 时区验证边界行为。
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
