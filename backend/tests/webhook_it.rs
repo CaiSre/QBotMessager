@@ -600,13 +600,13 @@ async fn markdown_uses_msg_type_2() {
         .as_str()
         .expect("Markdown 消息缺少正文");
     assert!(
-        markdown.starts_with("# 「消息来源」集成测试"),
+        markdown.starts_with("> 「消息来源」集成测试"),
         "Markdown 应在头部标注推送来源：{markdown}"
     );
     assert_eq!(calls[0].body["content"], json!(""));
     assert_eq!(
         calls[0].body["markdown"]["content"],
-        json!("# 「消息来源」集成测试\n\n**服务** 异常")
+        json!("> 「消息来源」集成测试\n\n**服务** 异常")
     );
 }
 
@@ -907,7 +907,7 @@ async fn github_signed_ping_pushes_and_logs() {
         .as_str()
         .expect("Markdown 消息缺少正文");
     assert!(
-        markdown.starts_with("# 「消息来源」集成测试"),
+        markdown.starts_with("> 「消息来源」集成测试"),
         "Markdown 应在头部标注推送来源：{markdown}"
     );
 

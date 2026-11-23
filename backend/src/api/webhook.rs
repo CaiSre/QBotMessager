@@ -383,7 +383,7 @@ async fn receive(
 
 // ------------------------------------------------------------------ 辅助函数
 
-/// 在转换后的消息头部标注推送来源：Markdown 用一级标题，纯文本用普通一行。
+/// 在转换后的消息头部标注推送来源：Markdown 用引用行，纯文本用普通一行。
 fn with_push_source(
     payload: QqPayload,
     push_source: &str,
@@ -399,7 +399,7 @@ fn with_push_source(
     if payload.msg_type == MSG_TYPE_MARKDOWN {
         let body = payload.markdown.as_deref().unwrap_or_default();
         let markdown = truncate(
-            &format!("# 「消息来源」{source}\n\n{body}"),
+            &format!("> 「消息来源」{source}\n\n{body}"),
             Some(markdown_max_len),
         );
         return QqPayload {
