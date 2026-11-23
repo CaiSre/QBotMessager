@@ -44,6 +44,8 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 subtle = "2"
 thiserror = "2"
+# 仅用 BroadcastStream：把入队通知通道接进 apalis 的轮询策略。
+tokio-stream = { version = "0.1", features = ["sync"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tower = "0.5"
 tracing = "0.1"

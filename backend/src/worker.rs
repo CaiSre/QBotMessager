@@ -11,9 +11,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use apalis::prelude::{Data, Task, WorkerBuilder, WorkerBuilderExt, WorkerContext};
+use apalis::prelude::{
+    BackendExt, Data, Strategy, Task, WorkerBuilder, WorkerBuilderExt, WorkerContext,
+};
 use apalis_mysql::MySqlStorage;
 use tokio::task::JoinHandle;
+use tokio_stream::StreamExt as _;
 use tower::retry::Policy;
 
 use crate::error::AppError;
@@ -34,6 +37,12 @@ pub const SENT_GUARD_CLEANUP_SECONDS: u64 = 300;
 pub const VACUUM_INTERVAL_SECONDS: u64 = 3600;
 /// worker 名称。
 pub const WORKER_NAME: &str = "push-worker";
+/// 空闲时轮询队列的间隔（毫秒）。
+///
+/// MySQL 没有类似 PG LISTEN/NOTIFY 的入队通知，默认只有 30 秒心跳会顺带查库，
+/// 单条推送的拾取延迟会拉到整整一个心跳周期；这里用短轮询把空闲拾取
+/// 压到亚秒级。与 apalis 官方共享轮询器的默认值一致。
+pub const QUEUE_POLL_INTERVAL_MS: u64 = 100;
 
 /// worker 错误类型。
 pub type WorkerError = Box<dyn std::error::Error + Send + Sync>;
@@ -118,6 +127,30 @@ pub async fn run(state: Arc<AppState>) -> Result<(), AppError> {
     }
 
     let backend = MySqlStorage::<PushJob>::new(&state.pool).with_config(config);
+
+    // 双驱动拾取：入队通知优先（Webhook 入队成功即唤醒，拾取延迟压到通知
+    // 投递 + 一次查库），间隔轮询兜底（通知因通道满或无人订阅丢失时，
+    // 空闲拾取仍有一个轮询周期上限）。通知与间隔都在 worker 空闲停车时才
+    // 生效；繁忙时批量拾取本来就无停顿。
+    let strategy = match state.queue.as_ref().map(|queue| queue.wake_receiver()) {
+        Some(receiver) => {
+            let stream = tokio_stream::wrappers::BroadcastStream::new(receiver);
+            // 丢弃 Lagged 残帧后继续等待下一条通知，不让策略因缺帧退出。
+            let stream = stream.filter_map(|result| match result {
+                Ok(()) => Some(()),
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) => {
+                    // 落帧说明突发入队超过通道容量：任务已入库，下一次轮询兜底。
+                    tracing::debug!("入队通知通道积压落帧，等待间隔轮询兜底拾取");
+                    None
+                }
+            });
+            Strategy::new()
+                .stream(stream)
+                .interval(Duration::from_millis(QUEUE_POLL_INTERVAL_MS))
+        }
+        None => Strategy::new().interval(Duration::from_millis(QUEUE_POLL_INTERVAL_MS)),
+    };
+    let backend = backend.poll_with_strategy(strategy);
 
     let settings_task = spawn_settings_refresh(state.clone());
     let cleanup_task = spawn_sent_guard_cleanup(state.clone());

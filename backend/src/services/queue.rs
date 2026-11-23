@@ -48,12 +48,19 @@ pub enum QueueError {
     Backend(String),
 }
 
+/// 入队通知广播的通道容量：worker 一次拾取批量 10，短期突发入队超过容量时
+/// 通知会丢弃，由间隔轮询兜底拾取，不丢任务本身。
+pub const WAKE_CHANNEL_CAPACITY: usize = 64;
+
 /// 推送队列。
 pub struct PushQueue {
     /// apalis 的 MySQL 存储；`push_task` 需要 `&mut`，故用互斥锁保护。
     storage: tokio::sync::Mutex<MySqlStorage<PushJob>>,
     pool: MySqlPool,
     max_pending: usize,
+    /// 入队通知：Webhook 入队成功后立刻唤醒空闲 worker 拾取，
+    /// 间隔轮询只作为通知丢失时的兜底。
+    wake_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl PushQueue {
@@ -67,12 +74,25 @@ impl PushQueue {
         // 保证 Web 进程入队与 worker 消费的是同一个队列。
         let config = apalis_mysql::Config::default().queue(QUEUE_NAME);
         let storage = MySqlStorage::<PushJob>::new(&pool).with_config(config);
+        let (wake_tx, _) = tokio::sync::broadcast::channel(WAKE_CHANNEL_CAPACITY);
 
         Ok(Self {
             storage: tokio::sync::Mutex::new(storage),
             pool,
             max_pending,
+            wake_tx,
         })
+    }
+
+    /// 订阅入队通知；worker 用它驱动拾取。
+    pub fn wake_receiver(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.wake_tx.subscribe()
+    }
+
+    /// 通知 worker 有新任务；当前没有订阅者或通道满时静默跳过，
+    /// 由 worker 的间隔轮询兜底。
+    fn notify_worker(&self) {
+        let _ = self.wake_tx.send(());
     }
 
     /// 队列使用的数据库连接池。
@@ -135,7 +155,12 @@ impl PushQueue {
             .build();
 
         match storage.push_task(task).await {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                // 入队成功即唤醒 worker 立刻拾取；MySQL 没有 LISTEN/NOTIFY 类的
+                // 库级通知，跨 storage 实例只能靠共享通道把唤醒传出去。
+                self.notify_worker();
+                Ok(true)
+            }
             // 并发入队时唯一索引冲突：同一投递已经在队列里。
             Err(err) if is_duplicate_key(&err) => Ok(false),
             Err(err) => Err(QueueError::Backend(err.to_string())),
