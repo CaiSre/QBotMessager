@@ -1,5 +1,8 @@
 .env
 
+# Claude Code 本地工作目录（plans / settings 等本地产物，不应入库）
+.claude/
+
 # 前端构建产物与依赖
 web/node_modules/
 web/.next/
