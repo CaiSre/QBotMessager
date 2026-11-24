@@ -11,8 +11,8 @@ use sqlx::MySqlPool;
 use crate::config::Config;
 use crate::services::qq::QqClient;
 use crate::services::queue::{PushQueue, SentGuard};
-use crate::services::runtime_settings::RuntimeSettings;
-use crate::services::throttle::{AttemptLimiter, LimiterRegistry};
+use crate::services::runtime_settings::{EMAIL_CODE_IP_WINDOW_SECONDS, RuntimeSettings};
+use crate::services::throttle::{AttemptLimiter, IssueLimiter, LimiterRegistry};
 
 /// `X-Forwarded-For` 请求头。
 const X_FORWARDED_FOR: &str = "x-forwarded-for";
@@ -35,6 +35,8 @@ pub struct AppState {
     pub limiters: LimiterRegistry,
     /// 登录失败限流器。
     pub login_limiter: AttemptLimiter,
+    /// 验证码发码限流器（按来源地址计数）。
+    pub issue_limiter: IssueLimiter,
     /// 推送队列；`None` 表示未启用，Webhook 走同步发送。
     pub queue: Option<Arc<PushQueue>>,
     /// 推送幂等守卫
@@ -62,7 +64,11 @@ impl AppState {
             runtime.login_ip_max_failures(),
             runtime.login_window_seconds(),
         );
-        runtime.apply_side_effects(&limiters, &login_limiter);
+        let issue_limiter = IssueLimiter::new(
+            runtime.email_code_ip_hourly_limit(),
+            EMAIL_CODE_IP_WINDOW_SECONDS,
+        );
+        runtime.apply_side_effects(&limiters, &login_limiter, &issue_limiter);
 
         Self {
             qq: QqClient::new(http.clone()),
@@ -73,6 +79,7 @@ impl AppState {
             http,
             limiters,
             login_limiter,
+            issue_limiter,
             queue,
             version: env!("CARGO_PKG_VERSION").to_string(),
         }

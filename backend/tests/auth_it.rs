@@ -16,6 +16,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -107,6 +108,12 @@ impl Fixture {
         let object = changes.as_object().expect("设置必须是 JSON 对象");
         let values = runtime.validate(object).expect("设置校验失败");
         runtime.apply(&values);
+        // 与管理端一致：设置生效后立即让进程内限速器采用新值。
+        runtime.apply_side_effects(
+            &self.state.limiters,
+            &self.state.login_limiter,
+            &self.state.issue_limiter,
+        );
     }
 
     fn enable_register(&self) {
@@ -286,6 +293,14 @@ fn get_with(uri: &str, cookies: &[(&str, &str)]) -> TestRequest {
 
 fn post_json(uri: &str, body: &Value) -> TestRequest {
     request(Method::POST, uri, Some(body), &[])
+}
+
+/// 指定来源地址的 POST 请求（模拟不同客户端 IP）。
+fn post_json_from(ip: &str, uri: &str, body: &Value) -> TestRequest {
+    let addr: SocketAddr = format!("{ip}:12345")
+        .parse()
+        .expect("测试来源地址必须是合法 IP");
+    request(Method::POST, uri, Some(body), &[]).peer_addr(addr)
 }
 
 fn post_json_with(uri: &str, body: &Value, cookies: &[(&str, &str)]) -> TestRequest {
@@ -1820,6 +1835,89 @@ async fn email_code_resend_cooldown_and_hourly_quota() {
     assert_eq!(before, after, "已注册邮箱不应真的发码");
 }
 
+/// 发码接口按来源地址限速：额度用尽后同一来源被拒，其他来源不受影响。
+///
+/// 邮箱已注册时该接口静默成功且不发信，正好用来验证限额判定，
+/// 不依赖真实 SMTP。
+#[actix_web::test]
+async fn email_code_rate_limited_by_source_ip() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    fixture.enable_register();
+    fixture.configure_mail();
+    fixture.apply_settings(json!({"email_code_ip_hourly_limit": 2}));
+    let account = make_account(
+        &fixture,
+        "iplimit",
+        Some(PASSWORD),
+        ROLE_USER,
+        STATUS_ACTIVE,
+    )
+    .await;
+
+    for _ in 0..2 {
+        let ok = send!(
+            app,
+            post_json_from(
+                "203.0.113.5",
+                "/api/auth/email-code",
+                &json!({"email": account.email, "purpose": "register"})
+            )
+        );
+        assert_status!(ok, StatusCode::OK);
+    }
+
+    let blocked = send!(
+        app,
+        post_json_from(
+            "203.0.113.5",
+            "/api/auth/email-code",
+            &json!({"email": account.email, "purpose": "register"})
+        )
+    );
+    let blocked = assert_status!(blocked, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        blocked.detail().contains("发码请求过于频繁"),
+        "{}",
+        blocked.detail()
+    );
+    let retry_after = blocked
+        .headers
+        .get(header::RETRY_AFTER)
+        .expect("429 必须带 Retry-After")
+        .to_str()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    assert!(retry_after > 0 && retry_after <= 3600, "{retry_after}");
+
+    // 限额判定在账号查询之前：已注册与未注册邮箱的响应一致，不泄露账号是否存在。
+    let unknown = send!(
+        app,
+        post_json_from(
+            "203.0.113.5",
+            "/api/auth/email-code",
+            &json!({
+                "email": format!("{}-nobody@example.com", fixture.prefix),
+                "purpose": "register"
+            })
+        )
+    );
+    assert_status!(unknown, StatusCode::TOO_MANY_REQUESTS);
+
+    // 别的来源地址不受牵连。
+    let other = send!(
+        app,
+        post_json_from(
+            "203.0.113.7",
+            "/api/auth/email-code",
+            &json!({"email": account.email, "purpose": "register"})
+        )
+    );
+    assert_status!(other, StatusCode::OK);
+}
+
 /// 并发提交错误验证码时尝试计数由数据库原子推进：一次只 +1，
 /// 计满 `MAX_ATTEMPTS` 后立即作废，不允许通过竞争突破上限。
 #[tokio::test]
@@ -1866,6 +1964,47 @@ async fn email_code_attempts_increment_atomically_under_concurrency() {
         .await
         .unwrap();
     assert!(!ok);
+}
+
+/// 同一邮箱的小时配额在并发签发下不可绕过：签发被行锁串行化，
+/// 只有额度内的请求能插入记录，其余一律 429。
+#[tokio::test]
+async fn email_code_hourly_quota_not_bypassed_under_concurrency() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let email = format!("{}-quota-race@example.com", fixture.prefix);
+
+    // 关闭冷却（resend_seconds = 0），只让小时配额生效。
+    let limit = 3;
+    let rounds = 12;
+    let mut joins = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let pool = fixture.pool.clone();
+        let email = email.clone();
+        joins.push(tokio::spawn(async move {
+            email_codes::issue_code(&pool, &email, "reset_password", 10, 0, limit, None).await
+        }));
+    }
+    let mut issued = 0;
+    for join in joins {
+        match join.await.expect("issue 任务 panic") {
+            Ok(_) => issued += 1,
+            Err(err) => assert!(
+                matches!(err, qbotmessager::error::AppError::RateLimited { .. }),
+                "超限必须返回 429：{err}"
+            ),
+        }
+    }
+    assert_eq!(issued, limit);
+
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM email_verification_codes WHERE email = ?",
+    )
+    .bind(&email)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, limit, "落库条数必须与放行数一致");
 }
 
 #[actix_web::test]

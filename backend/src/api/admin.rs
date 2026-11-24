@@ -1713,7 +1713,7 @@ async fn patch_settings(
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         runtime.apply(&values);
-        runtime.apply_side_effects(&state.limiters, &state.login_limiter);
+        runtime.apply_side_effects(&state.limiters, &state.login_limiter, &state.issue_limiter);
     }
 
     let mut detail = serde_json::Map::new();

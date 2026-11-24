@@ -316,11 +316,22 @@ async fn request_email_code(
     if !mail::is_configured(&settings) {
         return Err(AppError::database_busy("邮件服务未配置"));
     }
+    if body.purpose == email_codes::PURPOSE_REGISTER && !settings.register_enabled() {
+        return Err(AppError::forbidden("注册入口已关闭"));
+    }
+
+    // 按来源地址限速：未登录调用者不得对大量邮箱触发邮件发送。
+    // 检查放在账号查询之前，限额内外响应一致，避免被用来枚举已注册邮箱。
+    let ip = state.client_ip(&req);
+    if let Err(wait) = state.issue_limiter.try_acquire(ip.as_deref()) {
+        let seconds = wait.as_secs().max(1);
+        return Err(AppError::rate_limited(
+            format!("发码请求过于频繁，请 {seconds} 秒后再试"),
+            seconds,
+        ));
+    }
 
     if body.purpose == email_codes::PURPOSE_REGISTER {
-        if !settings.register_enabled() {
-            return Err(AppError::forbidden("注册入口已关闭"));
-        }
         if queries::users::find_by_email(&state.pool, &email)
             .await?
             .is_some()
@@ -336,7 +347,6 @@ async fn request_email_code(
         }
     }
 
-    let ip = state.client_ip(&req);
     let response = send_code(&state, &settings, &email, &body.purpose, ip.as_deref()).await?;
     Ok(HttpResponse::Ok().json(response))
 }

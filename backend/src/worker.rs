@@ -223,7 +223,7 @@ pub async fn refresh_runtime_settings(state: WorkerData) -> Result<(), WorkerErr
     if let Err(err) = next.load(&state.pool).await {
         return Err(format!("同步系统设置失败：{err}").into());
     }
-    next.apply_side_effects(&state.limiters, &state.login_limiter);
+    next.apply_side_effects(&state.limiters, &state.login_limiter, &state.issue_limiter);
     *state
         .runtime
         .write()

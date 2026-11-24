@@ -201,6 +201,7 @@ docker compose up -d --build
 | SMTP 服务器（`SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURITY`） | 验证码邮件服务器；连接方式可选 STARTTLS / SSL / 明文 | 空 / `587` / `starttls` |
 | SMTP 账号（`SMTP_USERNAME` / `SMTP_PASSWORD` / `SMTP_FROM`） | 登录凭据与发件人；密码以 Fernet 密文入库，留空保持不变 | 空 |
 | 验证码策略（`EMAIL_CODE_TTL_MINUTES` / `EMAIL_CODE_RESEND_SECONDS` / `EMAIL_CODE_HOURLY_LIMIT`） | 有效期、重发间隔与同一邮箱每小时上限 | `10` / `60` / `5` |
+| 单来源发码上限（`EMAIL_CODE_IP_HOURLY_LIMIT`） | 同一来源地址每小时最多发起的验证码请求数，防止对大量邮箱触发邮件发送 | `30` |
 | QQ API 域名（`QQ_HOST`） | 机器人未单独配置时使用的默认地址 | `https://api.bot.qq.com` |
 | QQ 频控（`QQ_QPS` / `QQ_QPM` / `QQ_MIN_INTERVAL`） | 账号级频控，保存后重建限速器 | `5` / `30` / `0.21` |
 | 内容长度上限（`MARKDOWN_MAX_LEN` / `TEXT_MAX_LEN`） | 下发内容长度上限 | `4000` / `2000` |
@@ -334,6 +335,7 @@ bun run build
 - Webhook token 具有推送权限，泄露后请在「机器人 → 通道」中立即轮换。GitHub 通道的 URL token 与 Secret 相互独立：token 泄露不足以伪造投递，但仍应同时轮换并同步更新 GitHub 配置。
 - 邀请码按需签发并限定邮箱与有效期，注册入口用完即关。
 - 登录失败限速按 (来源地址, 账号) 计数：部署在反向代理之后时设置 `TRUST_PROXY=true` 以取得真实客户端地址。
+- 验证码发码按来源地址限速（默认每小时 30 次）：同一来源超出后返回 429。反代未透传真实客户端地址时所有用户共享同一额度，用户较多时应调高「单来源发码上限」并设置 `TRUST_PROXY=true`。
 
 ## 已知限制
 

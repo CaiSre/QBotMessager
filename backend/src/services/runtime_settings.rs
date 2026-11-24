@@ -1,7 +1,7 @@
 //! 系统设置：非敏感运行配置持久化到数据库，并通过内存缓存即时生效。
 //!
 //! 运行期系统设置（库表持久化 + 环境变量首启导入）：
-//! - 30 项设置以 `system_settings` 表为准；
+//! - 31 项设置以 `system_settings` 表为准；
 //! - 启动时若库中缺少某项，而同名环境变量的值与默认值不同，则**一次性**写入库
 //!   （来源标记 `environment`），此后运行期只读数据库；
 //! - 敏感项（`smtp_password`）用 Fernet 密文入库，缓存里保留明文供服务使用；
@@ -20,7 +20,7 @@ use sqlx::MySqlPool;
 
 use crate::crypto::{decrypt_secret, encrypt_secret};
 use crate::error::AppError;
-use crate::services::throttle::{AttemptLimiter, LimiterRegistry};
+use crate::services::throttle::{AttemptLimiter, IssueLimiter, LimiterRegistry};
 
 /// 站点与访问。
 pub const GROUP_SITE: &str = "站点与访问";
@@ -32,6 +32,8 @@ pub const GROUP_LOGIN: &str = "登录保护";
 pub const GROUP_MAIL: &str = "邮件服务";
 /// QQ 推送。
 pub const GROUP_QQ: &str = "QQ 推送";
+/// 单来源发码限流的窗口长度（秒）。
+pub const EMAIL_CODE_IP_WINDOW_SECONDS: u64 = 3600;
 
 /// 设置值类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -196,7 +198,7 @@ pub struct SettingSpec {
 }
 
 /// 全部设置项，顺序即管理页展示顺序。
-pub static CATALOG: [SettingSpec; 30] = [
+pub static CATALOG: [SettingSpec; 31] = [
     SettingSpec {
         key: "public_base_url",
         label: "对外访问地址",
@@ -505,6 +507,19 @@ pub static CATALOG: [SettingSpec; 30] = [
         description: "同一邮箱同一用途每小时最多发送次数",
         minimum: Some(1.0),
         maximum: Some(50.0),
+        options: &[],
+        max_length: 512,
+        secret: false,
+    },
+    SettingSpec {
+        key: "email_code_ip_hourly_limit",
+        label: "单 IP 每小时发码上限",
+        group: GROUP_MAIL,
+        kind: SettingKind::Int,
+        default: SettingDefault::Int(30),
+        description: "同一来源地址每小时最多发起的验证码请求数；反代未透传真实 IP 时所有用户共享此额度",
+        minimum: Some(1.0),
+        maximum: Some(600.0),
         options: &[],
         max_length: 512,
         secret: false,
@@ -830,7 +845,12 @@ impl RuntimeSettings {
     ///
     /// 日志级别由 `main` 的 tracing 订阅器在启动时读取 `RUST_LOG`；运行期调整日志级别
     /// 需要 `tracing-subscriber` 的 registry 特性，本 crate 未启用，故此处只更新频控。
-    pub fn apply_side_effects(&self, limiters: &LimiterRegistry, login_limiter: &AttemptLimiter) {
+    pub fn apply_side_effects(
+        &self,
+        limiters: &LimiterRegistry,
+        login_limiter: &AttemptLimiter,
+        issue_limiter: &IssueLimiter,
+    ) {
         limiters.configure(
             self.qq_qps(),
             self.qq_qpm(),
@@ -840,6 +860,10 @@ impl RuntimeSettings {
             self.login_max_failures(),
             self.login_ip_max_failures(),
             self.login_window_seconds(),
+        );
+        issue_limiter.configure(
+            self.email_code_ip_hourly_limit(),
+            EMAIL_CODE_IP_WINDOW_SECONDS,
         );
     }
 
@@ -1041,6 +1065,11 @@ impl RuntimeSettings {
     /// 每小时发码上限。
     pub fn email_code_hourly_limit(&self) -> i64 {
         self.int_value("email_code_hourly_limit")
+    }
+
+    /// 单来源每小时发码上限。
+    pub fn email_code_ip_hourly_limit(&self) -> u32 {
+        self.int_value("email_code_ip_hourly_limit").max(1) as u32
     }
 
     /// 默认 QQ API 域名。

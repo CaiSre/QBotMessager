@@ -52,6 +52,9 @@ pub fn generate_code() -> String {
 ///
 /// 冷却期（`resend_seconds`）内或小时配额（`hourly_limit`）用尽时返回 429；
 /// 签发新码前把同 `(email, purpose)` 的未消费记录置为已消费。
+///
+/// 同一 `(email, purpose)` 的签发在 `email_code_guards` 的行锁上串行化，
+/// 并发请求排队执行，冷却与配额判定不会因为读到同一份旧快照而互相绕过。
 pub async fn issue_code(
     pool: &MySqlPool,
     email: &str,
@@ -63,6 +66,18 @@ pub async fn issue_code(
 ) -> Result<String, AppError> {
     let now = Utc::now().naive_utc();
     let mut tx = pool.begin().await?;
+
+    // 行锁充当互斥量：并发事务在同一行上排队，后到者要等前一个事务提交
+    // 才能读到它的签发结果。必须作为事务里的第一条语句，读视图才会建立在
+    // 拿到锁之后，否则快照读仍会看到过期的计数。
+    sqlx::query(
+        "INSERT INTO email_code_guards (email, purpose) VALUES (?, ?) \
+         ON DUPLICATE KEY UPDATE email = email",
+    )
+    .bind(email)
+    .bind(purpose)
+    .execute(&mut *tx)
+    .await?;
 
     let latest: Option<(NaiveDateTime,)> = sqlx::query_as(
         "SELECT created_at FROM email_verification_codes \

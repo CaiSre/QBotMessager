@@ -4,7 +4,8 @@
 //!
 //! 频控（内存令牌桶）：
 //! - `RateLimiter`：只有记账在锁内完成，等待在锁外进行；
-//! - `AttemptLimiter`：回环或空 IP 只计 `(来源, 账号)` 维度。
+//! - `AttemptLimiter`：回环或空 IP 只计 `(来源, 账号)` 维度；
+//! - `IssueLimiter`：验证码发码按来源地址计数，取许可与计数在同一把锁内完成。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -259,6 +260,76 @@ impl AttemptLimiter {
     }
 }
 
+/// 验证码发码限速：按来源地址限制单位时间内的发码次数。
+///
+/// 发码接口未登录即可调用，若不按来源限速，调用者可以对大量邮箱触发邮件发送，
+/// 造成邮件费用、发件域信誉与用户收件箱骚扰。这里按客户端地址计数：同一来源在
+/// 一个窗口内最多发起 `limit` 次发码请求，超出直接拒绝。
+///
+/// 取许可与计数在同一把锁内完成，并发请求无法绕过上限。
+/// 计数保存在进程内，与 QQ 频控一样要求单 worker、单副本运行。
+#[derive(Debug)]
+pub struct IssueLimiter {
+    state: Mutex<IssueState>,
+}
+
+/// 发码计数的可变状态。
+#[derive(Debug)]
+struct IssueState {
+    limit: u32,
+    window_seconds: u64,
+    sources: HashMap<String, VecDeque<Instant>>,
+}
+
+/// 计数来源数量的上限，超过后清理过期来源，仍超限则淘汰计数最早的来源。
+const MAX_SOURCES: usize = 4096;
+
+impl IssueLimiter {
+    /// 创建限速器。
+    pub fn new(limit: u32, window_seconds: u64) -> Self {
+        Self {
+            state: Mutex::new(IssueState {
+                limit: limit.max(1),
+                window_seconds: window_seconds.max(1),
+                sources: HashMap::new(),
+            }),
+        }
+    }
+
+    /// 更新阈值与窗口长度；保留已有计数，避免瞬时放行双倍配额。
+    pub fn configure(&self, limit: u32, window_seconds: u64) {
+        let mut state = lock(&self.state);
+        state.limit = limit.max(1);
+        state.window_seconds = window_seconds.max(1);
+    }
+
+    /// 取一次发码许可；超限返回还需等待的时长。
+    pub fn try_acquire(&self, source: Option<&str>) -> Result<(), Duration> {
+        let now = Instant::now();
+        let mut state = lock(&self.state);
+        let limit = state.limit;
+        let window_seconds = state.window_seconds;
+        let key = source.unwrap_or("-");
+        let bucket = state.sources.entry(key.to_string()).or_default();
+        while let Some(&oldest) = bucket.front() {
+            if now.duration_since(oldest).as_secs() >= window_seconds {
+                bucket.pop_front();
+            } else {
+                break;
+            }
+        }
+        if bucket.len() as u32 >= limit {
+            let wait = wait_of(bucket, now, limit, window_seconds);
+            return Err(Duration::from_secs(wait));
+        }
+        bucket.push_back(now);
+        if state.sources.len() > MAX_SOURCES {
+            prune_sources(&mut state, now);
+        }
+        Ok(())
+    }
+}
+
 /// 判断客户端地址能否区分来源。
 ///
 /// 后端只监听 127.0.0.1、由同机 Next 反代访问时，请求方地址始终是回环地址，
@@ -353,6 +424,34 @@ fn prune_all(state: &mut AttemptState, now: Instant) {
     let keys: Vec<String> = state.failures.keys().cloned().collect();
     for key in keys {
         prune_bucket(state, &key, now);
+    }
+}
+
+/// 清理过期的发码来源；仍然超限时淘汰计数最早的来源。
+///
+/// 来源过多时整体清空会一次性放行所有来源，因此只淘汰最早的那个。
+fn prune_sources(state: &mut IssueState, now: Instant) {
+    for bucket in state.sources.values_mut() {
+        while let Some(&oldest) = bucket.front() {
+            if now.duration_since(oldest).as_secs() >= state.window_seconds {
+                bucket.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+    state.sources.retain(|_, bucket| !bucket.is_empty());
+    while state.sources.len() > MAX_SOURCES {
+        let Some(oldest) = state
+            .sources
+            .iter()
+            .filter_map(|(key, bucket)| bucket.front().map(|stamp| (*stamp, key.clone())))
+            .min_by_key(|(stamp, _)| *stamp)
+            .map(|(_, key)| key)
+        else {
+            break;
+        };
+        state.sources.remove(&oldest);
     }
 }
 
@@ -504,5 +603,72 @@ mod tests {
             limiter.record_failure(None, &format!("user{index}@example.com"));
         }
         assert_eq!(limiter.remaining_wait(None, "fresh@example.com"), 0);
+    }
+
+    #[test]
+    fn issue_limiter_counts_per_source() {
+        let limiter = IssueLimiter::new(2, 3600);
+
+        assert!(limiter.try_acquire(Some("1.2.3.4")).is_ok());
+        assert!(limiter.try_acquire(Some("1.2.3.4")).is_ok());
+        let wait = limiter.try_acquire(Some("1.2.3.4")).unwrap_err();
+        assert!(wait >= Duration::from_secs(1));
+        // 别的来源不受牵连
+        assert!(limiter.try_acquire(Some("5.6.7.8")).is_ok());
+    }
+
+    #[test]
+    fn issue_limiter_shares_bucket_for_unknown_source() {
+        let limiter = IssueLimiter::new(1, 3600);
+
+        assert!(limiter.try_acquire(None).is_ok());
+        assert!(limiter.try_acquire(None).is_err());
+    }
+
+    #[test]
+    fn issue_limiter_concurrent_acquire_cannot_bypass_limit() {
+        let limiter = Arc::new(IssueLimiter::new(5, 3600));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let limiter = limiter.clone();
+            handles.push(std::thread::spawn(move || {
+                limiter.try_acquire(Some("1.2.3.4")).is_ok()
+            }));
+        }
+        let granted = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|granted| *granted)
+            .count();
+        assert_eq!(granted, 5);
+    }
+
+    #[test]
+    fn issue_limiter_window_expires() {
+        let limiter = IssueLimiter::new(1, 1);
+
+        assert!(limiter.try_acquire(Some("1.2.3.4")).is_ok());
+        assert!(limiter.try_acquire(Some("1.2.3.4")).is_err());
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(limiter.try_acquire(Some("1.2.3.4")).is_ok());
+    }
+
+    #[test]
+    fn issue_limiter_configure_keeps_counts() {
+        let limiter = IssueLimiter::new(2, 3600);
+
+        assert!(limiter.try_acquire(Some("1.2.3.4")).is_ok());
+        limiter.configure(1, 3600);
+        assert!(limiter.try_acquire(Some("1.2.3.4")).is_err());
+    }
+
+    #[test]
+    fn issue_limiter_bounds_source_count() {
+        let limiter = IssueLimiter::new(10, 3600);
+        for index in 0..(MAX_SOURCES + 100) {
+            let source = format!("10.0.{}.{}", index / 256, index % 256);
+            assert!(limiter.try_acquire(Some(&source)).is_ok());
+        }
+        assert!(lock(&limiter.state).sources.len() <= MAX_SOURCES);
     }
 }
