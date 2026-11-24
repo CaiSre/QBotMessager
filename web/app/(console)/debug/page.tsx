@@ -219,7 +219,6 @@ export default function DebugPage() {
     initialized.current = true;
     setHookType(first.hook_type);
     setChannelId(String(first.id));
-    setToken(first.webhook_token);
     setMsgType(defaultMsgType(first.hook_type).value);
   }, [channelList]);
 
@@ -245,7 +244,6 @@ export default function DebugPage() {
     if (!MSG_TYPES[channel.hook_type].some((item) => item.value === msgType)) {
       setMsgType(defaultMsgType(channel.hook_type).value);
     }
-    setToken(channel.webhook_token);
     setResult(null);
     setError(null);
   }
@@ -454,13 +452,16 @@ export default function DebugPage() {
                 <Label htmlFor="debug-token">Webhook Token</Label>
                 <Input
                   id="debug-token"
-                  placeholder="选择通道后自动填入，也可手动粘贴"
+                  placeholder="粘贴通道令牌"
                   value={token}
                   onChange={(event) => {
                     setToken(event.target.value);
                     setResult(null);
                   }}
                 />
+                <p className="text-xs text-muted-foreground">
+                  令牌只在创建/轮换通道时展示一次，请从当时的窗口复制到这里。
+                </p>
               </div>
 
               {typeDef.showTitle ? (

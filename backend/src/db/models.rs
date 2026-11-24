@@ -162,7 +162,7 @@ pub struct BotProfile {
     pub created_at: NaiveDateTime,
 }
 
-/// 钩子类型接入通道；webhook_token 用于反查所属机器人。
+/// 钩子类型接入通道；webhook_token_hash 用于反查所属机器人。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Channel {
     /// 主键。
@@ -173,8 +173,8 @@ pub struct Channel {
     pub hook_type: String,
     /// 推送来源（用户自填）。
     pub push_source: String,
-    /// Webhook 凭据（唯一）。
-    pub webhook_token: String,
+    /// Webhook 凭据哈希（唯一）；明文只在创建/轮换时交付一次。
+    pub webhook_token_hash: String,
     /// 是否启用。
     pub enabled: bool,
     /// 钩子附加配置（JSON）。

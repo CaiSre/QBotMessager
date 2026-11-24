@@ -24,7 +24,7 @@ use crate::adapters::{
     Adapter, AdapterError, DingTalkAdapter, FeishuAdapter, GitHubAdapter, UnifiedMessage,
     WeComAdapter,
 };
-use crate::crypto::decrypt_secret;
+use crate::crypto::{decrypt_secret, hash_token};
 use crate::db::models::{BotProfile, Channel, HOOK_TYPE_GITHUB, HOOK_TYPES};
 use crate::db::queries;
 use crate::error::AppError;
@@ -132,7 +132,8 @@ async fn receive(
     }
 
     let Some(channel) =
-        queries::channels::find_enabled_for_hook_type(&state.pool, hook_type, &token).await?
+        queries::channels::find_enabled_for_hook_type(&state.pool, hook_type, &hash_token(&token))
+            .await?
     else {
         return Ok(hook_type_response(
             hook_type,

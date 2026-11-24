@@ -13,7 +13,6 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration as ChronoDuration, NaiveDateTime, Utc};
 use rand::Rng;
-use sha2::{Digest, Sha256};
 use sqlx::MySqlPool;
 
 use crate::config::Config;
@@ -35,8 +34,7 @@ pub fn new_session_token() -> String {
 
 /// 计算入库用的 token 哈希（SHA-256 小写十六进制）。
 pub fn hash_token(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    crate::crypto::hash_token(token)
 }
 
 /// 会话是否仍然有效。

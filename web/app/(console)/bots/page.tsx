@@ -108,7 +108,9 @@ export default function BotsPage() {
   const [channelSecret, setChannelSecret] = useState("");
   const [channelResult, setChannelResult] = useState<{
     webhookUrl: string;
-    secret: string;
+    token: string;
+    secret?: string | undefined;
+    hookType: HookType;
     rotated: boolean;
   } | null>(null);
 
@@ -204,31 +206,33 @@ export default function BotsPage() {
     setSaving(true);
     setError(null);
     try {
-      const result = await api<{ webhook_url?: string; secret?: string }>(
-        "/api/admin/channels",
-        {
-          method: "POST",
-          body: {
-            hook_type: channelHookType,
-            push_source: channelPushSource.trim(),
-            bot_profile_id: Number(channelBotId),
-            enabled: channelEnabled,
-            ...(channelHookType === "github" && channelSecret.trim()
-              ? { secret: channelSecret.trim() }
-              : {}),
-          },
+      const result = await api<{
+        webhook_url?: string;
+        webhook_token?: string;
+        secret?: string;
+      }>("/api/admin/channels", {
+        method: "POST",
+        body: {
+          hook_type: channelHookType,
+          push_source: channelPushSource.trim(),
+          bot_profile_id: Number(channelBotId),
+          enabled: channelEnabled,
+          ...(channelHookType === "github" && channelSecret.trim()
+            ? { secret: channelSecret.trim() }
+            : {}),
         },
-      );
+      });
       setChannelOpen(false);
       setChannelSecret("");
       await channels.reload();
-      if (result.webhook_url && result.secret) {
-        setChannelResult({
-          webhookUrl: result.webhook_url,
-          secret: result.secret,
-          rotated: false,
-        });
-      }
+      // 令牌只在创建时返回一次，关闭后无法再取回。
+      setChannelResult({
+        webhookUrl: result.webhook_url ?? "",
+        token: result.webhook_token ?? "",
+        secret: result.secret,
+        hookType: channelHookType,
+        rotated: false,
+      });
     } catch (err) {
       setError(messageOf(err));
     } finally {
@@ -251,18 +255,20 @@ export default function BotsPage() {
   async function rotateChannel(channel: Channel) {
     setError(null);
     try {
-      const result = await api<{ webhook_url?: string; secret?: string }>(
-        `/api/admin/channels/${channel.id}/rotate`,
-        { method: "POST" },
-      );
+      const result = await api<{
+        webhook_url?: string;
+        webhook_token?: string;
+        secret?: string;
+      }>(`/api/admin/channels/${channel.id}/rotate`, { method: "POST" });
       await channels.reload();
-      if (result.webhook_url && result.secret) {
-        setChannelResult({
-          webhookUrl: result.webhook_url,
-          secret: result.secret,
-          rotated: true,
-        });
-      }
+      // 轮换后的新令牌同样只返回一次。
+      setChannelResult({
+        webhookUrl: result.webhook_url ?? "",
+        token: result.webhook_token ?? "",
+        secret: result.secret,
+        hookType: channel.hook_type,
+        rotated: true,
+      });
     } catch (err) {
       setError(messageOf(err));
     }
@@ -393,7 +399,7 @@ export default function BotsPage() {
             <CardDescription>
               按钩子类型接入：钉钉 /webhook/dingtalk、企业微信 /webhook/wecom、飞书
               /webhook/feishu；GitHub 使用 /webhook/github/{"{token}"}，token 已包含在 Payload URL
-              中，并需在 GitHub 侧配置 Secret
+              中，并需在 GitHub 侧配置 Secret。令牌只在创建/轮换时展示一次，请及时保存。
             </CardDescription>
             <CardAction>
               <Button
@@ -441,12 +447,7 @@ export default function BotsPage() {
                       </TableCell>
                       <TableCell>{botName(channel.bot_profile_id)}</TableCell>
                       <TableCell>
-                        <div className="flex items-center gap-1">
-                          <span className="block max-w-32 truncate text-xs">
-                            {channel.webhook_token}
-                          </span>
-                          <CopyButton value={channel.webhook_token} />
-                        </div>
+                        <span className="text-xs text-muted-foreground">仅创建/轮换时展示一次</span>
                       </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1">
@@ -456,7 +457,9 @@ export default function BotsPage() {
                           >
                             {channel.webhook_url}
                           </span>
-                          <CopyButton value={channel.webhook_url} />
+                          {channel.hook_type === "github" ? null : (
+                            <CopyButton value={channel.webhook_url} />
+                          )}
                         </div>
                       </TableCell>
                       <TableCell>
@@ -743,21 +746,24 @@ export default function BotsPage() {
         <DialogContent className="grid-cols-[minmax(0,1fr)] sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>
-              {channelResult?.rotated ? "GitHub 通道已轮换" : "GitHub 通道已创建"}
+              {channelResult?.rotated ? "通道已轮换" : "通道已创建"}（
+              {channelResult ? HOOK_TYPE_LABELS[channelResult.hookType] : ""}）
             </DialogTitle>
           </DialogHeader>
           <div className="flex min-w-0 flex-col gap-4 text-sm">
-            <p className="text-muted-foreground">
-              请在 GitHub 仓库 Settings → Webhooks → Add webhook 中填写以下两项，Content type
-              选择 application/json，SSL verification 保持启用，再选择要订阅的事件。
-            </p>
-            <CopyField
-              label="Payload URL（token 已包含在地址中）"
-              value={channelResult?.webhookUrl ?? ""}
-            />
-            <CopyField label="Secret" value={channelResult?.secret ?? ""} />
+            {channelResult?.hookType === "github" ? (
+              <p className="text-muted-foreground">
+                请在 GitHub 仓库 Settings → Webhooks → Add webhook 中填写以下两项，Content type
+                选择 application/json，SSL verification 保持启用，再选择要订阅的事件。
+              </p>
+            ) : null}
+            <CopyField label="Webhook 地址" value={channelResult?.webhookUrl ?? ""} />
+            <CopyField label="Webhook Token" value={channelResult?.token ?? ""} />
+            {channelResult?.secret ? (
+              <CopyField label="Secret" value={channelResult.secret} />
+            ) : null}
             <FieldDescription>
-              密钥只显示这一次，关闭后无法再次查看；如需更换请使用通道列表中的「轮换」。
+              令牌只显示这一次，关闭后无法再次查看；如需更换请使用通道列表中的「轮换」。
             </FieldDescription>
             <div className="flex justify-end">
               <Button onClick={() => setChannelResult(null)}>知道了</Button>

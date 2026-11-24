@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use sqlx::{MySql, QueryBuilder};
 
 use crate::auth::sessions;
-use crate::crypto::{encrypt_secret, mask_secret, random_token};
+use crate::crypto::{encrypt_secret, hash_token, mask_secret, random_token};
 use crate::db::models::{
     BotProfile, Channel, HOOK_TYPE_GITHUB, HOOK_TYPES, PushLog, STATUS_ACTIVE, User,
 };
@@ -512,6 +512,9 @@ fn webhook_url(base: &str, hook_type: &str, token: &str) -> String {
     }
 }
 
+/// 通道列表里代替令牌明文的占位符。
+const WEBHOOK_TOKEN_PLACEHOLDER: &str = "{token}";
+
 /// 解析查询参数；同名参数取最后一个（与 Starlette 的 `.get` 一致）。
 fn query_params(req: &HttpRequest) -> HashMap<String, String> {
     let mut params = HashMap::new();
@@ -799,8 +802,8 @@ async fn list_channels(
             "hook_type": channel.hook_type,
             "push_source": channel.push_source,
             "bot_profile_id": channel.bot_profile_id,
-            "webhook_token": channel.webhook_token,
-            "webhook_url": webhook_url(&base, &channel.hook_type, &channel.webhook_token),
+            // 令牌只存哈希，明文无法再取回；GitHub 地址里的令牌位用占位符表示。
+            "webhook_url": webhook_url(&base, &channel.hook_type, WEBHOOK_TOKEN_PLACEHOLDER),
             "has_secret": channel_has_secret(&channel),
             "enabled": channel.enabled,
         }));
@@ -851,7 +854,8 @@ async fn create_channel(
             bot_profile_id: data.bot_profile_id,
             hook_type: &data.hook_type,
             push_source,
-            webhook_token: &token,
+            // 库里只留哈希，明文仅在本次响应里交付一次。
+            webhook_token_hash: &hash_token(&token),
             enabled: data.enabled,
             extra: extra.as_ref(),
             created_at: now,
@@ -870,11 +874,14 @@ async fn create_channel(
     .await?;
     tx.commit().await?;
 
-    let mut result = json!({"id": channel_id, "webhook_token": token.clone()});
+    let settings = state.settings().clone();
+    let base = webhook_base(&req, &settings);
+    let mut result = json!({
+        "id": channel_id,
+        "webhook_token": token.clone(),
+        "webhook_url": webhook_url(&base, &data.hook_type, &token),
+    });
     if let Some(secret) = secret_plain {
-        let settings = state.settings().clone();
-        let base = webhook_base(&req, &settings);
-        result["webhook_url"] = Value::String(webhook_url(&base, HOOK_TYPE_GITHUB, &token));
         result["secret"] = Value::String(secret);
     }
     Ok(HttpResponse::Created().json(result))
@@ -967,14 +974,15 @@ async fn rotate_channel(
     let ip = state.client_ip(&req);
     let mut tx = state.pool.begin().await?;
     if channel.hook_type == HOOK_TYPE_GITHUB {
-        sqlx::query("UPDATE channels SET webhook_token = ?, extra = ? WHERE id = ?")
-            .bind(&token)
+        sqlx::query("UPDATE channels SET webhook_token_hash = ?, extra = ? WHERE id = ?")
+            .bind(hash_token(&token))
             .bind(extra.as_ref())
             .bind(channel.id)
             .execute(&mut *tx)
             .await?;
     } else {
-        queries::channels::update_webhook_token(&mut *tx, channel.id, &token).await?;
+        queries::channels::update_webhook_token_hash(&mut *tx, channel.id, &hash_token(&token))
+            .await?;
     }
     audit_tx(
         &mut tx,
@@ -988,11 +996,14 @@ async fn rotate_channel(
     .await?;
     tx.commit().await?;
 
-    let mut result = json!({"id": channel.id, "webhook_token": token.clone()});
+    let settings = state.settings().clone();
+    let base = webhook_base(&req, &settings);
+    let mut result = json!({
+        "id": channel.id,
+        "webhook_token": token.clone(),
+        "webhook_url": webhook_url(&base, &channel.hook_type, &token),
+    });
     if let Some(secret) = secret_plain {
-        let settings = state.settings().clone();
-        let base = webhook_base(&req, &settings);
-        result["webhook_url"] = Value::String(webhook_url(&base, HOOK_TYPE_GITHUB, &token));
         result["secret"] = Value::String(secret);
     }
     Ok(HttpResponse::Ok().json(result))

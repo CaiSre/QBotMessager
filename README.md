@@ -80,7 +80,7 @@ MySQL 8.4（业务表 + apalis 队列表）
 
 - 启动时执行 `sqlx::migrate!` 内嵌迁移（幂等），无需额外迁移容器或命令。
 - Webhook 只做校验与入队，worker 按机器人频控节奏发送并写入推送日志；幂等守卫同样落在 MySQL 表，全链路无外部中间件。
-- 启动时执行幂等引导：超管已存在则跳过；提供 `QQ_APPID` / `QQ_APP_SECRET` 时导入默认机器人与三条通道，不覆盖已有配置。
+- 启动时执行幂等引导：超管已存在则跳过；提供 `QQ_APPID` / `QQ_APP_SECRET` 时导入默认机器人，不覆盖已有配置。接入通道需在控制台创建（令牌只在创建时展示一次）。
 
 ## 快速开始
 
@@ -212,7 +212,7 @@ docker compose up -d --build
 ### 创建机器人与通道
 
 1. 在「机器人」页新增机器人，填写 AppID、AppSecret 与默认接收方（openid 或群 openid）。
-2. 在同一页新增通道，选择钩子类型并填写推送来源（可选，用于区分 Webhook 的使用位置）后即生成 `webhook_token` 与完整 Webhook 地址，可直接复制。GitHub 的 Webhook 设置中没有单独的 token 字段：token 已包含在 `/webhook/github/{token}` 地址中，填入 Payload URL 即可；创建时还会生成 Secret，需填到 GitHub 的 Secret 字段。
+2. 在同一页新增通道，选择钩子类型并填写推送来源（可选，用于区分 Webhook 的使用位置）后即生成 Webhook Token 与完整 Webhook 地址，**只展示这一次**，请立即复制保存。GitHub 的 Webhook 设置中没有单独的 token 字段：token 已包含在 `/webhook/github/{token}` 地址中，填入 Payload URL 即可；创建时还会生成 Secret，需填到 GitHub 的 Secret 字段。
 3. 通道可在「轮换」后立即失效旧 token，也可停用而不删除；GitHub 通道轮换会同时更换签名密钥，需要同步更新 GitHub 配置。
 
 ### 发送 Webhook
@@ -332,7 +332,7 @@ bun run build
 - 部署在反向代理之后时设置 `TRUST_PROXY=true`，否则登录限速只能看到代理地址。
 - 只有在提供方确实验证过邮箱归属时才开启 OAuth2 提供方的「信任邮箱」，否则同邮箱的本地账号可能被冒名登录接管。
 - 不要将 MySQL 端口暴露到公网（compose 未映射 3306）。
-- Webhook token 具有推送权限，泄露后请在「机器人 → 通道」中立即轮换。GitHub 通道的 URL token 与 Secret 相互独立：token 泄露不足以伪造投递，但仍应同时轮换并同步更新 GitHub 配置。
+- Webhook token 具有推送权限，泄露后请在「机器人 → 通道」中立即轮换。库内只保存 token 的 SHA-256 哈希，明文仅在创建/轮换时展示一次，无法再次查看。GitHub 通道的 URL token 与 Secret 相互独立：token 泄露不足以伪造投递，但仍应同时轮换并同步更新 GitHub 配置。
 - 邀请码按需签发并限定邮箱与有效期，注册入口用完即关。
 - 登录失败限速按 (来源地址, 账号) 计数：部署在反向代理之后时设置 `TRUST_PROXY=true` 以取得真实客户端地址。
 - 验证码发码按来源地址限速（默认每小时 30 次）：同一来源超出后返回 429。反代未透传真实客户端地址时所有用户共享同一额度，用户较多时应调高「单来源发码上限」并设置 `TRUST_PROXY=true`。

@@ -36,7 +36,7 @@ use qbotmessager::adapters::{
 };
 use qbotmessager::auth::sessions;
 use qbotmessager::config::Config;
-use qbotmessager::crypto::encrypt_secret;
+use qbotmessager::crypto::{encrypt_secret, hash_token};
 use qbotmessager::db::queries;
 use qbotmessager::markdown::{degrade_tables, sanitize_markdown, sanitize_text};
 use qbotmessager::renderer::{MSG_TYPE_MARKDOWN, MSG_TYPE_TEXT, render_qq, render_qq_with_limits};
@@ -467,12 +467,12 @@ async fn make_channel(
         (None, None)
     };
     let id = sqlx::query(
-        "INSERT INTO channels (bot_profile_id, hook_type, push_source, webhook_token, enabled, \
+        "INSERT INTO channels (bot_profile_id, hook_type, push_source, webhook_token_hash, enabled, \
          extra, created_at) VALUES (?, ?, '集成测试', ?, TRUE, ?, ?)",
     )
     .bind(bot_id)
     .bind(hook_type)
-    .bind(&token)
+    .bind(sessions::hash_token(&token))
     .bind(extra)
     .bind(Utc::now().naive_utc())
     .execute(&fixture.pool)
@@ -768,6 +768,47 @@ async fn rejects_bad_token_hook_type_and_body() {
     );
     assert_status!(unknown_type, StatusCode::BAD_REQUEST);
     assert!(fixture.mock.calls().is_empty());
+}
+
+/// 迁移用 MySQL 的 SHA2 把既有明文改写为哈希：两侧结果必须一致，
+/// 否则升级后旧令牌会全部失效。
+#[actix_web::test]
+async fn mysql_sha2_matches_rust_token_hash() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let owner = make_user(&fixture).await;
+    let bot_id = make_bot(&fixture, owner, &["u-sha2"], None).await;
+    // 令牌带上用例随机前缀：哈希列有唯一约束，重复跑同一用例不会撞车。
+    let token = format!("legacy-plaintext-token-{}", fixture.prefix);
+
+    let sql_hash: String = sqlx::query_scalar("SELECT SHA2(?, 256)")
+        .bind(&token)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("查询 SHA2 失败");
+    assert_eq!(sql_hash, hash_token(&token));
+
+    // 用 SQL 算出的哈希入库（等同迁移改写的结果），明文令牌仍应通过鉴权。
+    sqlx::query(
+        "INSERT INTO channels (bot_profile_id, hook_type, push_source, webhook_token_hash, enabled,          extra, created_at) VALUES (?, 'dingtalk', '迁移校验', ?, TRUE, NULL, ?)",
+    )
+    .bind(bot_id)
+    .bind(&sql_hash)
+    .bind(Utc::now().naive_utc())
+    .execute(&fixture.pool)
+    .await
+    .expect("插入测试通道失败");
+
+    let accepted = send!(
+        app,
+        webhook_request(
+            "/webhook/dingtalk",
+            &json!({"msgtype": "text", "text": {"content": "sha2"}}),
+            &token
+        )
+    );
+    assert_status!(accepted, StatusCode::OK);
 }
 
 #[actix_web::test]

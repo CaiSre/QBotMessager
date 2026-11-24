@@ -1,10 +1,10 @@
-//! 首次启动引导：初始超级管理员，并把环境变量中的 QQ 凭据导入为默认机器人与通道。
+//! 首次启动引导：初始超级管理员，并把环境变量中的 QQ 凭据导入为默认机器人。
 //!
 //! 语义：
 //! - `BOOTSTRAP_ADMIN_EMAIL` 与 `BOOTSTRAP_ADMIN_PASSWORD` 同时非空才创建；
 //! - 邮箱已存在时不改密码；仅当系统没有任何启用的超管时把该账号提升为超管；
 //! - 仅当该管理员还没有机器人、且 `QQ_APPID` / `QQ_APP_SECRET` 同时非空时导入机器人
-//!   与钉钉 / 企业微信 / 飞书三条通道（GitHub 通道需要手动创建）。
+//!   （接入通道需在控制台创建：令牌只存哈希，明文仅在创建时展示一次）。
 
 use chrono::Utc;
 use serde_json::json;
@@ -12,13 +12,10 @@ use sqlx::MySqlPool;
 
 use crate::auth::passwords::hash_password_async;
 use crate::config::Config;
-use crate::crypto::{encrypt_secret, random_token};
-use crate::db::models::{
-    HOOK_TYPE_DINGTALK, HOOK_TYPE_FEISHU, HOOK_TYPE_WECOM, ROLE_SUPER_ADMIN, STATUS_ACTIVE, User,
-};
+use crate::crypto::encrypt_secret;
+use crate::db::models::{ROLE_SUPER_ADMIN, STATUS_ACTIVE, User};
 use crate::db::queries;
 use crate::db::queries::bots::NewBotProfile;
-use crate::db::queries::channels::NewChannel;
 use crate::db::queries::users::NewUser;
 use crate::error::AppError;
 use crate::services::runtime_settings::RuntimeSettings;
@@ -111,7 +108,7 @@ pub async fn run(
         let now = Utc::now().naive_utc();
 
         let mut tx = pool.begin().await?;
-        let bot_id = queries::bots::insert(
+        queries::bots::insert(
             &mut *tx,
             &NewBotProfile {
                 owner_user_id: admin.id,
@@ -126,24 +123,8 @@ pub async fn run(
             },
         )
         .await?;
-        for hook_type in [HOOK_TYPE_DINGTALK, HOOK_TYPE_WECOM, HOOK_TYPE_FEISHU] {
-            let token = random_token(24);
-            queries::channels::insert(
-                &mut *tx,
-                &NewChannel {
-                    bot_profile_id: bot_id,
-                    hook_type,
-                    push_source: "",
-                    webhook_token: &token,
-                    enabled: true,
-                    extra: None,
-                    created_at: now,
-                },
-            )
-            .await?;
-        }
         tx.commit().await?;
-        tracing::info!("已从环境变量导入默认 QQ 机器人配置");
+        tracing::info!("已从环境变量导入默认 QQ 机器人配置；接入通道请在控制台创建");
         summary.bot_created = true;
     }
 

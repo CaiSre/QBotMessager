@@ -59,7 +59,6 @@ export interface Channel {
   hook_type: HookType;
   push_source: string;
   bot_profile_id: number;
-  webhook_token: string;
   webhook_url: string;
   has_secret: boolean;
   enabled: boolean;

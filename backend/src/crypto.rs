@@ -1,15 +1,18 @@
-//! 敏感字段的落库加密（Fernet）。
+//! 敏感字段的落库加密（Fernet）与随机 token 的入库哈希。
 //!
 //!
 //! - `APP_SECRET_KEY` 缺失时降级为明文存储（带 `plain1:` 前缀）；
 //! - 密文带 `enc1:` 前缀；
 //! - 解密结果不得写回 ORM 实体，否则会把明文写回库。
+//! - 高熵随机 token（会话、Webhook 凭据）只存 [`hash_token`] 的 SHA-256 哈希，
+//!   明文仅在生成时交付一次。
 //!
 //! 密钥为 44 字符 urlsafe-base64 编码的 32 字节，**原样**使用，不做 KDF 派生。
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::Rng;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// 生成 `bytes` 字节的 urlsafe-base64 随机 token（无填充）。
@@ -17,6 +20,14 @@ pub fn random_token(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
     rand::rng().fill_bytes(&mut buffer);
     URL_SAFE_NO_PAD.encode(buffer)
+}
+
+/// 计算随机 token 的入库哈希（SHA-256 小写十六进制）。
+///
+/// token 本身是全熵随机串，无需慢速 KDF；哈希后仍可直接按唯一索引比对。
+pub fn hash_token(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// 密文前缀。

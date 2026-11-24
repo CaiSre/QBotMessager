@@ -610,8 +610,8 @@ pub mod channels {
         pub hook_type: &'a str,
         /// 推送来源（用户自填）。
         pub push_source: &'a str,
-        /// Webhook 凭据。
-        pub webhook_token: &'a str,
+        /// Webhook 凭据哈希。
+        pub webhook_token_hash: &'a str,
         /// 是否启用。
         pub enabled: bool,
         /// 钩子附加配置（JSON）。
@@ -626,7 +626,7 @@ pub mod channels {
         E: Executor<'e, Database = MySql>,
     {
         sqlx::query_as::<_, Channel>(
-            "SELECT id, bot_profile_id, hook_type, push_source, webhook_token, enabled, extra, created_at \
+            "SELECT id, bot_profile_id, hook_type, push_source, webhook_token_hash, enabled, extra, created_at \
              FROM channels WHERE id = ?",
         )
         .bind(id)
@@ -634,20 +634,20 @@ pub mod channels {
         .await
     }
 
-    /// 按 webhook token + 钩子类型查询启用中的通道（Webhook 鉴权用）。
+    /// 按 webhook token 哈希 + 钩子类型查询启用中的通道（Webhook 鉴权用）。
     pub async fn find_enabled_for_hook_type<'e, E>(
         executor: E,
         hook_type: &str,
-        webhook_token: &str,
+        webhook_token_hash: &str,
     ) -> Result<Option<Channel>, sqlx::Error>
     where
         E: Executor<'e, Database = MySql>,
     {
         sqlx::query_as::<_, Channel>(
-            "SELECT id, bot_profile_id, hook_type, push_source, webhook_token, enabled, extra, created_at \
-             FROM channels WHERE webhook_token = ? AND hook_type = ? AND enabled = TRUE",
+            "SELECT id, bot_profile_id, hook_type, push_source, webhook_token_hash, enabled, extra, created_at \
+             FROM channels WHERE webhook_token_hash = ? AND hook_type = ? AND enabled = TRUE",
         )
-        .bind(webhook_token)
+        .bind(webhook_token_hash)
         .bind(hook_type)
         .fetch_optional(executor)
         .await
@@ -662,7 +662,7 @@ pub mod channels {
         E: Executor<'e, Database = MySql>,
     {
         sqlx::query_as::<_, Channel>(
-            "SELECT id, bot_profile_id, hook_type, push_source, webhook_token, enabled, extra, created_at \
+            "SELECT id, bot_profile_id, hook_type, push_source, webhook_token_hash, enabled, extra, created_at \
              FROM channels WHERE bot_profile_id = ? ORDER BY id",
         )
         .bind(bot_profile_id)
@@ -683,7 +683,7 @@ pub mod channels {
                 sqlx::query(
                     "SELECT c.id AS c_id, c.bot_profile_id AS c_bot_profile_id, \
                      c.hook_type AS c_hook_type, c.push_source AS c_push_source, \
-                     c.webhook_token AS c_webhook_token, \
+                     c.webhook_token_hash AS c_webhook_token_hash, \
                      c.enabled AS c_enabled, c.extra AS c_extra, c.created_at AS c_created_at, \
                      b.id AS b_id, b.owner_user_id AS b_owner_user_id, b.name AS b_name, \
                      b.qq_appid AS b_qq_appid, b.qq_app_secret AS b_qq_app_secret, \
@@ -701,7 +701,7 @@ pub mod channels {
                 sqlx::query(
                     "SELECT c.id AS c_id, c.bot_profile_id AS c_bot_profile_id, \
                      c.hook_type AS c_hook_type, c.push_source AS c_push_source, \
-                     c.webhook_token AS c_webhook_token, \
+                     c.webhook_token_hash AS c_webhook_token_hash, \
                      c.enabled AS c_enabled, c.extra AS c_extra, c.created_at AS c_created_at, \
                      b.id AS b_id, b.owner_user_id AS b_owner_user_id, b.name AS b_name, \
                      b.qq_appid AS b_qq_appid, b.qq_app_secret AS b_qq_app_secret, \
@@ -721,7 +721,7 @@ pub mod channels {
                 bot_profile_id: row.try_get("c_bot_profile_id")?,
                 hook_type: row.try_get("c_hook_type")?,
                 push_source: row.try_get("c_push_source")?,
-                webhook_token: row.try_get("c_webhook_token")?,
+                webhook_token_hash: row.try_get("c_webhook_token_hash")?,
                 enabled: row.try_get("c_enabled")?,
                 extra: row.try_get("c_extra")?,
                 created_at: row.try_get("c_created_at")?,
@@ -749,13 +749,13 @@ pub mod channels {
         E: Executor<'e, Database = MySql>,
     {
         let result = sqlx::query(
-            "INSERT INTO channels (bot_profile_id, hook_type, push_source, webhook_token, \
+            "INSERT INTO channels (bot_profile_id, hook_type, push_source, webhook_token_hash, \
              enabled, extra, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(channel.bot_profile_id)
         .bind(channel.hook_type)
         .bind(channel.push_source)
-        .bind(channel.webhook_token)
+        .bind(channel.webhook_token_hash)
         .bind(channel.enabled)
         .bind(channel.extra)
         .bind(channel.created_at)
@@ -764,17 +764,17 @@ pub mod channels {
         Ok(result.last_insert_id() as i64)
     }
 
-    /// 轮换 webhook token。
-    pub async fn update_webhook_token<'e, E>(
+    /// 轮换 webhook token（写入新哈希）。
+    pub async fn update_webhook_token_hash<'e, E>(
         executor: E,
         id: i64,
-        webhook_token: &str,
+        webhook_token_hash: &str,
     ) -> Result<u64, sqlx::Error>
     where
         E: Executor<'e, Database = MySql>,
     {
-        let result = sqlx::query("UPDATE channels SET webhook_token = ? WHERE id = ?")
-            .bind(webhook_token)
+        let result = sqlx::query("UPDATE channels SET webhook_token_hash = ? WHERE id = ?")
+            .bind(webhook_token_hash)
             .bind(id)
             .execute(executor)
             .await?;
@@ -1693,13 +1693,13 @@ pub mod email_codes {
 pub mod webhooks {
     use super::*;
 
-    /// 按钩子类型与 token 查询启用的通道。
+    /// 按钩子类型与 token 哈希查询启用的通道。
     pub async fn find_enabled_channel(
         pool: &MySqlPool,
         hook_type: &str,
-        webhook_token: &str,
+        webhook_token_hash: &str,
     ) -> Result<Option<Channel>, sqlx::Error> {
-        channels::find_enabled_for_hook_type(pool, hook_type, webhook_token).await
+        channels::find_enabled_for_hook_type(pool, hook_type, webhook_token_hash).await
     }
 
     /// 按机器人主键查询启用的机器人配置。
@@ -1714,9 +1714,9 @@ pub mod webhooks {
     pub async fn resolve_enabled(
         pool: &MySqlPool,
         hook_type: &str,
-        webhook_token: &str,
+        webhook_token_hash: &str,
     ) -> Result<Option<(Channel, BotProfile)>, sqlx::Error> {
-        let Some(channel) = find_enabled_channel(pool, hook_type, webhook_token).await? else {
+        let Some(channel) = find_enabled_channel(pool, hook_type, webhook_token_hash).await? else {
             return Ok(None);
         };
         let bot = find_enabled_bot(pool, channel.bot_profile_id).await?;

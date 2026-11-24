@@ -11,7 +11,6 @@
 
 mod common;
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
 
@@ -22,10 +21,7 @@ use qbotmessager::auth::passwords::{hash_password_async, verify_password_async};
 use qbotmessager::bootstrap;
 use qbotmessager::config::Config;
 use qbotmessager::crypto::decrypt_secret;
-use qbotmessager::db::models::{
-    HOOK_TYPE_DINGTALK, HOOK_TYPE_FEISHU, HOOK_TYPE_WECOM, ROLE_SUPER_ADMIN, ROLE_USER,
-    STATUS_ACTIVE, STATUS_DISABLED,
-};
+use qbotmessager::db::models::{ROLE_SUPER_ADMIN, ROLE_USER, STATUS_ACTIVE, STATUS_DISABLED};
 use qbotmessager::db::queries;
 use qbotmessager::db::queries::users::NewUser;
 use qbotmessager::services::runtime_settings::RuntimeSettings;
@@ -155,9 +151,9 @@ async fn insert_user(pool: &MySqlPool, email: &str, role: &str, status: &str) ->
 
 // --------------------------------------------------------------------------- 用例
 
-/// 凭据齐全：创建超管、写入默认机器人与三条通道，密文可解密。
+/// 凭据齐全：创建超管、写入默认机器人，密文可解密；不创建接入通道。
 #[tokio::test]
-async fn creates_admin_bot_and_channels() {
+async fn creates_admin_bot() {
     let _guard = TEST_LOCK.lock().await;
     let pool = test_pool().await;
     reset(&pool).await;
@@ -218,26 +214,11 @@ async fn creates_admin_bot_and_channels() {
         "bootstrap-app-secret"
     );
 
+    // 接入通道不在引导里创建：令牌只存哈希，明文只能在控制台创建时交付一次。
     let channels = queries::channels::list_for_bot(&pool, bot.id)
         .await
         .expect("查询通道失败");
-    assert_eq!(channels.len(), 3);
-    let mut hook_types: Vec<&str> = channels.iter().map(|c| c.hook_type.as_str()).collect();
-    hook_types.sort_unstable();
-    let mut expected = vec![HOOK_TYPE_DINGTALK, HOOK_TYPE_FEISHU, HOOK_TYPE_WECOM];
-    expected.sort_unstable();
-    assert_eq!(hook_types, expected);
-    let tokens: HashSet<&str> = channels.iter().map(|c| c.webhook_token.as_str()).collect();
-    assert_eq!(tokens.len(), 3, "通道凭据必须互不相同");
-    for channel in &channels {
-        assert_eq!(
-            channel.webhook_token.len(),
-            32,
-            "24 字节 token 应为 32 字符"
-        );
-        assert!(channel.enabled);
-        assert_eq!(channel.push_source, "", "默认通道的推送来源应为空");
-    }
+    assert!(channels.is_empty(), "引导不应创建接入通道");
 }
 
 /// 同一配置重复执行：不再写入任何行。
@@ -272,7 +253,7 @@ async fn rerun_is_idempotent() {
 
     assert_eq!(count(&pool, "users").await, 1);
     assert_eq!(count(&pool, "bot_profiles").await, 1);
-    assert_eq!(count(&pool, "channels").await, 3);
+    assert_eq!(count(&pool, "channels").await, 0);
 }
 
 /// 未配置管理员凭据：不创建账号，也不导入机器人。

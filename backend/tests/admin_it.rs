@@ -908,12 +908,23 @@ async fn channel_crud_rotate_and_secret() {
     assert_eq!(item["hook_type"], json!("dingtalk"));
     assert_eq!(item["push_source"], json!("订单系统"));
     assert_eq!(item["bot_profile_id"], json!(bot_id));
-    assert_eq!(item["webhook_token"], json!(dingtalk_token));
+    // 令牌只存哈希，列表不再返回明文。
+    assert!(item.get("webhook_token").is_none());
     assert_eq!(item["has_secret"], json!(false));
     assert_eq!(item["enabled"], json!(true));
     let url = item["webhook_url"].as_str().unwrap();
     assert!(url.ends_with("/webhook/dingtalk"), "{url}");
     assert!(!url.contains(&dingtalk_token));
+
+    // 库里只有哈希，明文不可还原。
+    let stored_hash: String =
+        sqlx::query_scalar("SELECT webhook_token_hash FROM channels WHERE id = ?")
+            .bind(dingtalk_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_hash, sessions::hash_token(&dingtalk_token));
+    assert_ne!(stored_hash, dingtalk_token);
 
     let patched = send!(
         app,
@@ -2001,11 +2012,16 @@ async fn settings_public_base_url_applies_immediately() {
         .iter()
         .find(|row| row["hook_type"] == json!("github"))
         .unwrap();
+    // GitHub 地址里的令牌位是占位符：明文只在创建/轮换时返回一次。
     assert_eq!(
         github_row["webhook_url"],
-        json!(format!(
-            "https://push.example.com/webhook/github/{github_token}"
-        ))
+        json!("https://push.example.com/webhook/github/{token}")
+    );
+    assert!(
+        !github_row["webhook_url"]
+            .as_str()
+            .unwrap()
+            .contains(&github_token)
     );
 }
 
