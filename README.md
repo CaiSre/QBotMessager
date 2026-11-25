@@ -118,7 +118,7 @@ openssl rand -base64 32 | tr '+/' '-_'
 镜像发布在 GitHub Container Registry：`latest` 对应 `main` 分支最新构建，`vX.Y.Z` 对应版本标签，`sha-<短哈希>` 对应具体提交。
 
 ```bash
-docker pull ghcr.io/caisre/qbotmessger:latest
+docker pull ghcr.io/caisre/qbotmessager:latest
 ```
 
 预构建镜像不内置数据库，需在 `.env` 中显式指定连接串（sqlx 的协议前缀是 `mysql://`）：
@@ -133,7 +133,7 @@ MYSQL_URL=mysql://qbotmessager:<密码>@db:3306/qbotmessager
 docker run -d --name qbotmessager --restart unless-stopped \
   --env-file .env -p 3000:3000 \
   --stop-timeout 30 \
-  ghcr.io/caisre/qbotmessger:latest
+  ghcr.io/caisre/qbotmessager:latest
 ```
 
 > 镜像仅提供 `linux/amd64`；首次启动会自动完成迁移。MySQL 若也在 Docker 中，请让两个容器加入同一网络，并用服务名作为连接主机。
