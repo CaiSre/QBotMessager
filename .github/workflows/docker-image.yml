@@ -44,9 +44,11 @@ jobs:
             CREATE DATABASE IF NOT EXISTS qbot_test_admin CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
             CREATE DATABASE IF NOT EXISTS qbot_test_webhook CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
             CREATE DATABASE IF NOT EXISTS qbot_test_bootstrap CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+            CREATE DATABASE IF NOT EXISTS qbot_test_retention CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
             GRANT ALL PRIVILEGES ON qbot_test_admin.* TO 'qbotmessager'@'%';
             GRANT ALL PRIVILEGES ON qbot_test_webhook.* TO 'qbotmessager'@'%';
             GRANT ALL PRIVILEGES ON qbot_test_bootstrap.* TO 'qbotmessager'@'%';
+            GRANT ALL PRIVILEGES ON qbot_test_retention.* TO 'qbotmessager'@'%';
             FLUSH PRIVILEGES;"
 
       - name: Set up Rust
@@ -94,6 +96,12 @@ jobs:
         env:
           MYSQL_URL: mysql://qbotmessager:testpw@127.0.0.1:3306/qbot_test_bootstrap
         run: cargo test --test bootstrap_it --all-features
+
+      - name: Rust test (retention)
+        working-directory: backend
+        env:
+          MYSQL_URL: mysql://qbotmessager:testpw@127.0.0.1:3306/qbot_test_retention
+        run: cargo test --test retention_it --all-features
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2

@@ -178,6 +178,8 @@ docker compose up -d --build
 | `QQ_APPID` / `QQ_APP_SECRET` / `OPENID` | 首启导入的机器人凭据与默认推送目标 | 空 |
 | `TRUST_PROXY` | 是否信任上游反向代理的 `X-Forwarded-For`；直连部署保持 `false`，由 Nginx/Caddy 转发时设 `true`（取最右侧一跳） | `false` |
 | `PUSH_QUEUE_MAX` / `PUSH_QUEUE_MAX_PER_USER` | 推送队列总积压上限 / 单用户积压上限；单用户超额时仅该用户的新投递返回忙 | `200` / `20` |
+| `RETENTION_*_DAYS` | 过期会话 / 验证码 / 发码守卫 / 审计日志 / 推送日志 / 日志预览的保留天数；`0` 关闭对应清理 | `30` / `7` / `7` / `180` / `90` / `7` |
+| `RETENTION_INTERVAL_HOURS` | 数据保留清理任务执行间隔（小时） | `24` |
 | `STATIC_DIR` | 前端静态产物目录；容器内为 `/app/web`，本地直跑可指向 `../web/out` | `./web/out` |
 | `WORKERS` | Actix worker 线程数；留空按 CPU 核数但最多 2，降低容器常驻内存 | 最多 2 |
 | `PORT` / `APP_PORT` | 容器内监听端口 / 宿主机映射端口 | `3000` / `3000` |
@@ -318,7 +320,7 @@ bun run build
 │   ├── src/services/       QQ 客户端、邮件、频控、推送队列与执行
 │   ├── src/worker.rs       apalis 推送 worker 与定时任务
 │   ├── migrations/         sqlx 迁移（编译期内嵌，启动时执行）
-│   └── tests/              认证 / 管理 / Webhook / 启动引导集成测试
+│   └── tests/              认证 / 管理 / Webhook / 启动引导 / 数据保留集成测试
 ├── web/                    Next.js 控制台（静态导出）
 │   ├── app/(console)/      概览 / 机器人 / 日志 / 系统设置 / 用户 / 安全
 │   └── lib/                类型、请求封装、通行密钥
@@ -329,7 +331,8 @@ bun run build
 ## 安全建议
 
 - 生产环境务必设置 `APP_SECRET_KEY`（缺失时默认拒绝启动），密钥丢失将无法解密已入库的敏感字段。仅本地调试可显式设置 `ALLOW_PLAINTEXT_SECRETS=true` 降级明文。
-- 使用 HTTPS，并在「系统设置」中开启 Cookie 仅限 HTTPS、填写真实对外地址，保证 OAuth 回调与 Webhook 地址正确。HTTPS 下会话 Cookie 自动使用 `__Host-` 前缀，响应同时下发 HSTS 与限制脚本来源的 CSP。
+- 使用 HTTPS，并在「系统设置」中开启 Cookie 仅限 HTTPS、填写真实对外地址，保证 OAuth 回调与 Webhook 地址正确。HTTPS 下会话 Cookie 自动使用 `__Host-` 前缀；响应下发带 `includeSubDomains` 的 HSTS，并按页面内联脚本哈希生成 CSP，不使用 `script-src 'unsafe-inline'`。
+- 过期会话、验证码、审计与推送日志由 worker 定期清理；推送日志的内容预览默认 7 天后清空，可通过 `RETENTION_*` 环境变量调整或关闭。
 - 部署在反向代理之后时设置 `TRUST_PROXY=true`，否则登录限速只能看到代理地址。
 - 只有在提供方确实验证过邮箱归属时才开启 OAuth2 提供方的「信任邮箱」，否则同邮箱的本地账号可能被冒名登录接管。
 - 不要将 MySQL 端口暴露到公网（compose 未映射 3306）。

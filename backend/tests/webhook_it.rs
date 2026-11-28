@@ -250,6 +250,7 @@ async fn setup_with_queue_limits(
         db_pool_timeout: 10,
         push_queue_max: 20,
         push_queue_max_per_user: 20,
+        retention: Default::default(),
         trust_proxy: false,
         static_dir: PathBuf::from("./web/out"),
     };

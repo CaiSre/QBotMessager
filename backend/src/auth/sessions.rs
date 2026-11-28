@@ -349,6 +349,7 @@ mod tests {
             db_pool_timeout: 1,
             push_queue_max: 1,
             push_queue_max_per_user: 1,
+            retention: Default::default(),
             trust_proxy: false,
             static_dir: std::path::PathBuf::new(),
         }

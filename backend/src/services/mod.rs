@@ -11,6 +11,7 @@ pub mod mail;
 pub mod push;
 pub mod qq;
 pub mod queue;
+pub mod retention;
 pub mod runtime_settings;
 pub mod throttle;
 pub mod users;

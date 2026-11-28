@@ -25,6 +25,7 @@ use crate::services::queue::{
     JOB_RETRIES, QUEUE_NAME, job_retry_delay, job_timeout, purge_expired_pending,
     recover_worker_registration, vacuum_finished,
 };
+use crate::services::retention;
 use crate::state::AppState;
 
 /// worker 并发数：频控由进程内限流器串行化，并发只用于让不同机器人互不阻塞。
@@ -155,6 +156,7 @@ pub async fn run(state: Arc<AppState>) -> Result<(), AppError> {
     let settings_task = spawn_settings_refresh(state.clone());
     let cleanup_task = spawn_sent_guard_cleanup(state.clone());
     let vacuum_task = spawn_jobs_vacuum(state.clone());
+    let retention_task = spawn_retention(state.clone());
 
     // 顺序即层级：concurrency 最外层、retry 居中、timeout 最内层，
     // 这样每次尝试各自享有 180 秒上限，且重试不会额外占用并发槽。
@@ -179,6 +181,7 @@ pub async fn run(state: Arc<AppState>) -> Result<(), AppError> {
     settings_task.abort();
     cleanup_task.abort();
     vacuum_task.abort();
+    retention_task.abort();
 
     result.map_err(|err| AppError::internal(format!("推送 worker 异常退出：{err}")))
 }
@@ -302,6 +305,12 @@ fn spawn_jobs_vacuum(state: Arc<AppState>) -> JoinHandle<()> {
             }
         }
     })
+}
+
+/// 启动数据保留清理定时任务（首个 tick 立即执行一次）。
+fn spawn_retention(state: Arc<AppState>) -> JoinHandle<()> {
+    let policy = state.config.retention;
+    tokio::spawn(retention::run(state.pool.clone(), policy))
 }
 
 /// 等待 SIGTERM（类 Unix）或 Ctrl-C。

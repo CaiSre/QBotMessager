@@ -71,11 +71,12 @@ pub async fn issue_code(
     // 才能读到它的签发结果。必须作为事务里的第一条语句，读视图才会建立在
     // 拿到锁之后，否则快照读仍会看到过期的计数。
     sqlx::query(
-        "INSERT INTO email_code_guards (email, purpose) VALUES (?, ?) \
-         ON DUPLICATE KEY UPDATE email = email",
+        "INSERT INTO email_code_guards (email, purpose, updated_at) VALUES (?, ?, ?) \
+         ON DUPLICATE KEY UPDATE updated_at = VALUES(updated_at)",
     )
     .bind(email)
     .bind(purpose)
+    .bind(now)
     .execute(&mut *tx)
     .await?;
 

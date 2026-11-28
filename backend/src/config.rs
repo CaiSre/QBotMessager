@@ -36,6 +36,80 @@ pub enum ConfigError {
     MissingSecretKey,
 }
 
+/// 过期数据保留策略；天数为 0 表示关闭该表的清理。
+#[derive(Debug, Clone, Copy)]
+pub struct RetentionPolicy {
+    /// 已过期会话保留天数。
+    pub sessions_days: u32,
+    /// 邮箱验证码保留天数。
+    pub email_codes_days: u32,
+    /// 发码守卫行保留天数。
+    pub email_guards_days: u32,
+    /// 管理审计日志保留天数。
+    pub audit_days: u32,
+    /// 推送日志保留天数。
+    pub push_logs_days: u32,
+    /// 推送日志内容预览保留天数。
+    pub push_preview_days: u32,
+    /// 清理任务执行间隔（小时）。
+    pub interval_hours: u32,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            sessions_days: 30,
+            email_codes_days: 7,
+            email_guards_days: 7,
+            audit_days: 180,
+            push_logs_days: 90,
+            push_preview_days: 7,
+            interval_hours: 24,
+        }
+    }
+}
+
+impl RetentionPolicy {
+    /// 从环境变量装载；缺省值见 [`Default`]。
+    fn from_env() -> Result<Self, ConfigError> {
+        let defaults = Self::default();
+        Ok(Self {
+            sessions_days: parse_retention_days("RETENTION_SESSIONS_DAYS", defaults.sessions_days)?,
+            email_codes_days: parse_retention_days(
+                "RETENTION_EMAIL_CODES_DAYS",
+                defaults.email_codes_days,
+            )?,
+            email_guards_days: parse_retention_days(
+                "RETENTION_EMAIL_GUARDS_DAYS",
+                defaults.email_guards_days,
+            )?,
+            audit_days: parse_retention_days("RETENTION_AUDIT_DAYS", defaults.audit_days)?,
+            push_logs_days: parse_retention_days(
+                "RETENTION_PUSH_LOGS_DAYS",
+                defaults.push_logs_days,
+            )?,
+            push_preview_days: parse_retention_days(
+                "RETENTION_PUSH_PREVIEW_DAYS",
+                defaults.push_preview_days,
+            )?,
+            interval_hours: parse_retention_hours(
+                "RETENTION_INTERVAL_HOURS",
+                defaults.interval_hours,
+            )?,
+        })
+    }
+
+    /// 是否有任何清理项开启。
+    pub fn enabled(&self) -> bool {
+        self.sessions_days > 0
+            || self.email_codes_days > 0
+            || self.email_guards_days > 0
+            || self.audit_days > 0
+            || self.push_logs_days > 0
+            || self.push_preview_days > 0
+    }
+}
+
 /// 启动配置。
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -69,6 +143,8 @@ pub struct Config {
     pub push_queue_max: usize,
     /// 单个用户可占用的推送队列积压上限。
     pub push_queue_max_per_user: usize,
+    /// 过期数据保留策略。
+    pub retention: RetentionPolicy,
     /// 是否信任 `X-Forwarded-For` 最右一跳。
     pub trust_proxy: bool,
     /// 前端静态资源目录。
@@ -113,6 +189,7 @@ impl Config {
                 "PUSH_QUEUE_MAX_PER_USER",
                 crate::services::queue::DEFAULT_MAX_PENDING_PER_USER,
             )?,
+            retention: RetentionPolicy::from_env()?,
             trust_proxy: parse_bool_env("TRUST_PROXY", false)?,
             static_dir: PathBuf::from(env_or("STATIC_DIR", DEFAULT_STATIC_DIR)),
         })
@@ -160,6 +237,27 @@ where
             .map_err(|err| ConfigError::Invalid(key, format!("{value}（{err}）"))),
         _ => Ok(default),
     }
+}
+
+/// 读取保留天数：最多 100 年，避免极端值在日期运算中溢出。
+fn parse_retention_days(key: &'static str, default: u32) -> Result<u32, ConfigError> {
+    let value = parse_env(key, default)?;
+    if value > 36_500 {
+        return Err(ConfigError::Invalid(key, "最多 36500 天".to_string()));
+    }
+    Ok(value)
+}
+
+/// 读取清理间隔小时数：最多一年。
+fn parse_retention_hours(key: &'static str, default: u32) -> Result<u32, ConfigError> {
+    let value = parse_env(key, default)?;
+    if value == 0 || value > 8_760 {
+        return Err(ConfigError::Invalid(
+            key,
+            "取值范围 1~8760 小时".to_string(),
+        ));
+    }
+    Ok(value)
 }
 
 /// 读取布尔环境变量，缺失时用默认值。
