@@ -547,6 +547,41 @@ pub mod bots {
         Ok(result)
     }
 
+    /// 锁定机器人所属用户行，串行化同一用户的 AppID 唯一性检查与写入。
+    pub async fn lock_owner<'e, E>(executor: E, owner_user_id: i64) -> Result<(), sqlx::Error>
+    where
+        E: Executor<'e, Database = MySql>,
+    {
+        sqlx::query("SELECT id FROM users WHERE id = ? FOR UPDATE")
+            .bind(owner_user_id)
+            .fetch_one(executor)
+            .await?;
+        Ok(())
+    }
+
+    /// 同一用户名下是否已存在该 AppID（忽略指定机器人自身）。
+    pub async fn app_id_taken<'e, E>(
+        executor: E,
+        owner_user_id: i64,
+        qq_appid: &str,
+        exclude_id: Option<i64>,
+    ) -> Result<bool, sqlx::Error>
+    where
+        E: Executor<'e, Database = MySql>,
+    {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT CAST(COUNT(*) AS SIGNED) FROM bot_profiles \
+             WHERE owner_user_id = ? AND qq_appid = ? AND (? IS NULL OR id <> ?)",
+        )
+        .bind(owner_user_id)
+        .bind(qq_appid)
+        .bind(exclude_id)
+        .bind(exclude_id)
+        .fetch_one(executor)
+        .await?;
+        Ok(count > 0)
+    }
+
     /// 插入机器人配置，返回自增主键。
     pub async fn insert<'e, E>(executor: E, bot: &NewBotProfile<'_>) -> Result<i64, sqlx::Error>
     where

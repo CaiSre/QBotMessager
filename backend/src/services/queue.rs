@@ -24,6 +24,8 @@ pub const QUEUE_NAME: &str = "push";
 
 /// 队列积压默认上限。
 pub const DEFAULT_MAX_PENDING: usize = 200;
+/// 单用户队列积压默认上限。
+pub const DEFAULT_MAX_PENDING_PER_USER: usize = 20;
 /// 入队超过该秒数仍未开始的任务直接丢弃。
 pub const JOB_EXPIRES_SECONDS: u64 = 900;
 /// 单个任务的执行上限（秒）。
@@ -40,9 +42,12 @@ pub const DEDUPE_KEY_MAX_LEN: usize = 36;
 /// 队列操作错误。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum QueueError {
-    /// 积压达到上限。
+    /// 总积压达到上限。
     #[error("推送队列积压已达 {0}")]
     Full(usize),
+    /// 单个用户的积压达到上限。
+    #[error("该用户推送队列积压已达 {0}")]
+    OwnerFull(usize),
     /// 队列后端不可用。
     #[error("推送队列不可用：{0}")]
     Backend(String),
@@ -58,6 +63,7 @@ pub struct PushQueue {
     storage: tokio::sync::Mutex<MySqlStorage<PushJob>>,
     pool: MySqlPool,
     max_pending: usize,
+    max_pending_per_user: usize,
     /// 入队通知：Webhook 入队成功后立刻唤醒空闲 worker 拾取，
     /// 间隔轮询只作为通知丢失时的兜底。
     wake_tx: tokio::sync::broadcast::Sender<()>,
@@ -65,7 +71,11 @@ pub struct PushQueue {
 
 impl PushQueue {
     /// 连接队列：建表并构造后端。
-    pub async fn connect(pool: MySqlPool, max_pending: usize) -> Result<Self, QueueError> {
+    pub async fn connect(
+        pool: MySqlPool,
+        max_pending: usize,
+        max_pending_per_user: usize,
+    ) -> Result<Self, QueueError> {
         MySqlStorage::<()>::setup(&pool)
             .await
             .map_err(|err| QueueError::Backend(err.to_string()))?;
@@ -80,6 +90,7 @@ impl PushQueue {
             storage: tokio::sync::Mutex::new(storage),
             pool,
             max_pending,
+            max_pending_per_user,
             wake_tx,
         })
     }
@@ -105,6 +116,11 @@ impl PushQueue {
         self.max_pending
     }
 
+    /// 单用户积压上限。
+    pub fn max_pending_per_user(&self) -> usize {
+        self.max_pending_per_user
+    }
+
     /// 当前积压（`status = 'Pending'` 的任务数）。
     pub async fn pending(&self) -> Result<usize, QueueError> {
         let count: i64 = sqlx::query_scalar(
@@ -112,6 +128,24 @@ impl PushQueue {
              WHERE job_type = ? AND status = 'Pending'",
         )
         .bind(QUEUE_NAME)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| QueueError::Backend(err.to_string()))?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// 指定用户当前占用的积压（`status = 'Pending'` 的任务数）。
+    ///
+    /// apalis 的 `job` 列保存序列化后的 [`PushJob`]，这里按 JSON 字段计数，
+    /// 不额外改第三方队列表结构。
+    pub async fn pending_for_user(&self, owner_user_id: i64) -> Result<usize, QueueError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT CAST(COUNT(*) AS SIGNED) FROM jobs \
+             WHERE job_type = ? AND status = 'Pending' \
+             AND JSON_EXTRACT(CAST(job AS CHAR CHARACTER SET utf8mb4), '$.owner_user_id') = ?",
+        )
+        .bind(QUEUE_NAME)
+        .bind(owner_user_id)
         .fetch_one(&self.pool)
         .await
         .map_err(|err| QueueError::Backend(err.to_string()))?;
@@ -132,6 +166,9 @@ impl PushQueue {
 
         if self.pending().await? >= self.max_pending {
             return Err(QueueError::Full(self.max_pending));
+        }
+        if self.pending_for_user(job.owner_user_id).await? >= self.max_pending_per_user {
+            return Err(QueueError::OwnerFull(self.max_pending_per_user));
         }
 
         // 幂等键只约束「排队中/执行中」的任务：推送完成后的重复投递会重新入队，

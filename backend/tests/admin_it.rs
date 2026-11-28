@@ -118,6 +118,7 @@ async fn setup() -> Fixture {
         db_max_overflow: 20,
         db_pool_timeout: 10,
         push_queue_max: 20,
+        push_queue_max_per_user: 20,
         trust_proxy: false,
         static_dir: PathBuf::from("./web/out"),
     };
@@ -756,6 +757,72 @@ async fn bot_profile_crud_and_secret_masking() {
     );
     let missing = assert_status!(missing, StatusCode::NOT_FOUND);
     assert_eq!(missing.detail(), "机器人配置不存在");
+}
+
+#[actix_web::test]
+async fn bot_appid_is_unique_per_owner() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let (_user, token) = make_user(&fixture, "appid").await;
+
+    let first = send!(
+        app,
+        post_json_with(
+            "/api/admin/bot-profiles",
+            &json!({"name": "主机器人", "qq_appid": "dup-app", "qq_app_secret": "s"}),
+            &cookies(&token)
+        )
+    );
+    let first = assert_status!(first, StatusCode::CREATED).json()["id"]
+        .as_i64()
+        .unwrap();
+    let duplicate = send!(
+        app,
+        post_json_with(
+            "/api/admin/bot-profiles",
+            &json!({"name": "重复", "qq_appid": "dup-app", "qq_app_secret": "s"}),
+            &cookies(&token)
+        )
+    );
+    let duplicate = assert_status!(duplicate, StatusCode::CONFLICT);
+    assert_eq!(duplicate.detail(), "该 AppID 已绑定到您的其他机器人");
+
+    let second = send!(
+        app,
+        post_json_with(
+            "/api/admin/bot-profiles",
+            &json!({"name": "副机器人", "qq_appid": "other-app", "qq_app_secret": "s"}),
+            &cookies(&token)
+        )
+    );
+    let second = assert_status!(second, StatusCode::CREATED).json()["id"]
+        .as_i64()
+        .unwrap();
+    let patch = send!(
+        app,
+        patch_json_with(
+            &format!("/api/admin/bot-profiles/{second}"),
+            &json!({"qq_appid": "dup-app"}),
+            &cookies(&token)
+        )
+    );
+    assert_status!(patch, StatusCode::CONFLICT);
+
+    // 不同用户可以使用相同 AppID，互不影响。
+    let (_other, other_token) = make_user(&fixture, "appid2").await;
+    let other = send!(
+        app,
+        post_json_with(
+            "/api/admin/bot-profiles",
+            &json!({"name": "他人机器人", "qq_appid": "dup-app", "qq_app_secret": "s"}),
+            &cookies(&other_token)
+        )
+    );
+    let other = assert_status!(other, StatusCode::CREATED).json()["id"]
+        .as_i64()
+        .unwrap();
+    assert_ne!(first, other);
 }
 
 #[actix_web::test]

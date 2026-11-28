@@ -5,8 +5,10 @@
 //! - 库内 `sessions.token_hash` = `SHA-256(token)` 的 64 位小写十六进制；
 //! - Cookie：`HttpOnly; SameSite=Lax; Path=/; Max-Age=ttl*3600`，
 //!   `Secure` 当 `cookie_secure=true` 或 `public_base_url` 以 `https://` 开头；
+//!   HTTPS 下名称加 `__Host-` 前缀，读取时兼容旧的无前缀 Cookie；
 //! - 撤销：`revoked_at` 非空或 `expires_at <= now` 即失效。
 
+use actix_web::HttpRequest;
 use actix_web::cookie::time::Duration as CookieDuration;
 use actix_web::cookie::{Cookie, SameSite};
 use base64::Engine;
@@ -26,6 +28,8 @@ pub const TOKEN_BYTES: usize = 32;
 pub const USER_AGENT_MAX: usize = 255;
 /// 敏感操作要求的最近验证窗口（分钟）。
 pub const STEP_UP_WINDOW_MINUTES: i64 = 10;
+/// 仅 HTTPS 可用的 Cookie 前缀。
+pub const HOST_COOKIE_PREFIX: &str = "__Host-";
 
 /// 生成会话 token（base64url 无填充）。
 pub fn new_session_token() -> String {
@@ -49,6 +53,42 @@ pub fn step_up_valid(verified_at: Option<NaiveDateTime>, now: NaiveDateTime) -> 
     verified_at.is_some_and(|value| value + ChronoDuration::minutes(STEP_UP_WINDOW_MINUTES) > now)
 }
 
+/// 当前设置下应写入的会话 Cookie 名。
+///
+/// HTTPS 使用 `__Host-` 前缀，浏览器会强制该 Cookie 必须 `Secure`、`Path=/`
+/// 且不带 `Domain`，降低子域覆盖风险。
+pub fn session_cookie_name(config: &Config, settings: &RuntimeSettings) -> String {
+    if settings.secure_cookies() && !config.cookie_name.starts_with(HOST_COOKIE_PREFIX) {
+        format!("{HOST_COOKIE_PREFIX}{}", config.cookie_name)
+    } else {
+        config.cookie_name.clone()
+    }
+}
+
+/// 可能存在的会话 Cookie 名，按优先级排列。
+///
+/// 同时兼容开启/关闭 HTTPS 前后的旧 Cookie：读取时优先 `__Host-`，再退回原名。
+pub fn session_cookie_names(config: &Config, settings: &RuntimeSettings) -> Vec<String> {
+    let primary = session_cookie_name(config, settings);
+    if primary == config.cookie_name {
+        vec![primary]
+    } else {
+        vec![primary, config.cookie_name.clone()]
+    }
+}
+
+/// 从请求中读取会话 token；没有 Cookie 时返回空串。
+pub fn read_session_token(
+    req: &HttpRequest,
+    config: &Config,
+    settings: &RuntimeSettings,
+) -> String {
+    session_cookie_names(config, settings)
+        .into_iter()
+        .find_map(|name| req.cookie(&name).map(|cookie| cookie.value().to_string()))
+        .unwrap_or_default()
+}
+
 /// 构造会话 Cookie。
 pub fn session_cookie(
     config: &Config,
@@ -56,7 +96,7 @@ pub fn session_cookie(
     token: &str,
     ttl_hours: i64,
 ) -> Cookie<'static> {
-    Cookie::build(config.cookie_name.clone(), token.to_string())
+    Cookie::build(session_cookie_name(config, settings), token.to_string())
         .path("/")
         .http_only(true)
         .same_site(SameSite::Lax)
@@ -65,9 +105,24 @@ pub fn session_cookie(
         .finish()
 }
 
-/// 构造删除会话 Cookie 的指令（过期时间设为 0，属性与签发时保持一致）。
+/// 构造删除当前会话 Cookie 的指令（过期时间设为 0，属性与签发时保持一致）。
 pub fn clear_session_cookie(config: &Config, settings: &RuntimeSettings) -> Cookie<'static> {
-    Cookie::build(config.cookie_name.clone(), String::new())
+    clear_cookie_named(session_cookie_name(config, settings), settings)
+}
+
+/// 删除当前与旧命名的会话 Cookie。
+///
+/// 从 HTTP 切到 HTTPS（或反向）后，浏览器里可能同时存在 `sid` 与 `__Host-sid`；
+/// 退出登录必须都清掉，避免遗留 Cookie 继续被服务端接受。
+pub fn clear_session_cookies(config: &Config, settings: &RuntimeSettings) -> Vec<Cookie<'static>> {
+    session_cookie_names(config, settings)
+        .into_iter()
+        .map(|name| clear_cookie_named(name, settings))
+        .collect()
+}
+
+fn clear_cookie_named(name: String, settings: &RuntimeSettings) -> Cookie<'static> {
+    Cookie::build(name, String::new())
         .path("/")
         .http_only(true)
         .same_site(SameSite::Lax)
@@ -275,6 +330,60 @@ mod tests {
             },
             now
         ));
+    }
+
+    fn config() -> Config {
+        Config {
+            mysql_url: String::new(),
+            app_secret_key: None,
+            app_name: "test".to_string(),
+            cookie_name: "sid".to_string(),
+            bootstrap_admin_email: String::new(),
+            bootstrap_admin_password: String::new(),
+            qq_appid: String::new(),
+            qq_app_secret: String::new(),
+            openids: Vec::new(),
+            qq_allowed_hosts: Vec::new(),
+            db_pool_size: 1,
+            db_max_overflow: 1,
+            db_pool_timeout: 1,
+            push_queue_max: 1,
+            push_queue_max_per_user: 1,
+            trust_proxy: false,
+            static_dir: std::path::PathBuf::new(),
+        }
+    }
+
+    fn settings(values: serde_json::Value) -> RuntimeSettings {
+        let mut settings = RuntimeSettings::new(None);
+        let object = values.as_object().unwrap();
+        let values = settings.validate(object).unwrap();
+        settings.apply(&values);
+        settings
+    }
+
+    #[test]
+    fn secure_session_cookie_uses_host_prefix() {
+        let config = config();
+        let plain = settings(serde_json::json!({}));
+        let secure = settings(serde_json::json!({"cookie_secure": true}));
+        assert_eq!(session_cookie_name(&config, &plain), "sid");
+        assert_eq!(session_cookie_name(&config, &secure), "__Host-sid");
+        assert_eq!(
+            session_cookie_names(&config, &secure),
+            vec!["__Host-sid".to_string(), "sid".to_string()]
+        );
+        let cookie = session_cookie(&config, &secure, "token", 1);
+        assert_eq!(cookie.name(), "__Host-sid");
+        assert_eq!(cookie.path(), Some("/"));
+        assert!(cookie.secure().unwrap_or(false));
+        assert!(cookie.http_only().unwrap_or(false));
+        assert_eq!(clear_session_cookie(&config, &secure).name(), "__Host-sid");
+        let cleared: Vec<String> = clear_session_cookies(&config, &secure)
+            .into_iter()
+            .map(|cookie| cookie.name().to_string())
+            .collect();
+        assert_eq!(cleared, vec!["__Host-sid", "sid"]);
     }
 
     #[test]

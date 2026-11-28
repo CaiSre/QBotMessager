@@ -312,10 +312,7 @@ fn json_payload_error(err: actix_web::error::JsonPayloadError) -> AppError {
 
 /// 读取当前请求的会话用户；未登录 401，停用 403。
 async fn require_user(state: &AppState, req: &HttpRequest) -> Result<User, AppError> {
-    let token = req
-        .cookie(state.config.cookie_name.as_str())
-        .map(|cookie| cookie.value().to_string())
-        .unwrap_or_default();
+    let token = sessions::read_session_token(req, &state.config, &state.settings());
     match sessions::resolve_session(&state.pool, &token).await? {
         None => Err(AppError::unauthorized("未登录")),
         Some(user) if user.status != STATUS_ACTIVE => Err(AppError::forbidden("账号已停用")),
@@ -583,6 +580,11 @@ async fn create_bot(
     let ip = state.client_ip(&req);
 
     let mut tx = state.pool.begin().await?;
+    // 同一用户的行锁串行化 AppID 唯一性检查：并发创建不会各自通过检查。
+    queries::bots::lock_owner(&mut *tx, actor.id).await?;
+    if queries::bots::app_id_taken(&mut *tx, actor.id, &data.qq_appid, None).await? {
+        return Err(AppError::conflict("该 AppID 已绑定到您的其他机器人"));
+    }
     let bot_id = queries::bots::insert(
         &mut *tx,
         &NewBotProfile {
@@ -630,6 +632,7 @@ async fn patch_bot(
         ensure_max_length("名称", name, BOT_TEXT_MAX)?;
     }
     if let Some(appid) = data.qq_appid.as_deref() {
+        ensure_min_length("AppID", appid, 1)?;
         ensure_max_length("AppID", appid, BOT_TEXT_MAX)?;
     }
     if let Some(secret) = data.qq_app_secret.as_deref() {
@@ -646,6 +649,7 @@ async fn patch_bot(
     if let Some(group) = data.default_group_openid.as_deref() {
         ensure_max_length("默认群 openid", group, MAX_TARGET_LEN)?;
     }
+    let new_appid = data.qq_appid.clone();
 
     let mut fields: Vec<&'static str> = Vec::new();
     let mut has_updates = false;
@@ -713,6 +717,12 @@ async fn patch_bot(
     fields.sort_unstable();
 
     let mut tx = state.pool.begin().await?;
+    if let Some(appid) = new_appid.as_deref() {
+        queries::bots::lock_owner(&mut *tx, bot.owner_user_id).await?;
+        if queries::bots::app_id_taken(&mut *tx, bot.owner_user_id, appid, Some(bot.id)).await? {
+            return Err(AppError::conflict("该 AppID 已绑定到您的其他机器人"));
+        }
+    }
     if has_updates {
         update.push(" WHERE id = ").push_bind(bot.id);
         update.build().execute(&mut *tx).await?;

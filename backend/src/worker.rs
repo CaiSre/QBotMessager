@@ -187,7 +187,7 @@ pub async fn run(state: Arc<AppState>) -> Result<(), AppError> {
 pub async fn push_bot_message(job: PushJob, state: WorkerData) -> Result<(), WorkerError> {
     let state = state.0.clone();
     let settings = state.settings().clone();
-    let limiter = state.limiters.get(&format!("bot:{}", job.bot_id));
+    let limiter = state.limiters.get(&job.qq_account_key(&settings));
 
     let outcome = execute_push(
         &state.pool,

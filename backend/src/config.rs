@@ -65,8 +65,10 @@ pub struct Config {
     pub db_max_overflow: u32,
     /// 数据库连接池等待超时（秒）。
     pub db_pool_timeout: u32,
-    /// 推送队列积压上限。
+    /// 推送队列总积压上限。
     pub push_queue_max: usize,
+    /// 单个用户可占用的推送队列积压上限。
+    pub push_queue_max_per_user: usize,
     /// 是否信任 `X-Forwarded-For` 最右一跳。
     pub trust_proxy: bool,
     /// 前端静态资源目录。
@@ -107,6 +109,10 @@ impl Config {
             db_max_overflow: parse_env("DB_MAX_OVERFLOW", 20)?,
             db_pool_timeout: parse_env("DB_POOL_TIMEOUT", 10)?,
             push_queue_max: parse_env("PUSH_QUEUE_MAX", 200)?,
+            push_queue_max_per_user: parse_env(
+                "PUSH_QUEUE_MAX_PER_USER",
+                crate::services::queue::DEFAULT_MAX_PENDING_PER_USER,
+            )?,
             trust_proxy: parse_bool_env("TRUST_PROXY", false)?,
             static_dir: PathBuf::from(env_or("STATIC_DIR", DEFAULT_STATIC_DIR)),
         })

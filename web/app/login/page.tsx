@@ -20,6 +20,7 @@ export default function LoginPage() {
   const meta = useApi<AuthMeta>("/api/auth/providers");
   const [account, setAccount] = useState("");
   const [password, setPassword] = useState("");
+  const [inviteCode, setInviteCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<{ account?: string; password?: string }>({});
   const [busy, setBusy] = useState<"password" | "passkey" | null>(null);
@@ -153,13 +154,29 @@ export default function LoginPage() {
                   第三方登录
                   <span className="h-px flex-1 bg-border" />
                 </div>
+                {meta.data.registration_enabled ? (
+                  <Field>
+                    <FieldLabel htmlFor="oauth_invite">邀请码（首次使用第三方登录）</FieldLabel>
+                    <Input
+                      autoComplete="off"
+                      id="oauth_invite"
+                      placeholder="已有账号可留空"
+                      type="text"
+                      value={inviteCode}
+                      onChange={(event) => setInviteCode(event.target.value)}
+                    />
+                  </Field>
+                ) : null}
                 {meta.data.oauth_providers.map((provider) => (
                   <Button
                     key={provider.key}
                     className="w-full"
                     variant="outline"
                     onClick={() => {
-                      window.location.href = `/api/auth/oauth/${provider.key}/start`;
+                      const invite = inviteCode.trim();
+                      window.location.href = `/api/auth/oauth/${provider.key}/start${
+                        invite ? `?invite_code=${encodeURIComponent(invite)}` : ""
+                      }`;
                     }}
                   >
                     {provider.key === "github" ? (

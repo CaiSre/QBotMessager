@@ -21,7 +21,7 @@ use crate::state::AppState;
 ///
 /// 名称必须全小写：`HeaderName::from_static` 只接受小写（HTTP 头名本身大小写不敏感，
 /// HTTP/2 也要求小写）。
-pub const SECURITY_HEADERS: [(&str, &str); 5] = [
+pub const SECURITY_HEADERS: [(&str, &str); 6] = [
     ("x-content-type-options", "nosniff"),
     ("x-frame-options", "DENY"),
     ("referrer-policy", "strict-origin-when-cross-origin"),
@@ -30,8 +30,17 @@ pub const SECURITY_HEADERS: [(&str, &str); 5] = [
         "camera=(), microphone=(), geolocation=()",
     ),
     (
+        // 静态导出的 Next.js 页面带有水合所需内联脚本，无法在不改写 HTML 的
+        // 前提下使用 nonce，因此保留 'unsafe-inline'；仍限制脚本只能来自本站。
         "content-security-policy",
-        "frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; \
+         base-uri 'self'; form-action 'self'",
+    ),
+    (
+        // 浏览器只在 HTTPS 响应上采纳该头；HTTP 部署不受影响。
+        "strict-transport-security",
+        "max-age=31536000",
     ),
 ];
 
@@ -193,6 +202,22 @@ mod tests {
             assert_eq!(header.as_str(), name);
             HeaderValue::from_static(value);
         }
+    }
+
+    #[test]
+    fn security_headers_block_scripts_and_upgrade_https() {
+        let find = |name: &str| {
+            SECURITY_HEADERS
+                .iter()
+                .find(|(header, _)| *header == name)
+                .map(|(_, value)| *value)
+                .unwrap_or_else(|| panic!("缺少安全头 {name}"))
+        };
+        let csp = find("content-security-policy");
+        assert!(csp.contains("script-src 'self'"));
+        assert!(csp.contains("object-src 'none'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert_eq!(find("strict-transport-security"), "max-age=31536000");
     }
 
     #[test]

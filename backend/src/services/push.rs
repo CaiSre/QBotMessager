@@ -55,6 +55,22 @@ pub struct PushJob {
     pub targets: Vec<QqTarget>,
 }
 
+impl PushJob {
+    /// 实际使用的 QQ API 域名：任务未指定时回落到运行期设置。
+    pub fn qq_host<'a>(&'a self, settings: &'a RuntimeSettings) -> &'a str {
+        if self.bot_host.is_empty() {
+            settings.qq_host()
+        } else {
+            self.bot_host.as_str()
+        }
+    }
+
+    /// QQ 凭据缓存与频控键（按 AppID 归属，多个机器人复用同一 AppID 时共享）。
+    pub fn qq_account_key(&self, settings: &RuntimeSettings) -> String {
+        crate::services::qq::account_key(self.qq_host(settings), &self.bot_appid)
+    }
+}
+
 /// 推送结果：每个目标一条错误信息（`None` 表示成功）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PushOutcome {
@@ -119,12 +135,8 @@ pub async fn execute_push(
     let text = payload.text().to_string();
     let content_preview: String = text.chars().take(PREVIEW_CHARS).collect();
     let content_len = text.chars().count() as i32;
-    let host = if job.bot_host.is_empty() {
-        settings.qq_host()
-    } else {
-        job.bot_host.as_str()
-    };
-    let token_key = format!("bot:{}", job.bot_id);
+    let host = job.qq_host(settings);
+    let token_key = job.qq_account_key(settings);
 
     let mut errors: Vec<Option<String>> = Vec::with_capacity(job.targets.len());
     let mut retryable_flags: Vec<bool> = Vec::with_capacity(job.targets.len());

@@ -155,6 +155,7 @@ async fn setup() -> Fixture {
         db_max_overflow: 20,
         db_pool_timeout: 10,
         push_queue_max: 20,
+        push_queue_max_per_user: 20,
         trust_proxy: false,
         static_dir: PathBuf::from("./web/out"),
     };
@@ -660,11 +661,21 @@ async fn secure_cookie_on_https() {
         )
     );
     let reply = assert_status!(reply, StatusCode::OK);
-    let raw = reply.raw_cookie("sid").expect("登录必须下发 sid");
+    let raw = reply
+        .raw_cookie("__Host-sid")
+        .expect("https 下登录必须下发 __Host-sid");
     assert!(
         raw.contains("Secure"),
         "https 下 Cookie 必须带 Secure：{raw}"
     );
+    assert!(raw.contains("Path=/"), "Cookie 必须限定 Path=/：{raw}");
+    assert!(!raw.contains("Domain="), "Cookie 不得带 Domain：{raw}");
+    let sid = reply.cookie("__Host-sid").unwrap();
+    let me = send!(
+        app,
+        get_with("/api/auth/me", &[("__Host-sid", sid.as_str())])
+    );
+    assert_status!(me, StatusCode::OK);
 }
 
 #[actix_web::test]
@@ -2208,6 +2219,34 @@ macro_rules! oauth_callback {
     }};
 }
 
+macro_rules! oauth_callback_with_invite {
+    ($app:expr, $key:expr, $code:expr, $state:expr, $state_cookie:expr, $provider_cookie:expr, $invite:expr) => {{
+        let full_state: String = $state.to_string();
+        let flow = full_state
+            .split_once('.')
+            .map(|(flow, _)| flow.to_string())
+            .unwrap_or_default();
+        let state_name = flow_cookie_name("oauth_state", &flow);
+        let provider_name = flow_cookie_name("oauth_provider", &flow);
+        let invite_name = flow_cookie_name("oauth_invite", &flow);
+        let uri = format!(
+            "/api/auth/oauth/{}/callback?code={}&state={}",
+            $key, $code, full_state
+        );
+        send!(
+            $app,
+            get_with(
+                &uri,
+                &[
+                    (state_name.as_str(), $state_cookie.as_str()),
+                    (provider_name.as_str(), $provider_cookie.as_str()),
+                    (invite_name.as_str(), $invite),
+                ]
+            )
+        )
+    }};
+}
+
 fn query_param(url: &str, name: &str) -> Option<String> {
     // 相对路径（如 /oauth/failure?message=…）不是合法绝对 URL，直接取问号后的部分。
     let query = match url::Url::parse(url) {
@@ -2373,7 +2412,19 @@ async fn oauth_login_keeps_secret_encrypted_and_uses_plaintext() {
     assert!(stored_before.starts_with("enc1:"), "{stored_before}");
 
     fixture.enable_register();
-    let start = oauth_start!(app, key);
+    let invite = create_invite(
+        &fixture,
+        "oauthreg",
+        1,
+        None,
+        Some(Utc::now().naive_utc() + Duration::days(1)),
+        None,
+    )
+    .await;
+    let start = send!(
+        app,
+        get(&format!("/api/auth/oauth/{key}/start?invite_code={invite}"))
+    );
     let start = assert_status!(start, StatusCode::FOUND);
     let location = start
         .headers
@@ -2391,7 +2442,15 @@ async fn oauth_login_keeps_secret_encrypted_and_uses_plaintext() {
         .cookie(&flow_cookie_name("oauth_provider", &flow))
         .unwrap();
 
-    let callback = oauth_callback!(app, key, "mock-code", state, state_cookie, provider_cookie);
+    let callback = oauth_callback_with_invite!(
+        app,
+        key,
+        "mock-code",
+        state,
+        state_cookie,
+        provider_cookie,
+        invite.as_str()
+    );
     let callback = assert_status!(callback, StatusCode::FOUND);
     assert_eq!(
         callback
@@ -2401,6 +2460,7 @@ async fn oauth_login_keeps_secret_encrypted_and_uses_plaintext() {
         Some("/")
     );
     let sid = callback.cookie("sid").expect("OAuth 登录必须下发会话");
+    assert_eq!(invite_used_count(&fixture, &invite).await, 1);
     let _ = handle.stop(true).await;
 
     let me = send!(app, get_with("/api/auth/me", &[("sid", sid.as_str())]));
@@ -2466,13 +2526,14 @@ async fn oauth_untrusted_email_cannot_take_over_account() {
     }))
     .await;
     let key = format!("{}-untrusted", fixture.prefix);
+    // 管理端信任该提供方，但本次响应声明邮箱未验证：仍不得自动关联。
     assert_status!(
         create_provider!(
             app,
             admin_token,
             key.clone(),
             base,
-            Value::Bool(false),
+            Value::Bool(true),
             false
         ),
         StatusCode::CREATED
@@ -2498,7 +2559,7 @@ async fn oauth_untrusted_email_cannot_take_over_account() {
         .unwrap();
 
     let callback = oauth_callback!(app, key, "mock-code", state, state_cookie, provider_cookie);
-    let location = assert_oauth_failure(callback, "未验证邮箱");
+    let location = assert_oauth_failure(callback, "可信验证");
     let _ = location;
     let _ = handle.stop(true).await;
 
@@ -2520,6 +2581,146 @@ async fn oauth_untrusted_email_cannot_take_over_account() {
         )
     );
     assert_status!(login, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn oauth_signup_without_invite_is_rejected() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let (_admin, admin_token) = make_admin(&fixture, "adminnoinvite").await;
+    let email = format!("{}-noinvite@example.com", fixture.prefix);
+    let (base, _mock, handle) = start_oauth_mock(json!({
+        "id": "noinvite-1",
+        "login": "noinvite",
+        "email": email,
+        "email_verified": true,
+    }))
+    .await;
+    let key = format!("{}-noinvite", fixture.prefix);
+    assert_status!(
+        create_provider!(
+            app,
+            admin_token,
+            key.clone(),
+            base,
+            Value::Bool(true),
+            false
+        ),
+        StatusCode::CREATED
+    );
+    fixture.enable_register();
+
+    let start = oauth_start!(app, key);
+    let start = assert_status!(start, StatusCode::FOUND);
+    let location = start
+        .headers
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let state = query_param(&location, "state").unwrap();
+    let flow = state_flow(&location);
+    let state_cookie = start
+        .cookie(&flow_cookie_name("oauth_state", &flow))
+        .unwrap();
+    let provider_cookie = start
+        .cookie(&flow_cookie_name("oauth_provider", &flow))
+        .unwrap();
+
+    let callback = oauth_callback!(app, key, "mock-code", state, state_cookie, provider_cookie);
+    assert_oauth_failure(callback, "需要邀请码");
+    let _ = handle.stop(true).await;
+
+    let users: i64 =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS SIGNED) FROM users WHERE email = ?")
+            .bind(&email)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(users, 0, "未携带邀请码不得创建账号");
+}
+
+#[actix_web::test]
+async fn oauth_provider_must_trust_email_for_signup() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let (_admin, admin_token) = make_admin(&fixture, "adminuntrustedcfg").await;
+    let email = format!("{}-untrustedcfg@example.com", fixture.prefix);
+    let (base, _mock, handle) = start_oauth_mock(json!({
+        "id": "untrustedcfg-1",
+        "login": "untrustedcfg",
+        "email": email,
+        "email_verified": true,
+    }))
+    .await;
+    let key = format!("{}-untrustedcfg", fixture.prefix);
+    // 提供方返回已验证，但管理端未信任该提供方：不得据此建号。
+    assert_status!(
+        create_provider!(
+            app,
+            admin_token,
+            key.clone(),
+            base,
+            Value::Bool(false),
+            false
+        ),
+        StatusCode::CREATED
+    );
+    fixture.enable_register();
+    let invite = create_invite(
+        &fixture,
+        "untrustedcfg",
+        1,
+        None,
+        Some(Utc::now().naive_utc() + Duration::days(1)),
+        None,
+    )
+    .await;
+
+    let start = send!(
+        app,
+        get(&format!("/api/auth/oauth/{key}/start?invite_code={invite}"))
+    );
+    let start = assert_status!(start, StatusCode::FOUND);
+    let location = start
+        .headers
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let state = query_param(&location, "state").unwrap();
+    let flow = state_flow(&location);
+    let state_cookie = start
+        .cookie(&flow_cookie_name("oauth_state", &flow))
+        .unwrap();
+    let provider_cookie = start
+        .cookie(&flow_cookie_name("oauth_provider", &flow))
+        .unwrap();
+
+    let callback = oauth_callback_with_invite!(
+        app,
+        key,
+        "mock-code",
+        state,
+        state_cookie,
+        provider_cookie,
+        invite.as_str()
+    );
+    assert_oauth_failure(callback, "可信验证");
+    let _ = handle.stop(true).await;
+
+    let users: i64 =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS SIGNED) FROM users WHERE email = ?")
+            .bind(&email)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(users, 0);
+    assert_eq!(invite_used_count(&fixture, &invite).await, 0);
 }
 
 #[actix_web::test]
@@ -2864,9 +3065,24 @@ async fn oauth_link_rejects_identity_bound_to_other_user() {
         StatusCode::CREATED
     );
     fixture.enable_register();
+    let invite = create_invite(
+        &fixture,
+        "occu-reg",
+        1,
+        None,
+        Some(Utc::now().naive_utc() + Duration::days(1)),
+        None,
+    )
+    .await;
 
     // 第一个用户先通过 OAuth 登录占住该第三方账号。
-    let first_start = oauth_start!(app, key.clone());
+    let first_start = send!(
+        app,
+        get(&format!(
+            "/api/auth/oauth/{}/start?invite_code={invite}",
+            key
+        ))
+    );
     let first_start = assert_status!(first_start, StatusCode::FOUND);
     let location = first_start
         .headers
@@ -2882,15 +3098,17 @@ async fn oauth_link_rejects_identity_bound_to_other_user() {
     let provider_cookie = first_start
         .cookie(&flow_cookie_name("oauth_provider", &flow))
         .unwrap();
-    let first = oauth_callback!(
+    let first = oauth_callback_with_invite!(
         app,
         key.clone(),
         "mock-code",
         state,
         state_cookie,
-        provider_cookie
+        provider_cookie,
+        invite.as_str()
     );
     assert_status!(first, StatusCode::FOUND);
+    assert_eq!(invite_used_count(&fixture, &invite).await, 1);
     let _ = mock;
 
     // 第二个已登录用户尝试绑定同一个第三方账号。
@@ -4075,11 +4293,16 @@ async fn passkey_login_succeeds_with_real_signature() {
     );
     let reply = assert_status!(reply, StatusCode::OK);
     assert_eq!(reply.json(), json!({"ok": true}));
-    let sid = reply.cookie("sid").expect("登录成功必须下发会话");
+    let sid = reply
+        .cookie("__Host-sid")
+        .expect("HTTPS 下登录成功必须下发 __Host-sid");
     assert!(!sid.is_empty());
 
     // 会话确实可用。
-    let me = send!(app, get_with("/api/auth/me", &[("sid", sid.as_str())]));
+    let me = send!(
+        app,
+        get_with("/api/auth/me", &[("__Host-sid", sid.as_str())])
+    );
     let me = assert_status!(me, StatusCode::OK);
     assert_eq!(me.json()["email"], json!(account.email));
 

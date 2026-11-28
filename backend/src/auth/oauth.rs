@@ -5,7 +5,8 @@
 //!   '.' 不在 base64url 字母表内可无歧义切分，主体仍为 24 随机字节 →
 //!   base64url 无填充（32 字符）、纯随机；
 //! - 双提交 Cookie：`oauth_state_{flow}` 与 `oauth_provider_{flow}`（绑定流程另有
-//!   `oauth_link_{flow}`），名带 flow 后缀，同一浏览器并行流程互不覆盖，`Max-Age=600`；
+//!   `oauth_link_{flow}`，首次建号另有一次性的 `oauth_invite_{flow}`），名带
+//!   flow 后缀，同一浏览器并行流程互不覆盖，`Max-Age=600`；
 //! - 回调常量时间比对 state，并要求提供方 Cookie 与路径上的 key 一致；
 //! - token / userinfo 请求的参数名、请求头与 GitHub 主邮箱兜底逻辑逐项复刻；
 //! - `client_secret` 由调用方解密后显式传入，绝不写回实体（否则会把明文写进库）。
@@ -31,6 +32,8 @@ pub const STATE_COOKIE: &str = "oauth_state";
 pub const PROVIDER_COOKIE: &str = "oauth_provider";
 /// 绑定用途 Cookie 名；存在表示本次流程用于给已登录用户绑定账号。
 pub const LINK_COOKIE: &str = "oauth_link";
+/// 首次注册所需邀请码 Cookie 名。
+pub const INVITE_COOKIE: &str = "oauth_invite";
 /// 两个临时 Cookie 的有效期（秒）。
 pub const COOKIE_MAX_AGE_SECONDS: i64 = 600;
 /// state 的随机字节数（24 字节 → 32 字符 base64url）。
@@ -352,6 +355,15 @@ pub fn link_cookie(settings: &RuntimeSettings, flow: &str) -> Cookie<'static> {
     )
 }
 
+/// 构造首次注册所需邀请码 Cookie；只在本次 flow 内有效。
+pub fn invite_cookie(settings: &RuntimeSettings, flow: &str, invite_code: &str) -> Cookie<'static> {
+    oauth_cookie(
+        flow_cookie_name(INVITE_COOKIE, flow),
+        invite_code.to_string(),
+        settings,
+    )
+}
+
 /// 构造删除 OAuth 临时 Cookie 的指令（属性与签发时保持一致）。
 ///
 /// name 接受运行期拼接的带 flow 后缀名，因此放宽为 `&str`。
@@ -446,6 +458,9 @@ mod tests {
         let cookie = link_cookie(&settings, &flow);
         assert_eq!(cookie.name(), format!("oauth_link_{flow}"));
         assert_eq!(cookie.value(), "1");
+        let cookie = invite_cookie(&settings, &flow, "invite-code");
+        assert_eq!(cookie.name(), format!("oauth_invite_{flow}"));
+        assert_eq!(cookie.value(), "invite-code");
         // 清除指令同样落在带后缀的名上。
         let cookie = clear_cookie(&format!("oauth_state_{flow}"), &settings);
         assert_eq!(cookie.name(), format!("oauth_state_{flow}"));

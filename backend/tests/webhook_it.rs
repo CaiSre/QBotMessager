@@ -41,7 +41,8 @@ use qbotmessager::db::queries;
 use qbotmessager::markdown::{degrade_tables, sanitize_markdown, sanitize_text};
 use qbotmessager::renderer::{MSG_TYPE_MARKDOWN, MSG_TYPE_TEXT, render_qq, render_qq_with_limits};
 use qbotmessager::services::push::PushJob;
-use qbotmessager::services::queue::{PushQueue, dedupe_key};
+use qbotmessager::services::qq::QqTarget;
+use qbotmessager::services::queue::{PushQueue, QueueError, dedupe_key};
 use qbotmessager::services::runtime_settings::RuntimeSettings;
 use qbotmessager::state::AppState;
 use serde_json::{Value, json};
@@ -225,7 +226,10 @@ impl Fixture {
     }
 }
 
-async fn setup_with_queue(max_pending: Option<usize>) -> Fixture {
+async fn setup_with_queue_limits(
+    max_pending: Option<usize>,
+    max_pending_per_user: usize,
+) -> Fixture {
     // reqwest（rustls-no-provider）需要进程级 CryptoProvider。
     let _ = rustls::crypto::ring::default_provider().install_default();
     let pool = test_pool().await;
@@ -245,6 +249,7 @@ async fn setup_with_queue(max_pending: Option<usize>) -> Fixture {
         db_max_overflow: 20,
         db_pool_timeout: 10,
         push_queue_max: 20,
+        push_queue_max_per_user: 20,
         trust_proxy: false,
         static_dir: PathBuf::from("./web/out"),
     };
@@ -256,7 +261,7 @@ async fn setup_with_queue(max_pending: Option<usize>) -> Fixture {
     let mock = MockQq::start();
     let queue = match max_pending {
         Some(max_pending) => Some(Arc::new(
-            PushQueue::connect(pool.clone(), max_pending)
+            PushQueue::connect(pool.clone(), max_pending, max_pending_per_user)
                 .await
                 .expect("连接推送队列失败"),
         )),
@@ -276,6 +281,10 @@ async fn setup_with_queue(max_pending: Option<usize>) -> Fixture {
         fernet_key,
         mock,
     }
+}
+
+async fn setup_with_queue(max_pending: Option<usize>) -> Fixture {
+    setup_with_queue_limits(max_pending, 20).await
 }
 
 async fn setup() -> Fixture {
@@ -1270,6 +1279,100 @@ async fn queue_full_asks_sender_to_retry() {
     let reply = assert_status!(reply, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(reply.json()["errcode"], json!(503));
     assert!(fixture.mock.calls().is_empty());
+}
+
+#[actix_web::test]
+async fn queue_per_user_full_returns_busy_only_for_that_owner() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup_with_queue_limits(Some(10), 1).await;
+    clear_push_jobs(&fixture.pool).await;
+    let app = app!(fixture.state.clone());
+    let owner_a = make_user(&fixture).await;
+    let bot_a = make_bot(&fixture, owner_a, &["u-a"], None).await;
+    let (_channel_a, token_a, _) = make_channel(&fixture, bot_a, "dingtalk").await;
+    let owner_b = sqlx::query(
+        "INSERT INTO users (email, name, password_hash, role, status, created_at) \
+         VALUES (?, ?, NULL, 'user', 'active', ?)",
+    )
+    .bind(format!("{}-b@example.com", fixture.prefix))
+    .bind(format!("{}-b", fixture.prefix))
+    .bind(Utc::now().naive_utc())
+    .execute(&fixture.pool)
+    .await
+    .expect("插入第二个测试账号失败")
+    .last_insert_id() as i64;
+    let bot_b = make_bot(&fixture, owner_b, &["u-b"], None).await;
+    let (_channel_b, token_b, _) = make_channel(&fixture, bot_b, "dingtalk").await;
+
+    let send_text = |token: &str, text: &str| {
+        webhook_request(
+            "/webhook/dingtalk",
+            &json!({"msgtype": "text", "text": {"content": text}}),
+            token,
+        )
+    };
+    assert_status!(send!(app, send_text(&token_a, "A1")), StatusCode::OK);
+    let blocked = send!(app, send_text(&token_a, "A2"));
+    let blocked = assert_status!(blocked, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(blocked.json()["errcode"], json!(503));
+    assert_status!(send!(app, send_text(&token_b, "B1")), StatusCode::OK);
+    assert!(fixture.mock.calls().is_empty());
+
+    clear_push_jobs(&fixture.pool).await;
+}
+
+#[actix_web::test]
+async fn queue_per_user_limit_does_not_block_other_users() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup_with_queue_limits(Some(10), 2).await;
+    clear_push_jobs(&fixture.pool).await;
+    let queue = fixture.state.queue.as_ref().expect("测试夹具必须配置队列");
+
+    let job = |owner_user_id: i64, request_id: String| PushJob {
+        request_id,
+        hook_type: "dingtalk".to_string(),
+        push_source: "集成测试".to_string(),
+        channel_id: None,
+        bot_id: 1,
+        owner_user_id,
+        bot_host: "https://api.bot.qq.com".to_string(),
+        bot_appid: "app".to_string(),
+        app_secret_cipher: "cipher".to_string(),
+        source_msgtype: "text".to_string(),
+        msg_type: 0,
+        content: "队列公平性".to_string(),
+        markdown: None,
+        targets: vec![QqTarget::user("u")],
+    };
+
+    let owner_a = 900_001;
+    let owner_b = 900_002;
+    let key = || uuid::Uuid::new_v4().simple().to_string();
+    for _ in 0..2 {
+        let id = key();
+        assert!(
+            queue
+                .enqueue(job(owner_a, id.clone()), &id)
+                .await
+                .expect("用户 A 的前两条应入队")
+        );
+    }
+    let over = key();
+    assert!(matches!(
+        queue.enqueue(job(owner_a, over.clone()), &over).await,
+        Err(QueueError::OwnerFull(2))
+    ));
+    let other = key();
+    assert!(
+        queue
+            .enqueue(job(owner_b, other.clone()), &other)
+            .await
+            .expect("其他用户不应被单用户配额阻塞")
+    );
+    assert_eq!(queue.pending_for_user(owner_a).await.unwrap(), 2);
+    assert_eq!(queue.pending_for_user(owner_b).await.unwrap(), 1);
+
+    clear_push_jobs(&fixture.pool).await;
 }
 
 // --------------------------------------------------------- 长度限制（HTTP 全链路）

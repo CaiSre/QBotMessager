@@ -177,6 +177,7 @@ docker compose up -d --build
 | `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` | 初始超级管理员；账号已存在时仅在密码匹配且系统无启用的超管时提升，不改密码 | 空 |
 | `QQ_APPID` / `QQ_APP_SECRET` / `OPENID` | 首启导入的机器人凭据与默认推送目标 | 空 |
 | `TRUST_PROXY` | 是否信任上游反向代理的 `X-Forwarded-For`；直连部署保持 `false`，由 Nginx/Caddy 转发时设 `true`（取最右侧一跳） | `false` |
+| `PUSH_QUEUE_MAX` / `PUSH_QUEUE_MAX_PER_USER` | 推送队列总积压上限 / 单用户积压上限；单用户超额时仅该用户的新投递返回忙 | `200` / `20` |
 | `STATIC_DIR` | 前端静态产物目录；容器内为 `/app/web`，本地直跑可指向 `../web/out` | `./web/out` |
 | `WORKERS` | Actix worker 线程数；留空按 CPU 核数但最多 2，降低容器常驻内存 | 最多 2 |
 | `PORT` / `APP_PORT` | 容器内监听端口 / 宿主机映射端口 | `3000` / `3000` |
@@ -206,13 +207,12 @@ docker compose up -d --build
 | QQ API 域名（`QQ_HOST`） | 机器人未单独配置时使用的默认地址 | `https://api.bot.qq.com` |
 | QQ 频控（`QQ_QPS` / `QQ_QPM` / `QQ_MIN_INTERVAL`） | 账号级频控，保存后重建限速器 | `5` / `30` / `0.21` |
 | 内容长度上限（`MARKDOWN_MAX_LEN` / `TEXT_MAX_LEN`） | 下发内容长度上限 | `4000` / `2000` |
-| 队列积压上限（`PUSH_QUEUE_MAX`） | 排队中的推送任务上限，超过时 Webhook 返回忙 | `200` |
 
 ## 使用指南
 
 ### 创建机器人与通道
 
-1. 在「机器人」页新增机器人，填写 AppID、AppSecret 与默认接收方（openid 或群 openid）。
+1. 在「机器人」页新增机器人，填写 AppID、AppSecret 与默认接收方（openid 或群 openid）。同一账号下 AppID 不可重复，QQ 频控与 token 按 AppID 共享。
 2. 在同一页新增通道，选择钩子类型并填写推送来源（可选，用于区分 Webhook 的使用位置）后即生成 Webhook Token 与完整 Webhook 地址，**只展示这一次**，请立即复制保存。GitHub 的 Webhook 设置中没有单独的 token 字段：token 已包含在 `/webhook/github/{token}` 地址中，填入 Payload URL 即可；创建时还会生成 Secret，需填到 GitHub 的 Secret 字段。
 3. 通道可在「轮换」后立即失效旧 token，也可停用而不删除；GitHub 通道轮换会同时更换签名密钥，需要同步更新 GitHub 配置。
 
@@ -242,7 +242,7 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 - 注册需邀请码，注册用户固定为 `user`；邀请码由超级管理员签发，可限定邮箱、次数与有效期。
 - 用户名全局唯一（忽略大小写），可用于登录；未填写时按邮箱前缀自动生成，冲突时追加 `-2`、`-3` 等后缀。数据库对 `lower(name)` 建唯一索引兜底。
 - 系统至少保留一个启用的超级管理员，且不能修改自己的角色或账号状态。
-- OAuth2 提供方默认「邮箱不可信」：只有提供方确认验证过邮箱归属（或接口返回了已验证标记）时，才会用同邮箱自动关联已有本地账号；否则要求用户改用密码登录，避免冒名接管。GitHub 预设默认信任。
+- OAuth2 提供方默认「邮箱不可信」：管理端开启「信任邮箱」且本次授权响应标记邮箱已验证时，才会用同邮箱自动关联已有本地账号。首次通过 OAuth 建号还必须携带有效邀请码，邀请码限定邮箱时须与提供方返回的邮箱一致；邀请码名额与建号同事务占用。
 
 ## 接口一览
 
@@ -255,7 +255,7 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 | | `POST /api/auth/login`、`/logout`、`/register` | 用户名或邮箱密码登录、退出、邀请码注册（配置 SMTP 后需邮箱验证码） |
 | | `POST /api/auth/email-code`、`/password/reset` | 发送注册/找回密码验证码、用验证码重置密码 |
 | | `GET /api/auth/me` | 当前用户信息 |
-| | `GET /api/auth/oauth/{key}/start`、`/callback` | OAuth2 授权码流程 |
+| | `GET /api/auth/oauth/{key}/start`、`/callback` | OAuth2 授权码流程；`start?invite_code=` 携带首次建号所需邀请码 |
 | | `GET /api/auth/passkey`、`POST /api/auth/passkey/*` | 通行密钥注册与登录 |
 | 管理台 | `/api/admin/bot-profiles`、`/channels` | 资源增删改查（按归属过滤） |
 | | `GET /api/admin/logs`、`/stats` | 推送日志与统计 |
@@ -329,7 +329,7 @@ bun run build
 ## 安全建议
 
 - 生产环境务必设置 `APP_SECRET_KEY`（缺失时默认拒绝启动），密钥丢失将无法解密已入库的敏感字段。仅本地调试可显式设置 `ALLOW_PLAINTEXT_SECRETS=true` 降级明文。
-- 使用 HTTPS，并在「系统设置」中开启 Cookie 仅限 HTTPS、填写真实对外地址，保证 OAuth 回调与 Webhook 地址正确。
+- 使用 HTTPS，并在「系统设置」中开启 Cookie 仅限 HTTPS、填写真实对外地址，保证 OAuth 回调与 Webhook 地址正确。HTTPS 下会话 Cookie 自动使用 `__Host-` 前缀，响应同时下发 HSTS 与限制脚本来源的 CSP。
 - 部署在反向代理之后时设置 `TRUST_PROXY=true`，否则登录限速只能看到代理地址。
 - 只有在提供方确实验证过邮箱归属时才开启 OAuth2 提供方的「信任邮箱」，否则同邮箱的本地账号可能被冒名登录接管。
 - 不要将 MySQL 端口暴露到公网（compose 未映射 3306）。

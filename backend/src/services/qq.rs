@@ -1,7 +1,7 @@
 //! QQ 机器人 HTTP 客户端：token 缓存、消息发送、错误分类与重试。
 //!
 //! QQ 机器人 API 客户端：
-//! - token 按 `bot:<id>` 缓存，提前 60 秒刷新，每个 key 独立锁 + 双检；
+//! - token 与频控按 `app:<host>:<appid>` 缓存，提前 60 秒刷新，每个 key 独立锁 + 双检；
 //! - HTTP 401 清缓存并重试一次；
 //! - 错误码提取顺序 `code` → `err_code` → `errcode`，都没有时用 `http_{status}`；
 //! - `40054005`（去重）视为成功，`40034100`（超频）与 5xx 可重试；
@@ -137,6 +137,18 @@ impl QqError {
     }
 }
 
+/// QQ 凭据缓存与频控共用的键。
+///
+/// QQ access_token 与调用额度都归属于 AppID，而不是本地机器人行；同一 AppID
+/// 被多个机器人复用时必须共享缓存与限流，否则会各自放大平台调用量。
+pub fn account_key(host: &str, app_id: &str) -> String {
+    format!(
+        "app:{}:{}",
+        host.trim().trim_end_matches('/').to_ascii_lowercase(),
+        app_id.trim()
+    )
+}
+
 /// 已缓存的 access_token。
 #[derive(Debug, Clone)]
 struct CachedToken {
@@ -144,7 +156,7 @@ struct CachedToken {
     expires_at: Instant,
 }
 
-/// 按 `bot:<id>` 缓存 access_token 的异步客户端。
+/// 按 `app:<host>:<appid>` 缓存 access_token 的异步客户端。
 pub struct QqClient {
     client: reqwest::Client,
     tokens: DashMap<String, CachedToken>,
@@ -459,6 +471,23 @@ async fn safe_json(response: reqwest::Response) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_key_is_scoped_by_host_and_appid() {
+        assert_eq!(
+            account_key("https://API.BOT.QQ.COM/", "123"),
+            "app:https://api.bot.qq.com:123"
+        );
+        // 同一 AppID 的不同域名不能共用 token；不同 AppID 也不能共用限流。
+        assert_ne!(
+            account_key("https://api.bot.qq.com", "123"),
+            account_key("https://sandbox.bot.qq.com", "123")
+        );
+        assert_ne!(
+            account_key("https://api.bot.qq.com", "123"),
+            account_key("https://api.bot.qq.com", "456")
+        );
+    }
 
     #[test]
     fn target_path_prefers_group() {

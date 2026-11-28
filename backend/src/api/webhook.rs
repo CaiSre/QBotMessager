@@ -324,7 +324,7 @@ async fn receive(
                 ));
             }
             Ok(true) => return Ok(hook_type_response(hook_type, StatusCode::OK, 0, "ok")),
-            Err(QueueError::Full(_)) => {
+            Err(QueueError::Full(_) | QueueError::OwnerFull(_)) => {
                 tracing::warn!(
                     hook_type,
                     request_id = %request_id,
@@ -353,7 +353,7 @@ async fn receive(
 
     // 未配置队列（或队列不可用）时同步发送；同样启用幂等守卫，
     // 队列重投与同步回退共用同一套 `request_id:target` 完成标记。
-    let limiter = state.limiters.get(&format!("bot:{}", job.bot_id));
+    let limiter = state.limiters.get(&job.qq_account_key(&settings));
     let outcome = execute_push(
         &state.pool,
         &job,

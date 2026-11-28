@@ -158,6 +158,13 @@ struct PasskeyFinishIn {
     flow: String,
 }
 
+/// OAuth 发起参数；首次注册必须携带邀请码，已有账号登录可省略。
+#[derive(Debug, Default, Deserialize)]
+struct OAuthStartQuery {
+    #[serde(default)]
+    invite_code: String,
+}
+
 /// OAuth 回调查询参数；缺失时按空串处理。
 #[derive(Debug, Deserialize)]
 struct OAuthCallbackQuery {
@@ -462,9 +469,11 @@ async fn logout(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpResp
     let settings = (*state.settings()).clone();
     let token = session_token(&state, &req);
     sessions::revoke_session(&state.pool, &token).await?;
-    Ok(HttpResponse::Ok()
-        .cookie(sessions::clear_session_cookie(&state.config, &settings))
-        .json(json!({ "ok": true })))
+    let mut response = HttpResponse::Ok();
+    for cookie in sessions::clear_session_cookies(&state.config, &settings) {
+        response.cookie(cookie);
+    }
+    Ok(response.json(json!({ "ok": true })))
 }
 
 /// `POST /api/auth/register`
@@ -512,6 +521,7 @@ async fn oauth_start(
     req: HttpRequest,
     state: web::Data<AppState>,
     path: web::Path<String>,
+    query: web::Query<OAuthStartQuery>,
 ) -> Result<HttpResponse, AppError> {
     let provider_key = path.into_inner();
     let provider = queries::oauth::find_enabled_by_key(&state.pool, &provider_key)
@@ -520,6 +530,13 @@ async fn oauth_start(
 
     // 只做一次可解密性校验：结果不写回实体。
     let _client_secret = oauth::client_secret(&provider, state.config.app_secret_key.as_deref())?;
+    let invite_code = query.invite_code.trim();
+    if invite_code.chars().count() > users::INVITE_CODE_MAX {
+        return Err(AppError::validation(format!(
+            "邀请码最长 {} 个字符",
+            users::INVITE_CODE_MAX
+        )));
+    }
 
     let settings = (*state.settings()).clone();
     let origin = request_origin(&state, &settings, &req);
@@ -555,6 +572,13 @@ async fn oauth_start(
                 response.add_cookie(&oauth::link_cookie(&settings, &flow))
             } else {
                 Ok(())
+            }
+        })
+        .and_then(|()| {
+            if invite_code.is_empty() {
+                Ok(())
+            } else {
+                response.add_cookie(&oauth::invite_cookie(&settings, &flow, invite_code))
             }
         });
     cookie_result.map_err(|_| AppError::internal("响应构造失败"))?;
@@ -635,6 +659,8 @@ async fn oauth_callback_inner(
     let identity =
         queries::oauth::find_identity(&state.pool, &provider.key, &profile.provider_user_id)
             .await?;
+    // 邮箱信任必须同时满足：管理端确认该提供方会验证邮箱，且本次响应明确标记已验证。
+    let email_verified = provider.email_verified && profile.email_verified;
 
     // 绑定分支：start 时带会话、且回调时仍能解析出有效会话。
     let link_cookie_name = oauth::flow_cookie_name(oauth::LINK_COOKIE, &flow);
@@ -691,11 +717,10 @@ async fn oauth_callback_inner(
         };
         match existing {
             Some(found) => {
-                // 自动关联要求提供方在本次响应中确认邮箱已验证；
-                // 管理端的静态开关不参与该判定，避免逐响应标记被整体覆盖。
-                if !profile.email_verified {
+                // 自动关联要求管理端信任该提供方的邮箱、且本次响应确认邮箱已验证。
+                if !email_verified {
                     return Err(AppError::conflict(
-                        "该邮箱已存在本地账号，但提供方未验证邮箱，无法自动关联；请改用密码登录",
+                        "该邮箱已存在本地账号，但提供方邮箱未通过可信验证，无法自动关联；请改用密码登录",
                     ));
                 }
                 Some(found)
@@ -706,10 +731,26 @@ async fn oauth_callback_inner(
                         "未找到关联账号，且注册入口已关闭，请联系管理员邀请",
                     ));
                 }
+                if !email_verified {
+                    return Err(AppError::forbidden(
+                        "提供方邮箱未通过可信验证，无法创建账号；请联系管理员",
+                    ));
+                }
                 let Some(email) = profile.email.as_deref() else {
                     return Err(AppError::bad_request("提供方未返回邮箱，无法创建账号"));
                 };
+                let invite_code = req
+                    .cookie(&oauth::flow_cookie_name(oauth::INVITE_COOKIE, &flow))
+                    .map(|cookie| cookie.value().to_string())
+                    .unwrap_or_default();
+                if invite_code.is_empty() {
+                    return Err(AppError::forbidden(
+                        "首次通过 OAuth 登录需要邀请码，请返回登录页填写",
+                    ));
+                }
                 let email_lower = email.to_lowercase();
+                let invite =
+                    users::validate_invite(&state.pool, &invite_code, &email_lower).await?;
                 let preferred = profile
                     .name
                     .as_deref()
@@ -727,6 +768,7 @@ async fn oauth_callback_inner(
                 // 建号与身份绑定同一事务提交，任一步失败整体回滚，避免产生
                 // 没有任何登录凭据的孤儿账号。
                 let mut tx = state.pool.begin().await?;
+                users::consume_invite(&mut tx, invite.id, now).await?;
                 let user_id = queries::users::insert(&mut *tx, &new_user).await?;
                 queries::oauth::insert_identity(
                     &mut *tx,
@@ -809,6 +851,10 @@ async fn oauth_callback_inner(
             &oauth::flow_cookie_name(oauth::LINK_COOKIE, &flow),
             &settings,
         ))
+        .cookie(oauth::clear_cookie(
+            &oauth::flow_cookie_name(oauth::INVITE_COOKIE, &flow),
+            &settings,
+        ))
         .finish())
 }
 
@@ -837,6 +883,10 @@ fn oauth_done_redirect(
         ))
         .cookie(oauth::clear_cookie(
             &oauth::flow_cookie_name(oauth::LINK_COOKIE, flow),
+            settings,
+        ))
+        .cookie(oauth::clear_cookie(
+            &oauth::flow_cookie_name(oauth::INVITE_COOKIE, flow),
             settings,
         ))
         .finish()
@@ -868,6 +918,10 @@ fn oauth_failure_redirect(settings: &RuntimeSettings, flow: &str, err: &AppError
             ))
             .cookie(oauth::clear_cookie(
                 &oauth::flow_cookie_name(oauth::LINK_COOKIE, flow),
+                settings,
+            ))
+            .cookie(oauth::clear_cookie(
+                &oauth::flow_cookie_name(oauth::INVITE_COOKIE, flow),
                 settings,
             ));
     }
@@ -1247,9 +1301,7 @@ async fn require_step_up(state: &AppState, req: &HttpRequest) -> Result<(), AppE
 
 /// 从请求中读取会话 token（Cookie 名来自环境变量配置）。
 fn session_token(state: &AppState, req: &HttpRequest) -> String {
-    req.cookie(state.config.cookie_name.as_str())
-        .map(|cookie| cookie.value().to_string())
-        .unwrap_or_default()
+    sessions::read_session_token(req, &state.config, &state.settings())
 }
 
 /// 读取指定 Cookie 的值。

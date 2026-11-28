@@ -75,7 +75,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Web 与 worker 共享同一份 AppState：队列、限流器与运行期设置都只有一份。
-    let queue = Arc::new(PushQueue::connect(pool.clone(), config.push_queue_max).await?);
+    let queue = Arc::new(
+        PushQueue::connect(
+            pool.clone(),
+            config.push_queue_max,
+            config.push_queue_max_per_user,
+        )
+        .await?,
+    );
     let state = Arc::new(AppState::new(
         pool,
         Arc::new(config),

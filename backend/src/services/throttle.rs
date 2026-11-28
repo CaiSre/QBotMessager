@@ -108,7 +108,8 @@ impl RateLimiter {
 /// 按 key（机器人）分配独立限流器。
 ///
 /// QQ 的主动消息频控按机器人（AppID）维度计算，多个用户共用一条全局配额会互相
-/// 拖慢，因此每个机器人各维护一份窗口。键沿用 QqClient 的 `bot:<id>` 约定。
+/// 拖慢，因此每个 QQ AppID 各维护一份窗口。键沿用 QqClient 的
+/// `app:<host>:<appid>` 约定。
 #[derive(Debug)]
 pub struct LimiterRegistry {
     defaults: Mutex<RegistryDefaults>,

@@ -11,7 +11,9 @@ use sqlx::MySqlPool;
 
 use crate::auth::passwords::{burn_password_async, hash_password_async, verify_password_async};
 use crate::auth::sessions::{create_session, revoke_other_sessions, revoke_user_sessions};
-use crate::db::models::{ROLE_SUPER_ADMIN, ROLE_USER, ROLES, STATUS_ACTIVE, STATUS_DISABLED, User};
+use crate::db::models::{
+    InviteCode, ROLE_SUPER_ADMIN, ROLE_USER, ROLES, STATUS_ACTIVE, STATUS_DISABLED, User,
+};
 use crate::db::queries;
 use crate::error::AppError;
 use crate::services::email_codes;
@@ -192,6 +194,53 @@ fn suffixed_name(base: &str, index: u32) -> String {
     name
 }
 
+/// 校验邀请码是否可用于指定邮箱（不占用名额）。
+///
+/// 密码注册与 OAuth 首次建号共用，避免两条注册路径对邀请码的校验出现分歧。
+pub async fn validate_invite(
+    pool: &MySqlPool,
+    code: &str,
+    email: &str,
+) -> Result<InviteCode, AppError> {
+    if code.is_empty() || code.chars().count() > INVITE_CODE_MAX {
+        return Err(AppError::validation(format!(
+            "邀请码长度需在 1 到 {INVITE_CODE_MAX} 个字符之间"
+        )));
+    }
+    let now = Utc::now().naive_utc();
+    let Some(invite) = queries::invites::find_by_code(pool, code).await? else {
+        return Err(AppError::bad_request("邀请码无效"));
+    };
+    if invite.revoked_at.is_some() {
+        return Err(AppError::bad_request("邀请码已作废"));
+    }
+    if invite
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now)
+    {
+        return Err(AppError::bad_request("邀请码已过期"));
+    }
+    if let Some(limited_email) = invite.email.as_deref()
+        && limited_email.to_lowercase() != email
+    {
+        return Err(AppError::bad_request("邀请码不适用于该邮箱"));
+    }
+    Ok(invite)
+}
+
+/// 在事务内原子占用一次邀请名额。
+pub async fn consume_invite(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    invite_id: i64,
+    now: chrono::NaiveDateTime,
+) -> Result<(), AppError> {
+    let consumed = queries::invites::consume_slot(&mut **tx, invite_id, now).await?;
+    if consumed != 1 {
+        return Err(AppError::bad_request("邀请码已用尽"));
+    }
+    Ok(())
+}
+
 /// 注册（含邀请码名额占用、唯一性校验与邮箱验证码校验）。
 ///
 /// 事务边界：邀请码名额占用与账号插入同一事务提交；用户名/邮箱唯一索引兜底
@@ -223,23 +272,7 @@ pub async fn register(
     }
 
     let now = Utc::now().naive_utc();
-    let Some(invite) = queries::invites::find_by_code(pool, input.invite_code).await? else {
-        return Err(AppError::bad_request("邀请码无效"));
-    };
-    if invite.revoked_at.is_some() {
-        return Err(AppError::bad_request("邀请码已作废"));
-    }
-    if invite
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= now)
-    {
-        return Err(AppError::bad_request("邀请码已过期"));
-    }
-    if let Some(limited_email) = invite.email.as_deref()
-        && limited_email.to_lowercase() != email
-    {
-        return Err(AppError::bad_request("邀请码不适用于该邮箱"));
-    }
+    let invite = validate_invite(pool, input.invite_code, &email).await?;
 
     if queries::users::email_taken(pool, &email, None).await? {
         return Err(AppError::conflict("该邮箱已注册"));
@@ -272,10 +305,7 @@ pub async fn register(
 
     let mut tx = pool.begin().await?;
     // 原子占用名额：条件 UPDATE 保证并发注册也不会突破 max_uses。
-    let consumed = queries::invites::consume_slot(&mut *tx, invite.id, now).await?;
-    if consumed != 1 {
-        return Err(AppError::bad_request("邀请码已用尽"));
-    }
+    consume_invite(&mut tx, invite.id, now).await?;
 
     let new_user = queries::users::NewUser {
         email: &email,
