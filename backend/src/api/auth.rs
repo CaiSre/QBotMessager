@@ -44,6 +44,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .app_data(json_config())
             .route("/providers", web::get().to(list_providers))
             .route("/me", web::get().to(me))
+            .route("/me/verify", web::post().to(verify_identity))
             .route("/me/name", web::patch().to(update_name))
             .route("/me/email", web::patch().to(update_email))
             .route("/me/password", web::patch().to(update_password))
@@ -141,6 +142,12 @@ struct PasswordChangeIn {
     email_code: String,
 }
 
+/// step-up 身份验证：只接受当前密码。
+#[derive(Debug, Deserialize)]
+struct VerifyIn {
+    password: String,
+}
+
 /// Passkey 注册 / 登录完成：浏览器返回的凭据对象与本次流程的 flow。
 ///
 /// `flow` 必填（缺失由 serde 拒绝），值来自 begin 响应外层的 `flow` 键，
@@ -215,12 +222,42 @@ async fn list_providers(
 async fn me(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let user = require_user(&state, &req).await?;
     let passkey_count = passkey_store::count_for_user(&state.pool, user.id).await?;
+    let verified = sessions::verified_at(&state.pool, &session_token(&state, &req)).await?;
 
     let mut payload = user_payload(&user);
     if let Value::Object(map) = &mut payload {
         map.insert("passkey_count".to_string(), json!(passkey_count));
+        map.insert(
+            "step_up_valid".to_string(),
+            json!(sessions::step_up_valid(verified, Utc::now().naive_utc())),
+        );
     }
     Ok(HttpResponse::Ok().json(payload))
+}
+
+/// `POST /api/auth/me/verify`
+///
+/// 敏感操作前的 step-up：验证当前密码并把本会话的 `verified_at` 刷新到现在。
+async fn verify_identity(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<VerifyIn>,
+) -> Result<HttpResponse, AppError> {
+    let user = require_user(&state, &req).await?;
+    if body.password.is_empty() {
+        return Err(AppError::validation("请填写密码"));
+    }
+    validate_optional_password(&body.password)?;
+    let ip = state.client_ip(&req);
+    users::verify_current_password(&state.login_limiter, ip.as_deref(), &user, &body.password)
+        .await?;
+    sessions::mark_verified(
+        &state.pool,
+        &session_token(&state, &req),
+        Utc::now().naive_utc(),
+    )
+    .await?;
+    Ok(HttpResponse::Ok().json(json!({ "ok": true })))
 }
 
 // ---------------------------------------------------------------------- 个人资料
@@ -246,9 +283,18 @@ async fn update_email(
     validate_optional_password(&body.current_password)?;
     let email = validate_email_input(&body.email)?;
     let token = session_token(&state, &req);
-    let updated =
-        users::update_profile_email(&state.pool, &user, &email, &body.current_password, &token)
-            .await?;
+    let ip = state.client_ip(&req);
+    let updated = users::update_profile_email(
+        &state.pool,
+        &state.login_limiter,
+        &user,
+        &email,
+        &body.current_password,
+        &token,
+        ip.as_deref(),
+    )
+    .await?;
+    sessions::mark_verified(&state.pool, &token, Utc::now().naive_utc()).await?;
     Ok(HttpResponse::Ok().json(user_payload(&updated)))
 }
 
@@ -260,20 +306,28 @@ async fn update_password(
 ) -> Result<HttpResponse, AppError> {
     let user = require_user(&state, &req).await?;
     let settings = (*state.settings()).clone();
+    // 无密码账号设置首个密码等同新增登录凭据，要求近期验证（重新登录）。
+    if user.password_hash.is_none() {
+        require_step_up(&state, &req).await?;
+    }
     validate_optional_password(&body.current_password)?;
     validate_email_code_field(&body.email_code)?;
     let token = session_token(&state, &req);
+    let ip = state.client_ip(&req);
 
     users::change_password(
         &state.pool,
+        &state.login_limiter,
         &settings,
         &user,
         &body.current_password,
         &body.new_password,
         &body.email_code,
         &token,
+        ip.as_deref(),
     )
     .await?;
+    sessions::mark_verified(&state.pool, &token, Utc::now().naive_utc()).await?;
     Ok(HttpResponse::Ok().json(json!({ "ok": true })))
 }
 
@@ -479,6 +533,15 @@ async fn oauth_start(
     // 已登录用户发起的流程按「绑定」处理：回调据此把第三方账号挂到当前用户，
     // 而不是走登录/自动注册分支。
     let session_user = sessions::resolve_session(&state.pool, &session_token(&state, &req)).await?;
+    if session_user.is_some() && require_step_up(&state, &req).await.is_err() {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("oauth", "fail")
+            .append_pair("message", "请重新验证身份后再绑定第三方账号")
+            .finish();
+        return Ok(HttpResponse::Found()
+            .append_header((LOCATION, format!("/security?{query}")))
+            .finish());
+    }
     let mut response = HttpResponse::Found()
         .append_header((LOCATION, url))
         .finish();
@@ -842,6 +905,7 @@ async fn unlink_oauth(
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
     let user = require_user(&state, &req).await?;
+    require_step_up(&state, &req).await?;
     let identity_id = path
         .into_inner()
         .parse::<i64>()
@@ -896,6 +960,7 @@ async fn passkey_register_begin(
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
     let user = require_user(&state, &req).await?;
+    require_step_up(&state, &req).await?;
     let settings = (*state.settings()).clone();
     let rp_id = request_rp_id(&settings, &req);
     let origin = request_origin(&state, &settings, &req);
@@ -926,6 +991,7 @@ async fn passkey_register_finish(
     body: web::Json<PasskeyFinishIn>,
 ) -> Result<HttpResponse, AppError> {
     let user = require_user(&state, &req).await?;
+    require_step_up(&state, &req).await?;
     let settings = (*state.settings()).clone();
     let flow = finish_flow(&body.flow)?;
     let raw_challenge = cookie_value(&req, &passkey::cookie_name(passkey::CHALLENGE_COOKIE, flow));
@@ -998,6 +1064,7 @@ async fn delete_passkey(
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
     let user = require_user(&state, &req).await?;
+    require_step_up(&state, &req).await?;
     let credential_id = path
         .into_inner()
         .parse::<i64>()
@@ -1007,6 +1074,17 @@ async fn delete_passkey(
     if record.as_ref().map(|row| row.user_id) != Some(user.id) {
         return Err(AppError::not_found("凭证不存在"));
     }
+
+    // 与 OAuth 解绑一致：不允许删掉之后没有任何登录方式的最后凭据。
+    let has_password = user.password_hash.is_some();
+    let passkey_count = passkey_store::count_for_user(&state.pool, user.id).await?;
+    let identity_count = queries::oauth::count_identities_for_user(&state.pool, user.id).await?;
+    if !has_password && passkey_count <= 1 && identity_count == 0 {
+        return Err(AppError::conflict(
+            "删除后账号将没有任何登录方式，请先设置密码或绑定第三方账号",
+        ));
+    }
+
     passkey_store::delete(&state.pool, credential_id).await?;
     Ok(HttpResponse::Ok().json(json!({ "ok": true })))
 }
@@ -1154,6 +1232,16 @@ async fn require_user(state: &AppState, req: &HttpRequest) -> Result<User, AppEr
         None => Err(AppError::unauthorized("未登录")),
         Some(user) if user.status != STATUS_ACTIVE => Err(AppError::forbidden("账号已停用")),
         Some(user) => Ok(user),
+    }
+}
+
+/// 敏感操作要求会话在最近 [`sessions::STEP_UP_WINDOW_MINUTES`] 分钟内验证过身份。
+async fn require_step_up(state: &AppState, req: &HttpRequest) -> Result<(), AppError> {
+    let verified = sessions::verified_at(&state.pool, &session_token(state, req)).await?;
+    if sessions::step_up_valid(verified, Utc::now().naive_utc()) {
+        Ok(())
+    } else {
+        Err(AppError::forbidden("请重新验证身份后再操作"))
     }
 }
 

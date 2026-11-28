@@ -6,6 +6,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::markdown::markdown_link;
+
 use super::base::{Adapter, AdapterError, FMT_MARKDOWN, UnifiedMessage, truthy, value_text};
 
 /// 推送事件最多展示的提交数。
@@ -337,7 +339,7 @@ fn push_message(payload: &Map<String, Value>) -> UnifiedMessage {
         .join("\n");
     let compare = stripped(payload, "compare");
     if !compare.is_empty() {
-        body.push_str(&format!("\n\n[查看对比]({compare})"));
+        body.push_str(&format!("\n\n{}", markdown_link("查看对比", &compare)));
     }
     markdown_message(format!("{repo} 推送 {branch}"), body, "push".to_string())
 }
@@ -553,7 +555,7 @@ fn workflow_run_message(payload: &Map<String, Value>) -> Result<UnifiedMessage, 
         format!("分支 `{branch}` 运行{label}")
     };
     if !url.is_empty() {
-        body.push_str(&format!("\n\n[查看运行]({url})"));
+        body.push_str(&format!("\n\n{}", markdown_link("查看运行", &url)));
     }
     Ok(markdown_message(
         format!("{repo} 工作流 {name} {label}"),
@@ -600,7 +602,7 @@ fn workflow_job_message(payload: &Map<String, Value>) -> UnifiedMessage {
         format!("分支 `{branch}` 任务{label}")
     };
     if !url.is_empty() {
-        body.push_str(&format!("\n\n[查看运行]({url})"));
+        body.push_str(&format!("\n\n{}", markdown_link("查看运行", &url)));
     }
     let title = format!("{repo} 工作流任务 {name} {label}")
         .trim()
@@ -636,7 +638,7 @@ fn generic_message(payload: &Map<String, Value>, event: &str) -> UnifiedMessage 
     }
     let repo_url = repo_url(payload);
     if url.is_empty() && !repo_url.is_empty() {
-        body.push_str(&format!("\n\n[查看仓库]({repo_url})"));
+        body.push_str(&format!("\n\n{}", markdown_link("查看仓库", &repo_url)));
     }
     let title = if repo.is_empty() {
         format!("GitHub {label}")
@@ -780,11 +782,7 @@ fn subject(payload: &Map<String, Value>, event: &str) -> (String, String) {
 }
 
 fn link_text(label: &str, url: &str) -> String {
-    if url.is_empty() {
-        label.to_string()
-    } else {
-        format!("[{label}]({url})")
-    }
+    markdown_link(label, url)
 }
 
 fn action_or_update(action: &str) -> String {
@@ -945,6 +943,39 @@ mod tests {
             "**bob** 合并：[新功能](https://github.com/o/r/pull/7)"
         );
         assert_eq!(message.source_msgtype, "pull_request.closed");
+    }
+
+    #[test]
+    fn pull_request_title_cannot_inject_extra_links() {
+        let message = parse(
+            json!({
+                "action": "closed",
+                "number": 7,
+                "pull_request": {
+                    "number": 7,
+                    "title": "x](https://evil.example)",
+                    "html_url": "https://github.com/o/r/pull/7",
+                    "merged": true,
+                    "merged_by": {"login": "bob"}
+                },
+                "repository": {"full_name": "o/r"},
+                "sender": {"login": "alice"}
+            }),
+            "pull_request",
+        )
+        .expect("解析成功");
+        assert!(
+            !message.body.contains("](https://evil.example)"),
+            "标题不应闭合原链接并注入新链接：{}",
+            message.body
+        );
+        assert!(
+            message
+                .body
+                .contains("[x\\]\\(https://evil.example\\)](https://github.com/o/r/pull/7)"),
+            "标签应被转义且目标保持为可信 URL：{}",
+            message.body
+        );
     }
 
     #[test]

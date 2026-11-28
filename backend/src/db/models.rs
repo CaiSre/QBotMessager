@@ -106,6 +106,8 @@ pub struct Session {
     pub ip: Option<String>,
     /// 客户端 UA（截断 255 字符）。
     pub user_agent: Option<String>,
+    /// 最近一次身份验证时间；敏感操作要求其在窗口内。
+    pub verified_at: Option<NaiveDateTime>,
     /// 过期时间。
     pub expires_at: NaiveDateTime,
     /// 撤销时间。

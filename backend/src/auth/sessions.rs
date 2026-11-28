@@ -24,6 +24,8 @@ use crate::services::runtime_settings::RuntimeSettings;
 pub const TOKEN_BYTES: usize = 32;
 /// user_agent 入库前的最大长度。
 pub const USER_AGENT_MAX: usize = 255;
+/// 敏感操作要求的最近验证窗口（分钟）。
+pub const STEP_UP_WINDOW_MINUTES: i64 = 10;
 
 /// 生成会话 token（base64url 无填充）。
 pub fn new_session_token() -> String {
@@ -40,6 +42,11 @@ pub fn hash_token(token: &str) -> String {
 /// 会话是否仍然有效。
 pub fn is_session_valid(session: &Session, now: NaiveDateTime) -> bool {
     session.revoked_at.is_none() && session.expires_at > now
+}
+
+/// 最近验证是否仍在窗口内；`None`（旧会话或未验证）视为过期。
+pub fn step_up_valid(verified_at: Option<NaiveDateTime>, now: NaiveDateTime) -> bool {
+    verified_at.is_some_and(|value| value + ChronoDuration::minutes(STEP_UP_WINDOW_MINUTES) > now)
 }
 
 /// 构造会话 Cookie。
@@ -89,13 +96,15 @@ pub async fn create_session(
     // 会话插入与最后登录时间必须同一事务提交。
     let mut tx = pool.begin().await?;
     sqlx::query(
-        "INSERT INTO sessions (token_hash, user_id, ip, user_agent, expires_at, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sessions \
+         (token_hash, user_id, ip, user_agent, verified_at, expires_at, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(hash_token(&token))
     .bind(user.id)
     .bind(ip)
     .bind(user_agent)
+    .bind(now)
     .bind(expires_at)
     .bind(now)
     .execute(&mut *tx)
@@ -116,7 +125,7 @@ pub async fn resolve_session(pool: &MySqlPool, token: &str) -> Result<Option<Use
         return Ok(None);
     }
     let session = sqlx::query_as::<_, Session>(
-        "SELECT id, token_hash, user_id, ip, user_agent, expires_at, revoked_at, created_at \
+        "SELECT id, token_hash, user_id, ip, user_agent, verified_at, expires_at, revoked_at, created_at \
          FROM sessions WHERE token_hash = ?",
     )
     .bind(hash_token(token))
@@ -136,6 +145,36 @@ pub async fn resolve_session(pool: &MySqlPool, token: &str) -> Result<Option<Use
     .fetch_optional(pool)
     .await?;
     Ok(user)
+}
+
+/// 读取会话最近验证时间；token 无效时返回 `None`。
+pub async fn verified_at(pool: &MySqlPool, token: &str) -> Result<Option<NaiveDateTime>, AppError> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let row: Option<(Option<NaiveDateTime>,)> =
+        sqlx::query_as("SELECT verified_at FROM sessions WHERE token_hash = ?")
+            .bind(hash_token(token))
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|(value,)| value))
+}
+
+/// 标记当前会话刚刚完成身份验证。
+pub async fn mark_verified(
+    pool: &MySqlPool,
+    token: &str,
+    now: NaiveDateTime,
+) -> Result<(), AppError> {
+    if token.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("UPDATE sessions SET verified_at = ? WHERE token_hash = ? AND revoked_at IS NULL")
+        .bind(now)
+        .bind(hash_token(token))
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// 撤销单个会话。
@@ -216,6 +255,7 @@ mod tests {
             user_id: 1,
             ip: None,
             user_agent: None,
+            verified_at: Some(now),
             expires_at: now + ChronoDuration::hours(1),
             revoked_at: None,
             created_at: now,
@@ -235,5 +275,20 @@ mod tests {
             },
             now
         ));
+    }
+
+    #[test]
+    fn step_up_window_accepts_recent_and_rejects_stale_or_missing() {
+        let now = Utc::now().naive_utc();
+        assert!(step_up_valid(Some(now), now));
+        assert!(step_up_valid(
+            Some(now - ChronoDuration::minutes(STEP_UP_WINDOW_MINUTES - 1)),
+            now
+        ));
+        assert!(!step_up_valid(
+            Some(now - ChronoDuration::minutes(STEP_UP_WINDOW_MINUTES)),
+            now
+        ));
+        assert!(!step_up_valid(None, now));
     }
 }

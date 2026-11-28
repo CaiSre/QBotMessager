@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use crate::markdown::degrade_tables;
+use crate::markdown::{degrade_tables, markdown_link};
 
 use super::base::{
     Adapter, AdapterError, Attachment, FMT_MARKDOWN, FMT_TEXT, UnifiedMessage, truthy, value_text,
@@ -191,7 +191,7 @@ fn news_message(payload: &Map<String, Value>) -> Result<UnifiedMessage, AdapterE
             let url = stripped_field(article, "url");
             let description = stripped_field(article, "description");
             if !title.is_empty() && !url.is_empty() {
-                parts.push(format!("- [{title}]({url})"));
+                parts.push(format!("- {}", markdown_link(&title, &url)));
             } else if !title.is_empty() {
                 parts.push(format!("- {title}"));
             }

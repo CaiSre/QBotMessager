@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde_json::json;
 use sqlx::MySqlPool;
 
-use crate::auth::passwords::hash_password_async;
+use crate::auth::passwords::{hash_password_async, verify_password_async};
 use crate::config::Config;
 use crate::crypto::encrypt_secret;
 use crate::db::models::{ROLE_SUPER_ADMIN, STATUS_ACTIVE, User};
@@ -19,7 +19,9 @@ use crate::db::queries::bots::NewBotProfile;
 use crate::db::queries::users::NewUser;
 use crate::error::AppError;
 use crate::services::runtime_settings::RuntimeSettings;
-use crate::services::users::{is_super_admin, normalize_email, unique_name};
+use crate::services::users::{
+    is_super_admin, normalize_email, unique_name, validate_email, validate_password,
+};
 
 /// 本次引导创建或提升的实体摘要（用于启动日志与测试）。
 #[derive(Debug, Default)]
@@ -43,23 +45,56 @@ pub async fn run(
 
     if !config.bootstrap_admin_email.is_empty() && !config.bootstrap_admin_password.is_empty() {
         let email = normalize_email(&config.bootstrap_admin_email);
+        validate_email(&email)?;
+        validate_password(&config.bootstrap_admin_password).map_err(|err| {
+            AppError::bad_request(format!(
+                "BOOTSTRAP_ADMIN_PASSWORD 不符合密码策略：{}",
+                err.detail()
+            ))
+        })?;
+
         admin = match queries::users::find_by_email(pool, &email).await? {
+            Some(user) if is_super_admin(&user) => Some(user),
             Some(user) => {
-                if !is_super_admin(&user)
-                    && queries::users::count_other_active_super_admins(pool, user.id).await? == 0
-                {
-                    sqlx::query("UPDATE users SET role = ? WHERE id = ?")
-                        .bind(ROLE_SUPER_ADMIN)
-                        .bind(user.id)
-                        .execute(pool)
-                        .await?;
+                let other_admins =
+                    queries::users::count_other_active_super_admins(pool, user.id).await?;
+                if other_admins > 0 {
                     tracing::warn!(
                         email = %email,
-                        "系统中没有可用超级管理员，已将该账号提升为超级管理员"
+                        "已存在其他启用的超级管理员，跳过角色提升与机器人导入"
                     );
-                    summary.admin_promoted = Some(email.clone());
+                    None
+                } else {
+                    // 提升靠邮箱匹配还不够：必须证明持有该账号的密码，
+                    // 避免管理员邮箱被抢注后靠重启获得超管权限。
+                    let password_matches = match user.password_hash.as_deref() {
+                        Some(stored) => {
+                            verify_password_async(&config.bootstrap_admin_password, stored).await
+                        }
+                        None => false,
+                    };
+                    if !password_matches {
+                        tracing::warn!(
+                            email = %email,
+                            "既有账号的密码与 BOOTSTRAP_ADMIN_PASSWORD 不匹配，跳过角色提升与机器人导入"
+                        );
+                        None
+                    } else {
+                        sqlx::query("UPDATE users SET role = ? WHERE id = ?")
+                            .bind(ROLE_SUPER_ADMIN)
+                            .bind(user.id)
+                            .execute(pool)
+                            .await?;
+                        tracing::warn!(
+                            email = %email,
+                            "系统中没有可用超级管理员，已将该账号提升为超级管理员"
+                        );
+                        summary.admin_promoted = Some(email.clone());
+                        let mut promoted = user;
+                        promoted.role = ROLE_SUPER_ADMIN.to_string();
+                        Some(promoted)
+                    }
                 }
-                Some(user)
             }
             None => {
                 let preferred = email.split('@').next().unwrap_or_default();

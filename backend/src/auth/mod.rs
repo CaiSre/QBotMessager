@@ -15,7 +15,7 @@ pub use passwords::{
     verify_password, verify_password_async,
 };
 pub use sessions::{
-    USER_AGENT_MAX, clear_session_cookie, create_session, hash_token, is_session_valid,
-    new_session_token, resolve_session, revoke_other_sessions, revoke_session,
-    revoke_user_sessions, session_cookie,
+    STEP_UP_WINDOW_MINUTES, USER_AGENT_MAX, clear_session_cookie, create_session, hash_token,
+    is_session_valid, mark_verified, new_session_token, resolve_session, revoke_other_sessions,
+    revoke_session, revoke_user_sessions, session_cookie, step_up_valid, verified_at,
 };

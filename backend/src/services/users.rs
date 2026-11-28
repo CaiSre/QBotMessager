@@ -514,6 +514,44 @@ pub async fn update_profile_name(
     Ok(updated)
 }
 
+/// 敏感操作当前密码校验的限速键；与登录失败计数分开，避免互相锁死。
+fn step_up_key(user: &User) -> String {
+    format!("stepup:{}", user.email)
+}
+
+/// 校验当前密码，并按 (来源地址, 账号) 限速。
+///
+/// 用于修改邮箱、修改密码与 step-up 验证；无密码账号返回引导信息，
+/// 同时消耗一次等价 PBKDF2，避免按响应时间判断账号是否设置过密码。
+pub async fn verify_current_password(
+    limiter: &AttemptLimiter,
+    ip: Option<&str>,
+    user: &User,
+    password: &str,
+) -> Result<(), AppError> {
+    let key = step_up_key(user);
+    let wait = limiter.remaining_wait(ip, &key);
+    if wait > 0 {
+        return Err(AppError::rate_limited(
+            format!("验证过于频繁，请 {wait} 秒后再试"),
+            wait,
+        ));
+    }
+
+    let Some(stored) = user.password_hash.as_deref() else {
+        burn_password_async(password).await;
+        return Err(AppError::bad_request(
+            "该账号未设置密码，请先设置密码或重新登录验证身份",
+        ));
+    };
+    if !verify_password_async(password, stored).await {
+        limiter.record_failure(ip, &key);
+        return Err(AppError::bad_request("当前密码错误"));
+    }
+    limiter.reset(ip, &key);
+    Ok(())
+}
+
 /// 个人资料：修改邮箱。
 ///
 /// 账号已有密码时必须校验当前密码；无密码账号（仅 OAuth 创建）没有可验凭据，
@@ -521,23 +559,17 @@ pub async fn update_profile_name(
 /// 避免凭据泄露时旧设备仍以新邮箱维持登录。
 pub async fn update_profile_email(
     pool: &MySqlPool,
+    limiter: &AttemptLimiter,
     user: &User,
     email: &str,
     current_password: &str,
     keep_token: &str,
+    ip: Option<&str>,
 ) -> Result<User, AppError> {
     let email = normalize_email(email);
     validate_email(&email)?;
 
-    if let Some(stored) = user.password_hash.as_deref() {
-        if !verify_password_async(current_password, stored).await {
-            return Err(AppError::bad_request("当前密码错误"));
-        }
-    } else {
-        return Err(AppError::bad_request(
-            "该账号未设置密码，请先在安全设置中设置密码",
-        ));
-    }
+    verify_current_password(limiter, ip, user, current_password).await?;
     if email == user.email {
         return Ok(user.clone());
     }
@@ -560,21 +592,22 @@ pub async fn update_profile_email(
 /// - 已有密码：必须验证当前密码，且新密码不能与当前密码相同；
 /// - 无密码且邮件已配置：必须提供 `set_password` 邮箱验证码；
 /// - 成功后撤销除当前会话外的其他会话。
+#[allow(clippy::too_many_arguments)]
 pub async fn change_password(
     pool: &MySqlPool,
+    limiter: &AttemptLimiter,
     settings: &RuntimeSettings,
     user: &User,
     current_password: &str,
     new_password: &str,
     email_code: &str,
     keep_token: &str,
+    ip: Option<&str>,
 ) -> Result<(), AppError> {
     validate_password(new_password)?;
 
     if let Some(stored) = user.password_hash.as_deref() {
-        if !verify_password_async(current_password, stored).await {
-            return Err(AppError::bad_request("当前密码错误"));
-        }
+        verify_current_password(limiter, ip, user, current_password).await?;
         if verify_password_async(new_password, stored).await {
             return Err(AppError::bad_request("新密码不能与当前密码相同"));
         }

@@ -4,6 +4,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::markdown::markdown_link;
+
 use super::base::{
     Adapter, AdapterError, Attachment, FMT_MARKDOWN, FMT_TEXT, UnifiedMessage, truthy, value_text,
 };
@@ -97,7 +99,7 @@ fn link_message(payload: &Map<String, Value>) -> Result<UnifiedMessage, AdapterE
         parts.push(text);
     }
     if !message_url.is_empty() {
-        parts.push(format!("[查看详情]({message_url})"));
+        parts.push(markdown_link("查看详情", &message_url));
     }
     if parts.is_empty() && title.is_empty() {
         return Err(AdapterError::payload("link 消息内容为空"));
@@ -134,7 +136,7 @@ fn action_card_message(payload: &Map<String, Value>) -> Result<UnifiedMessage, A
     let single_title = stripped_field(card, "singleTitle");
     let single_url = stripped_field(card, "singleURL");
     if !single_title.is_empty() && !single_url.is_empty() {
-        parts.push(format!("- [{single_title}]({single_url})"));
+        parts.push(format!("- {}", markdown_link(&single_title, &single_url)));
     }
     if let Some(buttons) = card
         .and_then(|map| map.get("btns"))
@@ -145,7 +147,7 @@ fn action_card_message(payload: &Map<String, Value>) -> Result<UnifiedMessage, A
             let button_title = stripped_field(button, "title");
             let button_url = stripped_field(button, "actionURL");
             if !button_title.is_empty() && !button_url.is_empty() {
-                parts.push(format!("- [{button_title}]({button_url})"));
+                parts.push(format!("- {}", markdown_link(&button_title, &button_url)));
             } else if !button_title.is_empty() {
                 parts.push(format!("- {button_title}"));
             }
@@ -175,7 +177,7 @@ fn feed_card_message(payload: &Map<String, Value>) -> Result<UnifiedMessage, Ada
             let item_title = stripped_field(link, "title");
             let item_url = stripped_field(link, "messageURL");
             if !item_title.is_empty() && !item_url.is_empty() {
-                parts.push(format!("- [{item_title}]({item_url})"));
+                parts.push(format!("- {}", markdown_link(&item_title, &item_url)));
             } else if !item_title.is_empty() {
                 parts.push(format!("- {item_title}"));
             }

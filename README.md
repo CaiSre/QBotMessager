@@ -100,7 +100,7 @@ cp .env.example .env
 ```dotenv
 APP_SECRET_KEY=请填入 Fernet 密钥
 BOOTSTRAP_ADMIN_EMAIL=admin@example.com
-BOOTSTRAP_ADMIN_PASSWORD=请替换为强密码
+BOOTSTRAP_ADMIN_PASSWORD=请替换为至少8位的强密码
 ```
 
 > 对外地址、会话、限速与 QQ 推送等非敏感配置持久化在数据库中，登录后在「系统设置」修改，保存即生效，重建容器无需再提供 env。
@@ -172,8 +172,9 @@ docker compose up -d --build
 |---|---|---|
 | `MYSQL_URL` | 数据库连接串（`mysql://`）；源码 compose 自动注入为 `db` 服务的 `qbotmessager` 库，预构建镜像需在 `.env` 中显式设置 | 空 |
 | `MYSQL_PASSWORD` / `MYSQL_ROOT_PASSWORD` | MySQL 业务账号与 root 密码（compose 必填） | 无 |
-| `APP_SECRET_KEY` | Fernet 主密钥，用于加密库内敏感字段 | 空（降级明文并告警） |
-| `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` | 初始超级管理员；账号已存在时不改动 | 空 |
+| `APP_SECRET_KEY` | Fernet 主密钥，用于加密库内敏感字段；缺失时默认拒绝启动 | 空（必须设置） |
+| `ALLOW_PLAINTEXT_SECRETS` | 仅本地调试使用：设为 `true` 时允许缺少主密钥并以明文保存敏感字段 | `false` |
+| `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` | 初始超级管理员；账号已存在时仅在密码匹配且系统无启用的超管时提升，不改密码 | 空 |
 | `QQ_APPID` / `QQ_APP_SECRET` / `OPENID` | 首启导入的机器人凭据与默认推送目标 | 空 |
 | `TRUST_PROXY` | 是否信任上游反向代理的 `X-Forwarded-For`；直连部署保持 `false`，由 Nginx/Caddy 转发时设 `true`（取最右侧一跳） | `false` |
 | `STATIC_DIR` | 前端静态产物目录；容器内为 `/app/web`，本地直跑可指向 `../web/out` | `./web/out` |
@@ -327,12 +328,13 @@ bun run build
 
 ## 安全建议
 
-- 生产环境务必设置 `APP_SECRET_KEY`，密钥丢失将无法解密已入库的敏感字段。
+- 生产环境务必设置 `APP_SECRET_KEY`（缺失时默认拒绝启动），密钥丢失将无法解密已入库的敏感字段。仅本地调试可显式设置 `ALLOW_PLAINTEXT_SECRETS=true` 降级明文。
 - 使用 HTTPS，并在「系统设置」中开启 Cookie 仅限 HTTPS、填写真实对外地址，保证 OAuth 回调与 Webhook 地址正确。
 - 部署在反向代理之后时设置 `TRUST_PROXY=true`，否则登录限速只能看到代理地址。
 - 只有在提供方确实验证过邮箱归属时才开启 OAuth2 提供方的「信任邮箱」，否则同邮箱的本地账号可能被冒名登录接管。
 - 不要将 MySQL 端口暴露到公网（compose 未映射 3306）。
 - Webhook token 具有推送权限，泄露后请在「机器人 → 通道」中立即轮换。库内只保存 token 的 SHA-256 哈希，明文仅在创建/轮换时展示一次，无法再次查看。GitHub 通道的 URL token 与 Secret 相互独立：token 泄露不足以伪造投递，但仍应同时轮换并同步更新 GitHub 配置。
+- 添加/删除通行密钥、绑定/解绑第三方账号前，需要会话在最近 10 分钟内完成过身份验证；未设置密码的账号请退出后重新登录，再执行这些操作。
 - 邀请码按需签发并限定邮箱与有效期，注册入口用完即关。
 - 登录失败限速按 (来源地址, 账号) 计数：部署在反向代理之后时设置 `TRUST_PROXY=true` 以取得真实客户端地址。
 - 验证码发码按来源地址限速（默认每小时 30 次）：同一来源超出后返回 429。反代未透传真实客户端地址时所有用户共享同一额度，用户较多时应调高「单来源发码上限」并设置 `TRUST_PROXY=true`。

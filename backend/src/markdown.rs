@@ -28,6 +28,11 @@ fn bare_image_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"\[!\(([^)]*)\)\]").expect("裸图片正则"))
 }
 
+fn link_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\[([^\]\n]*)\]\(([^)\s]*)\)").expect("链接正则"))
+}
+
 fn control_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]").expect("控制字符正则"))
@@ -48,6 +53,58 @@ fn bound(text: &str, max_len: Option<usize>) -> String {
         return text.to_string();
     }
     text.chars().take(cap).collect()
+}
+
+/// 构造安全的 Markdown 链接。
+///
+/// 标签里的 `\ [ ] ( )` 会被转义，避免外部标题注入额外链接；目标只接受
+/// `http/https`，其它协议或不含主机的地址降级为纯文本标签。
+pub fn markdown_link(label: &str, url: &str) -> String {
+    let label = escape_link_label(label);
+    match safe_link_url(url) {
+        Some(url) => format!("[{label}]({url})"),
+        None => label,
+    }
+}
+
+/// 转义链接标签中的 Markdown 元字符，并去掉换行/控制字符。
+fn escape_link_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for ch in label.chars() {
+        match ch {
+            '\r' | '\n' => out.push(' '),
+            '\\' | '[' | ']' | '(' | ')' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ if ch.is_control() => {}
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// 链接目标是否安全：只允许 http/https，且不含空白、控制字符或可截断语法的字符。
+fn safe_link_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty()
+        || raw.chars().any(|ch| {
+            ch.is_whitespace()
+                || ch.is_control()
+                || matches!(ch, '\\' | '(' | ')' | '<' | '>' | '"' | '\'')
+        })
+    {
+        return None;
+    }
+    let parsed = url::Url::parse(raw).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+fn is_safe_link_url(raw: &str) -> bool {
+    safe_link_url(raw).is_some()
 }
 
 /// 去掉 HTML 标签，保留标签内文字（线性扫描，避免正则回溯）。
@@ -157,6 +214,16 @@ pub fn sanitize_markdown(text: &str, max_len: Option<usize>) -> String {
         .into_owned();
     content = bare_image_regex()
         .replace_all(&content, "（图片）")
+        .into_owned();
+    content = link_regex()
+        .replace_all(&content, |caps: &Captures| {
+            let label = &caps[1];
+            if is_safe_link_url(&caps[2]) {
+                caps[0].to_string()
+            } else {
+                label.to_string()
+            }
+        })
         .into_owned();
     content = degrade_tables(&content);
     content = control_regex().replace_all(&content, "").into_owned();
@@ -284,6 +351,31 @@ mod tests {
     #[test]
     fn bare_image_becomes_placeholder() {
         assert_eq!(sanitize_markdown("[!(https://x/y.png)]", None), "（图片）");
+    }
+
+    #[test]
+    fn markdown_link_escapes_labels_and_rejects_unsafe_urls() {
+        assert_eq!(
+            markdown_link("修复 [Bug](x)", "https://github.com/o/r/pull/1"),
+            "[修复 \\[Bug\\]\\(x\\)](https://github.com/o/r/pull/1)"
+        );
+        assert_eq!(markdown_link("点我", "javascript:alert"), "点我");
+        assert_eq!(markdown_link("点我", "data:text/html,x"), "点我");
+        assert_eq!(markdown_link("点我", ""), "点我");
+        assert_eq!(
+            markdown_link("点我", "https://example.com/a?b=1"),
+            "[点我](https://example.com/a?b=1)"
+        );
+    }
+
+    #[test]
+    fn sanitize_markdown_neutralizes_unsafe_link_schemes() {
+        assert_eq!(sanitize_markdown("[点我](javascript:alert)", None), "点我");
+        assert_eq!(sanitize_markdown("[点我](data:text/html,x)", None), "点我");
+        assert_eq!(
+            sanitize_markdown("[点我](https://example.com/x)", None),
+            "[点我](https://example.com/x)"
+        );
     }
 
     #[test]

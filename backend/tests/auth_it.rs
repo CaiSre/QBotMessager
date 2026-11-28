@@ -376,6 +376,16 @@ async fn token_for(fixture: &Fixture, user_id: i64) -> String {
         .expect("创建会话失败")
 }
 
+/// 把会话的最近验证时间拨到窗口外，模拟长时间未验证的会话。
+async fn expire_step_up(fixture: &Fixture, token: &str) {
+    sqlx::query("UPDATE sessions SET verified_at = ? WHERE token_hash = ?")
+        .bind(Utc::now().naive_utc() - Duration::minutes(11))
+        .bind(sessions::hash_token(token))
+        .execute(&fixture.pool)
+        .await
+        .expect("过期会话验证时间失败");
+}
+
 async fn make_admin(fixture: &Fixture, label: &str) -> (Account, String) {
     let account = make_account(
         fixture,
@@ -514,6 +524,7 @@ async fn login_and_logout() {
     let me_body = me.json();
     assert_eq!(me_body["id"], json!(account.id));
     assert_eq!(me_body["passkey_count"], json!(0));
+    assert_eq!(me_body["step_up_valid"], json!(true));
 
     let logout = send!(
         app,
@@ -3637,6 +3648,230 @@ async fn passkey_register_duplicate_and_delete() {
     .await
     .unwrap();
     assert_eq!(count, 0);
+}
+
+#[actix_web::test]
+async fn step_up_verification_refreshes_session() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let account = make_account(&fixture, "stepup", Some(PASSWORD), ROLE_USER, STATUS_ACTIVE).await;
+    let token = token_for(&fixture, account.id).await;
+    fixture.configure_webauthn();
+
+    let fresh = send!(app, get_with("/api/auth/me", &[("sid", token.as_str())]));
+    assert_eq!(fresh.json()["step_up_valid"], json!(true));
+
+    expire_step_up(&fixture, &token).await;
+    let stale = send!(app, get_with("/api/auth/me", &[("sid", token.as_str())]));
+    assert_eq!(stale.json()["step_up_valid"], json!(false));
+
+    let blocked = send!(
+        app,
+        post_json_with(
+            "/api/auth/passkey/register/begin",
+            &json!({}),
+            &[("sid", token.as_str())]
+        )
+    );
+    let blocked = assert_status!(blocked, StatusCode::FORBIDDEN);
+    assert_eq!(blocked.detail(), "请重新验证身份后再操作");
+
+    let wrong = send!(
+        app,
+        post_json_with(
+            "/api/auth/me/verify",
+            &json!({"password": "WrongPassw0rd!"}),
+            &[("sid", token.as_str())]
+        )
+    );
+    let wrong = assert_status!(wrong, StatusCode::BAD_REQUEST);
+    assert_eq!(wrong.detail(), "当前密码错误");
+
+    let verified = send!(
+        app,
+        post_json_with(
+            "/api/auth/me/verify",
+            &json!({"password": PASSWORD}),
+            &[("sid", token.as_str())]
+        )
+    );
+    assert_status!(verified, StatusCode::OK);
+    let refreshed = send!(app, get_with("/api/auth/me", &[("sid", token.as_str())]));
+    assert_eq!(refreshed.json()["step_up_valid"], json!(true));
+
+    let begin = send!(
+        app,
+        post_json_with(
+            "/api/auth/passkey/register/begin",
+            &json!({}),
+            &[("sid", token.as_str())]
+        )
+    );
+    assert_status!(begin, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn step_up_verification_is_rate_limited() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let account = make_account(
+        &fixture,
+        "steprate",
+        Some(PASSWORD),
+        ROLE_USER,
+        STATUS_ACTIVE,
+    )
+    .await;
+    let token = token_for(&fixture, account.id).await;
+
+    for _ in 0..5 {
+        let reply = send!(
+            app,
+            post_json_with(
+                "/api/auth/me/verify",
+                &json!({"password": "WrongPassw0rd!"}),
+                &[("sid", token.as_str())]
+            )
+        );
+        assert_status!(reply, StatusCode::BAD_REQUEST);
+    }
+    let limited = send!(
+        app,
+        post_json_with(
+            "/api/auth/me/verify",
+            &json!({"password": PASSWORD}),
+            &[("sid", token.as_str())]
+        )
+    );
+    let limited = assert_status!(limited, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        limited.detail().contains("验证过于频繁"),
+        "{}",
+        limited.detail()
+    );
+}
+
+#[actix_web::test]
+async fn deleting_last_passkey_requires_another_login_method() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let account = make_account(&fixture, "pklast", None, ROLE_USER, STATUS_ACTIVE).await;
+    let token = token_for(&fixture, account.id).await;
+    let credential_id = format!("last-credential-{}", fixture.prefix).into_bytes();
+    insert_passkey(&fixture, account.id, &credential_id, 0).await;
+    let id: i64 =
+        sqlx::query_scalar("SELECT id FROM webauthn_credentials WHERE user_id = ? LIMIT 1")
+            .bind(account.id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+
+    let blocked = send!(
+        app,
+        delete_with(
+            &format!("/api/auth/passkey/{id}"),
+            &[("sid", token.as_str())]
+        )
+    );
+    let blocked = assert_status!(blocked, StatusCode::CONFLICT);
+    assert!(
+        blocked.detail().contains("登录方式"),
+        "{}",
+        blocked.detail()
+    );
+
+    // 设置密码后允许删除。
+    let hash = passwords::hash_password_with("LastPassKeyPw!", b"test-salt-16byte", 1_000);
+    sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+        .bind(&hash)
+        .bind(account.id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let deleted = send!(
+        app,
+        delete_with(
+            &format!("/api/auth/passkey/{id}"),
+            &[("sid", token.as_str())]
+        )
+    );
+    assert_status!(deleted, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn oauth_link_start_requires_step_up() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let account = make_account(
+        &fixture,
+        "oauthstep",
+        Some(PASSWORD),
+        ROLE_USER,
+        STATUS_ACTIVE,
+    )
+    .await;
+    let token = token_for(&fixture, account.id).await;
+    let key = format!("{}-step", fixture.prefix);
+    sqlx::query(
+        "INSERT INTO oauth_providers (`key`, display_name, client_id, client_secret, \
+         authorization_url, token_url, userinfo_url, scopes, email_field, id_field, \
+         name_field, enabled, email_verified, created_at) \
+         VALUES (?, 'Step', 'c', 'secret', 'https://example.com/authorize', \
+         'https://example.com/token', 'https://example.com/userinfo', 's', \
+         'email', 'id', 'name', TRUE, FALSE, ?)",
+    )
+    .bind(&key)
+    .bind(Utc::now().naive_utc())
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+
+    expire_step_up(&fixture, &token).await;
+    let blocked = send!(
+        app,
+        get_with(
+            &format!("/api/auth/oauth/{key}/start"),
+            &[("sid", token.as_str())]
+        )
+    );
+    let blocked = assert_status!(blocked, StatusCode::FOUND);
+    let location = blocked
+        .headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(location.starts_with("/security?"), "{location}");
+
+    let verified = send!(
+        app,
+        post_json_with(
+            "/api/auth/me/verify",
+            &json!({"password": PASSWORD}),
+            &[("sid", token.as_str())]
+        )
+    );
+    assert_status!(verified, StatusCode::OK);
+    let start = send!(
+        app,
+        get_with(
+            &format!("/api/auth/oauth/{key}/start"),
+            &[("sid", token.as_str())]
+        )
+    );
+    let start = assert_status!(start, StatusCode::FOUND);
+    let location = start
+        .headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        location.starts_with("https://example.com/authorize?"),
+        "{location}"
+    );
 }
 
 #[actix_web::test]

@@ -7,6 +7,8 @@ use std::sync::OnceLock;
 use regex::{Captures, Regex};
 use serde_json::{Map, Value};
 
+use crate::markdown::markdown_link;
+
 use super::base::{
     Adapter, AdapterError, Attachment, FMT_MARKDOWN, FMT_TEXT, UnifiedMessage, truthy, value_text,
 };
@@ -246,7 +248,7 @@ fn render_paragraph(paragraph: &Value) -> String {
                     let text = field_trim(map, "text");
                     let href = field_trim(map, "href");
                     if !text.is_empty() && !href.is_empty() {
-                        format!("[{text}]({href})")
+                        markdown_link(&text, &href)
                     } else if !text.is_empty() {
                         text
                     } else {

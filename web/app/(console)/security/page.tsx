@@ -16,6 +16,7 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -42,7 +43,7 @@ import {
 import { api, messageOf } from "@/lib/api";
 import { formatDateTime } from "@/lib/format";
 import { useApi } from "@/lib/hooks";
-import { isSuperAdmin, useMe } from "@/lib/me";
+import { isSuperAdmin, useMe, useRefreshMe } from "@/lib/me";
 import { createPasskey, passkeySupported } from "@/lib/passkey";
 import type {
   AuthMeta,
@@ -137,6 +138,12 @@ function SecurityPageInner() {
   // 绑定流程结束回跳：后端带 ?oauth=ok|fail&message=…，展示后清掉参数。
   // ref 守卫防止 identities.reload 换代时 effect 重跑造成重复导航与重复请求。
   const router = useRouter();
+  const refreshMe = useRefreshMe();
+  const [stepUpOpen, setStepUpOpen] = useState(false);
+  const [stepUpPassword, setStepUpPassword] = useState("");
+  const [stepUpError, setStepUpError] = useState<string | null>(null);
+  const [stepUpBusy, setStepUpBusy] = useState(false);
+  const stepUpResolver = useRef<((ok: boolean) => void) | null>(null);
   const searchParams = useSearchParams();
   const oauthParam = searchParams.get("oauth");
   const oauthResult = oauthParam === "ok" || oauthParam === "fail" ? oauthParam : null;
@@ -156,6 +163,55 @@ function SecurityPageInner() {
 
   function providerNameOf(key: string) {
     return providerOptions.find((provider) => provider.key === key)?.display_name ?? key;
+  }
+
+  // 敏感操作前要求近期验证：已登录会话默认有效，超过窗口时弹出密码确认。
+  function ensureStepUp(): Promise<boolean> {
+    if (me.step_up_valid) return Promise.resolve(true);
+    setStepUpPassword("");
+    setStepUpError(null);
+    setStepUpOpen(true);
+    const { promise, resolve } = Promise.withResolvers<boolean>();
+    stepUpResolver.current = resolve;
+    return promise;
+  }
+
+  function settleStepUp(ok: boolean) {
+    stepUpResolver.current?.(ok);
+    stepUpResolver.current = null;
+    setStepUpOpen(false);
+  }
+
+  async function submitStepUp(event: React.FormEvent) {
+    event.preventDefault();
+    if (!stepUpPassword) {
+      setStepUpError("请填写密码");
+      return;
+    }
+    setStepUpBusy(true);
+    setStepUpError(null);
+    try {
+      await api("/api/auth/me/verify", {
+        method: "POST",
+        body: { password: stepUpPassword },
+      });
+      await refreshMe();
+      settleStepUp(true);
+    } catch (err) {
+      setStepUpError(messageOf(err));
+    } finally {
+      setStepUpBusy(false);
+    }
+  }
+
+  async function reloginForStepUp() {
+    try {
+      await api("/api/auth/logout", { method: "POST" });
+    } catch {
+      // 退出失败也回到登录页，凭据可通过重新登录刷新。
+    }
+    settleStepUp(false);
+    router.replace("/login");
   }
 
   async function toggleRegistration(value: boolean) {
@@ -250,6 +306,7 @@ function SecurityPageInner() {
   }
 
   async function addPasskey() {
+    if (!(await ensureStepUp())) return;
     setPasskeyBusy(true);
     setError(null);
     setNotice(null);
@@ -475,6 +532,7 @@ function SecurityPageInner() {
                               title: "删除通行密钥",
                               description: `删除「${item.label}」后将无法再用它登录。`,
                               action: async () => {
+                                if (!(await ensureStepUp())) return;
                                 await api(`/api/auth/passkey/${item.id}`, { method: "DELETE" });
                                 await passkeys.reload();
                               },
@@ -510,7 +568,8 @@ function SecurityPageInner() {
                       key={provider.key}
                       size="sm"
                       variant="outline"
-                      onClick={() => {
+                      onClick={async () => {
+                        if (!(await ensureStepUp())) return;
                         window.location.href = `/api/auth/oauth/${provider.key}/start`;
                       }}
                     >
@@ -543,6 +602,7 @@ function SecurityPageInner() {
                                   title: "解绑第三方账号",
                                   description: `解绑「${providerNameOf(item.provider)}」后将无法再用该第三方账号登录本站。`,
                                   action: async () => {
+                                    if (!(await ensureStepUp())) return;
                                     await api(`/api/auth/oauth/identities/${item.id}`, {
                                       method: "DELETE",
                                     });
@@ -759,6 +819,61 @@ function SecurityPageInner() {
               </div>
             </FieldGroup>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={stepUpOpen}
+        onOpenChange={(open) => {
+          if (!open) settleStepUp(false);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>验证身份</DialogTitle>
+            <DialogDescription>
+              为保护账号安全，修改登录方式前需要重新验证身份。
+            </DialogDescription>
+          </DialogHeader>
+          {me.has_password ? (
+            <form onSubmit={submitStepUp}>
+              <FieldGroup className="gap-4">
+                <Field data-invalid={Boolean(stepUpError)}>
+                  <FieldLabel htmlFor="step-up-password">当前密码</FieldLabel>
+                  <Input
+                    aria-invalid={Boolean(stepUpError) || undefined}
+                    autoComplete="current-password"
+                    id="step-up-password"
+                    type="password"
+                    value={stepUpPassword}
+                    onChange={(event) => setStepUpPassword(event.target.value)}
+                  />
+                  <FieldError>{stepUpError}</FieldError>
+                </Field>
+                <div className="flex justify-end gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => settleStepUp(false)}
+                  >
+                    取消
+                  </Button>
+                  <Button disabled={stepUpBusy} type="submit">
+                    {stepUpBusy ? "验证中…" : "验证"}
+                  </Button>
+                </div>
+              </FieldGroup>
+            </form>
+          ) : (
+            <div className="flex flex-col gap-4">
+              <p className="text-sm text-muted-foreground">
+                当前账号未设置密码。请退出后使用通行密钥或第三方账号重新登录，再继续操作。
+              </p>
+              <div className="flex justify-end">
+                <Button onClick={() => void reloginForStepUp()}>重新登录</Button>
+              </div>
+            </div>
+          )}
         </DialogContent>
       </Dialog>
 

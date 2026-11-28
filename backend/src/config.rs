@@ -29,6 +29,11 @@ pub enum ConfigError {
     /// APP_SECRET_KEY 不是合法的 Fernet 密钥。
     #[error(transparent)]
     Crypto(#[from] crate::crypto::CryptoError),
+    /// 缺少加密主密钥，且未显式允许明文存储。
+    #[error(
+        "缺少 APP_SECRET_KEY：敏感字段无法加密。请设置 APP_SECRET_KEY；仅本地调试可显式设置 ALLOW_PLAINTEXT_SECRETS=true"
+    )]
+    MissingSecretKey,
 }
 
 /// 启动配置。
@@ -72,8 +77,8 @@ impl Config {
     /// 从环境变量装载配置。
     ///
     /// `.env` 可选：存在则加载，读取失败不报错（缺少 `.env` 属于正常情况）。
-    /// `MYSQL_URL` 缺失时返回错误；`APP_SECRET_KEY` 缺失时只告警，
-    /// 敏感字段将降级为明文存储。
+    /// `MYSQL_URL` 与 `APP_SECRET_KEY` 均缺失时报错；仅当显式设置
+    /// `ALLOW_PLAINTEXT_SECRETS=true` 时才允许不带主密钥启动（敏感字段降级明文）。
     pub fn from_env() -> Result<Self, ConfigError> {
         // .env 可选；读取失败（不存在或格式错误）都不阻断启动。
         let _ = dotenvy::dotenv();
@@ -83,16 +88,9 @@ impl Config {
             _ => return Err(ConfigError::Missing("MYSQL_URL")),
         };
 
-        let app_secret_key = match env::var("APP_SECRET_KEY") {
-            Ok(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
-            _ => {
-                tracing::warn!("未配置 APP_SECRET_KEY：敏感字段将降级为明文存储，生产环境务必设置");
-                None
-            }
-        };
-        if let Some(key) = app_secret_key.as_deref() {
-            crate::crypto::validate_key(key)?;
-        }
+        let allow_plaintext = parse_bool_env("ALLOW_PLAINTEXT_SECRETS", false)?;
+        let app_secret_key =
+            resolve_app_secret_key(env::var("APP_SECRET_KEY").ok().as_deref(), allow_plaintext)?;
 
         Ok(Self {
             mysql_url,
@@ -112,6 +110,26 @@ impl Config {
             trust_proxy: parse_bool_env("TRUST_PROXY", false)?,
             static_dir: PathBuf::from(env_or("STATIC_DIR", DEFAULT_STATIC_DIR)),
         })
+    }
+}
+
+/// 解析主密钥：缺省时默认拒绝启动，只有显式允许才降级明文。
+fn resolve_app_secret_key(
+    raw: Option<&str>,
+    allow_plaintext: bool,
+) -> Result<Option<String>, ConfigError> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(key) => {
+            crate::crypto::validate_key(key)?;
+            Ok(Some(key.to_string()))
+        }
+        None if allow_plaintext => {
+            tracing::warn!(
+                "ALLOW_PLAINTEXT_SECRETS=true：未配置 APP_SECRET_KEY，敏感字段将降级为明文存储"
+            );
+            Ok(None)
+        }
+        None => Err(ConfigError::MissingSecretKey),
     }
 }
 
@@ -239,5 +257,41 @@ mod tests {
     #[test]
     fn openids_drop_empty_items() {
         assert_eq!(load_openids(Some(r#"["a", "", "b"]"#)), vec!["a", "b"]);
+    }
+
+    fn fernet_key(seed: u8) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE.encode([seed; 32])
+    }
+
+    #[test]
+    fn missing_secret_key_fails_closed_by_default() {
+        assert!(matches!(
+            resolve_app_secret_key(None, false),
+            Err(ConfigError::MissingSecretKey)
+        ));
+        assert!(matches!(
+            resolve_app_secret_key(Some("   "), false),
+            Err(ConfigError::MissingSecretKey)
+        ));
+    }
+
+    #[test]
+    fn missing_secret_key_allowed_only_when_opted_in() {
+        assert_eq!(resolve_app_secret_key(None, true).unwrap(), None);
+        assert_eq!(resolve_app_secret_key(Some(""), true).unwrap(), None);
+    }
+
+    #[test]
+    fn secret_key_is_trimmed_and_validated() {
+        let key = fernet_key(0x11);
+        assert_eq!(
+            resolve_app_secret_key(Some(&format!("  {key}  ")), false).unwrap(),
+            Some(key)
+        );
+        assert!(matches!(
+            resolve_app_secret_key(Some("not-a-key"), false),
+            Err(ConfigError::Crypto(crate::crypto::CryptoError::InvalidKey))
+        ));
     }
 }

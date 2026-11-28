@@ -316,7 +316,7 @@ async fn promotes_existing_user_without_active_super_admin() {
     let key = URL_SAFE.encode([9u8; 32]);
     let mut config = test_config(Some(key));
     config.bootstrap_admin_email = email.to_uppercase();
-    config.bootstrap_admin_password = ADMIN_PASSWORD.to_string();
+    config.bootstrap_admin_password = OLD_PASSWORD.to_string();
     config.qq_appid = "102000004".to_string();
     config.qq_app_secret = "bootstrap-app-secret".to_string();
     let runtime = RuntimeSettings::new(None);
@@ -388,7 +388,7 @@ async fn promotes_when_existing_super_admin_is_disabled() {
 
     let mut config = test_config(None);
     config.bootstrap_admin_email = email.clone();
-    config.bootstrap_admin_password = ADMIN_PASSWORD.to_string();
+    config.bootstrap_admin_password = OLD_PASSWORD.to_string();
     let runtime = RuntimeSettings::new(None);
 
     let summary = bootstrap::run(&pool, &config, &runtime)
@@ -401,4 +401,58 @@ async fn promotes_when_existing_super_admin_is_disabled() {
         .expect("查询账号失败")
         .expect("账号丢失");
     assert_eq!(user.role, ROLE_SUPER_ADMIN);
+}
+
+/// 引导密码必须满足登录密码策略，弱口令直接拒绝启动引导。
+#[tokio::test]
+async fn rejects_weak_bootstrap_password() {
+    let _guard = TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    reset(&pool).await;
+
+    let mut config = test_config(None);
+    config.bootstrap_admin_email = format!("boot{}@example.com", suffix());
+    config.bootstrap_admin_password = "short".to_string();
+    let runtime = RuntimeSettings::new(None);
+
+    let error = bootstrap::run(&pool, &config, &runtime)
+        .await
+        .expect_err("弱口令不应创建超管");
+    assert!(
+        error.detail().contains("BOOTSTRAP_ADMIN_PASSWORD"),
+        "{}",
+        error.detail()
+    );
+    assert_eq!(count(&pool, "users").await, 0);
+}
+
+/// 邮箱匹配但密码不匹配时不得提升，也不能导入机器人。
+#[tokio::test]
+async fn does_not_promote_without_matching_password() {
+    let _guard = TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    reset(&pool).await;
+
+    let email = format!("boot{}@example.com", suffix());
+    let (user_id, _) = insert_user(&pool, &email, ROLE_USER, STATUS_ACTIVE).await;
+
+    let mut config = test_config(None);
+    config.bootstrap_admin_email = email;
+    config.bootstrap_admin_password = ADMIN_PASSWORD.to_string();
+    config.qq_appid = "102000009".to_string();
+    config.qq_app_secret = "bootstrap-app-secret".to_string();
+    let runtime = RuntimeSettings::new(None);
+
+    let summary = bootstrap::run(&pool, &config, &runtime)
+        .await
+        .expect("启动引导失败");
+
+    assert!(summary.admin_promoted.is_none());
+    assert!(!summary.bot_created);
+    let user = queries::users::find_by_id(&pool, user_id)
+        .await
+        .expect("查询账号失败")
+        .expect("账号丢失");
+    assert_eq!(user.role, ROLE_USER);
+    assert_eq!(count(&pool, "bot_profiles").await, 0);
 }

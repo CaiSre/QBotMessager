@@ -1010,6 +1010,8 @@ pub mod sessions {
         pub ip: Option<&'a str>,
         /// 客户端 UA。
         pub user_agent: Option<&'a str>,
+        /// 最近一次身份验证时间。
+        pub verified_at: NaiveDateTime,
         /// 过期时间。
         pub expires_at: NaiveDateTime,
         /// 创建时间。
@@ -1025,7 +1027,7 @@ pub mod sessions {
         E: Executor<'e, Database = MySql>,
     {
         sqlx::query_as::<_, Session>(
-            "SELECT id, token_hash, user_id, ip, user_agent, expires_at, revoked_at, created_at \
+            "SELECT id, token_hash, user_id, ip, user_agent, verified_at, expires_at, revoked_at, created_at \
              FROM sessions WHERE token_hash = ?",
         )
         .bind(token_hash)
@@ -1039,13 +1041,14 @@ pub mod sessions {
         E: Executor<'e, Database = MySql>,
     {
         let result = sqlx::query(
-            "INSERT INTO sessions (token_hash, user_id, ip, user_agent, expires_at, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sessions (token_hash, user_id, ip, user_agent, verified_at, expires_at, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(session.token_hash)
         .bind(session.user_id)
         .bind(session.ip)
         .bind(session.user_agent)
+        .bind(session.verified_at)
         .bind(session.expires_at)
         .bind(session.created_at)
         .execute(executor)
