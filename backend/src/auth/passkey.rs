@@ -9,6 +9,7 @@
 //! - 注册结果的 AAGUID 与 COSE 字节从 `AuthenticatorData::<Registration>` 中提取
 //!   （`register_credential` 的返回值在 attestation=None 时不携带 AAGUID）；
 //! - 认证成功后回写 sign_count / last_used_at / device_type / backed_up；
+//! - 注册时的 UV 结果与策略随凭据持久化；当前设置要求 UV 时认证强制 Required；
 //! - 签名计数回退 `(current > 0 || stored > 0) && current <= stored` 一律拒绝。
 //!
 //! ceremony state（含 challenge）以 base64url JSON 存于 `webauthn_state_{flow}` Cookie；
@@ -41,6 +42,7 @@ use webauthn_rs_core::proto::{
     UserVerificationPolicy,
 };
 
+use crate::auth::cookies;
 use crate::error::AppError;
 use crate::services::runtime_settings::RuntimeSettings;
 
@@ -120,6 +122,10 @@ pub struct RegistrationResult {
     pub device_type: String,
     /// 是否已备份（BS 标志）。
     pub backed_up: bool,
+    /// 注册时是否完成用户验证。
+    pub user_verified: bool,
+    /// 注册时使用的 UV 策略（`required` / `preferred`）。
+    pub registration_policy: String,
 }
 
 /// 认证校验结果。
@@ -148,6 +154,10 @@ pub struct StoredCredential<'a> {
     pub device_type: Option<&'a str>,
     /// 已保存的备份状态。
     pub backed_up: bool,
+    /// 注册时是否完成用户验证。
+    pub user_verified: bool,
+    /// 注册时使用的 UV 策略。
+    pub registration_policy: &'a str,
 }
 
 /// 支持算法：EdDSA、ES256、RS256。
@@ -166,6 +176,7 @@ pub fn registration_options(
     origin: &str,
     user_id: i64,
     user_name: &str,
+    require_uv: bool,
 ) -> Result<RegistrationBegin, AppError> {
     let core = build_core(rp_id, rp_name, origin)?;
     // user handle 必须是 str(user_id) 的字节形式，不能换成随机 UUID。
@@ -177,7 +188,7 @@ pub fn registration_options(
         .credential_algorithms(allowed_algorithms())
         // PREFERRED：不强制常驻凭据，但也不像 Discouraged 那样劝退。
         .require_resident_key(false)
-        .user_verification_policy(UserVerificationPolicy::Preferred)
+        .user_verification_policy(uv_policy(require_uv))
         .reject_synchronised_authenticators(false)
         .exclude_credentials(None)
         .hints(None)
@@ -212,10 +223,11 @@ pub fn authentication_options(
     rp_id: &str,
     rp_name: &str,
     origin: &str,
+    require_uv: bool,
 ) -> Result<AuthenticationBegin, AppError> {
     let core = build_core(rp_id, rp_name, origin)?;
     let builder = core
-        .new_challenge_authenticate_builder(Vec::new(), Some(UserVerificationPolicy::Preferred))
+        .new_challenge_authenticate_builder(Vec::new(), Some(uv_policy(require_uv)))
         .map_err(|err| AppError::internal(format!("WebAuthn 配置错误：{err}")))?
         .extensions(None)
         .allow_backup_eligible_upgrade(true)
@@ -275,6 +287,8 @@ pub fn verify_registration(
         aaguid: attested.aaguid,
         device_type: device_type(passkey.backup_eligible).to_string(),
         backed_up: passkey.backup_state,
+        user_verified: passkey.user_verified,
+        registration_policy: uv_policy_name(passkey.registration_policy).to_string(),
     })
 }
 
@@ -314,12 +328,10 @@ pub fn verify_authentication(
         cred: cose_key,
         counter: stored_count,
         transports: None,
-        // 落库只存 COSE 公钥字节，UV 状态不持久化；重建时统一按未做 UV 处理
-        //（RP 配置本就不要求 uv）。
-        user_verified: false,
+        user_verified: stored.user_verified,
         backup_eligible: stored.device_type == Some(MULTI_DEVICE),
         backup_state: stored.backed_up,
-        registration_policy: UserVerificationPolicy::Preferred,
+        registration_policy: parse_uv_policy(stored.registration_policy),
         extensions: RegisteredExtensions::none(),
         attestation: ParsedAttestation::default(),
         attestation_format: AttestationFormat::None,
@@ -344,6 +356,32 @@ pub fn device_type(backup_eligible: bool) -> &'static str {
         MULTI_DEVICE
     } else {
         SINGLE_DEVICE
+    }
+}
+
+/// UV 设置到 WebAuthn 策略。
+fn uv_policy(require_uv: bool) -> UserVerificationPolicy {
+    if require_uv {
+        UserVerificationPolicy::Required
+    } else {
+        UserVerificationPolicy::Preferred
+    }
+}
+
+/// 策略的稳定存储名。
+fn uv_policy_name(policy: UserVerificationPolicy) -> &'static str {
+    match policy {
+        UserVerificationPolicy::Required => "required",
+        _ => "preferred",
+    }
+}
+
+/// 解析历史策略；未知值按 Preferred 处理，避免旧数据阻断登录。
+fn parse_uv_policy(value: &str) -> UserVerificationPolicy {
+    if value.eq_ignore_ascii_case("required") {
+        UserVerificationPolicy::Required
+    } else {
+        UserVerificationPolicy::Preferred
     }
 }
 
@@ -411,7 +449,7 @@ pub fn challenge_cookie(
     challenge: &str,
 ) -> Cookie<'static> {
     passkey_cookie(
-        cookie_name(CHALLENGE_COOKIE, flow),
+        cookies::preferred_name(CHALLENGE_COOKIE, flow, settings),
         challenge.to_string(),
         settings,
     )
@@ -420,7 +458,7 @@ pub fn challenge_cookie(
 /// 注册用户 Cookie（名带 flow 后缀，隔离并行流程）。
 pub fn user_cookie(settings: &RuntimeSettings, flow: &str, user_id: i64) -> Cookie<'static> {
     passkey_cookie(
-        cookie_name(USER_COOKIE, flow),
+        cookies::preferred_name(USER_COOKIE, flow, settings),
         user_id.to_string(),
         settings,
     )
@@ -428,7 +466,11 @@ pub fn user_cookie(settings: &RuntimeSettings, flow: &str, user_id: i64) -> Cook
 
 /// ceremony state Cookie（名带 flow 后缀，隔离并行流程）。
 pub fn state_cookie(settings: &RuntimeSettings, flow: &str, state: &str) -> Cookie<'static> {
-    passkey_cookie(cookie_name(STATE_COOKIE, flow), state.to_string(), settings)
+    passkey_cookie(
+        cookies::preferred_name(STATE_COOKIE, flow, settings),
+        state.to_string(),
+        settings,
+    )
 }
 
 /// 删除当前 flow 的三个 Passkey 临时 Cookie（属性与签发时保持一致）。
@@ -437,8 +479,22 @@ pub fn state_cookie(settings: &RuntimeSettings, flow: &str, state: &str) -> Cook
 pub fn clear_passkey_cookies(settings: &RuntimeSettings, flow: &str) -> Vec<Cookie<'static>> {
     [CHALLENGE_COOKIE, USER_COOKIE, STATE_COOKIE]
         .into_iter()
-        .map(|base| clear_cookie(cookie_name(base, flow), settings))
+        .flat_map(|base| {
+            cookies::names(base, flow, settings)
+                .into_iter()
+                .map(move |name| clear_cookie(name, settings))
+        })
         .collect()
+}
+
+/// 读取当前 flow 的临时 Cookie；兼容 `__Host-` 前缀与旧名。
+pub fn read_cookie(
+    req: &actix_web::HttpRequest,
+    base: &str,
+    flow: &str,
+    settings: &RuntimeSettings,
+) -> String {
+    cookies::read(req, base, flow, settings)
 }
 
 /// 构造删除指定 Cookie 的指令。
@@ -565,7 +621,6 @@ pub fn cose_key_from_bytes(bytes: &[u8]) -> Result<COSEKey, String> {
     COSEKey::try_from(&value).map_err(|err| format!("COSE 公钥非法：{err}"))
 }
 
-#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,7 +813,7 @@ mod tests {
     #[test]
     fn authentication_rejects_sign_counter_rollback() {
         let begin =
-            authentication_options("example.com", "Example", "https://example.com").unwrap();
+            authentication_options("example.com", "Example", "https://example.com", true).unwrap();
         let challenge = b64url_decode(&begin.challenge).unwrap();
         let client_data = serde_json::json!({
             "type": "webauthn.get",
@@ -791,6 +846,8 @@ mod tests {
             sign_count: 5,
             device_type: None,
             backed_up: false,
+            user_verified: true,
+            registration_policy: "required",
         };
         let error = verify_authentication(
             &credential,

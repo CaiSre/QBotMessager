@@ -3190,6 +3190,15 @@ async fn oauth_link_binds_identity_to_logged_in_user() {
     .await
     .expect("缺少身份绑定");
     assert_eq!(bound_user, linker.id);
+    let bind_audit: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM admin_audit_logs \
+         WHERE action = 'auth.oauth.bind' AND actor_user_id = ?",
+    )
+    .bind(linker.id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("查询 OAuth 绑定审计失败");
+    assert_eq!(bind_audit, 1);
 
     // 列表端点返回该绑定。
     let list = send!(
@@ -3410,6 +3419,15 @@ async fn oauth_unlink_guards_last_login_method() {
             .await
             .unwrap();
     assert_eq!(remaining, 0, "绑定应已删除");
+    let unbind_audit: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM admin_audit_logs \
+         WHERE action = 'auth.oauth.unbind' AND actor_user_id = ?",
+    )
+    .bind(owner.id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("查询 OAuth 解绑审计失败");
+    assert_eq!(unbind_audit, 1);
 }
 
 #[actix_web::test]
@@ -3609,7 +3627,7 @@ fn registration_credential(
     let client_data_json = serde_json::to_vec(&client_data).unwrap();
 
     let mut auth_data = sha256(rp_id.as_bytes());
-    auth_data.push(0x41); // UP | AT
+    auth_data.push(0x45); // UP | UV | AT
     auth_data.extend_from_slice(&0u32.to_be_bytes());
     auth_data.extend_from_slice(&[0x11u8; 16]); // AAGUID
     auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
@@ -3650,7 +3668,7 @@ fn assertion_credential(
     });
     let client_data_json = serde_json::to_vec(&client_data).unwrap();
     let mut auth_data = sha256(rp_id.as_bytes());
-    auth_data.push(0x01); // UP
+    auth_data.push(0x05); // UP | UV
     auth_data.extend_from_slice(&sign_count.to_be_bytes());
 
     json!({
@@ -3685,7 +3703,7 @@ fn signed_assertion_credential(
     });
     let client_data_json = serde_json::to_vec(&client_data).unwrap();
     let mut auth_data = sha256(rp_id.as_bytes());
-    auth_data.push(0x01); // UP
+    auth_data.push(0x05); // UP | UV
     auth_data.extend_from_slice(&sign_count.to_be_bytes());
 
     let client_hash = sha256(&client_data_json);
@@ -3729,8 +3747,9 @@ async fn insert_passkey(fixture: &Fixture, user_id: i64, credential_id: &[u8], s
     sqlx::query(
         "INSERT INTO webauthn_credentials \
          (user_id, credential_id, public_key, sign_count, aaguid, transports, device_type, \
-          backed_up, label, last_used_at, created_at) \
-         VALUES (?, ?, ?, ?, ?, NULL, 'single_device', FALSE, '测试凭据', NULL, ?)",
+          backed_up, user_verified, registration_policy, label, last_used_at, created_at) \
+         VALUES (?, ?, ?, ?, ?, NULL, 'single_device', FALSE, TRUE, 'required', '测试凭据', \
+          NULL, ?)",
     )
     .bind(user_id)
     .bind(credential_id)
@@ -3741,6 +3760,11 @@ async fn insert_passkey(fixture: &Fixture, user_id: i64, credential_id: &[u8], s
     .execute(&fixture.pool)
     .await
     .expect("插入 Passkey 失败");
+}
+
+/// HTTPS 测试配置下临时 Cookie 带 `__Host-` 前缀。
+fn passkey_cookie_name(base: &str, flow: &str) -> String {
+    format!("__Host-{}", passkey::cookie_name(base, flow))
 }
 
 // 用宏避免为 actix 的私有 Request 类型写泛型约束。
@@ -3798,18 +3822,28 @@ async fn passkey_register_stores_single_device() {
         begin_reply.json()["publicKey"]["user"]["id"],
         json!(b64(account.id.to_string().as_bytes()))
     );
+    assert_eq!(
+        begin_reply.json()["publicKey"]["authenticatorSelection"]["userVerification"],
+        json!("required")
+    );
     let challenge_cookie = begin_reply
-        .cookie(&passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow))
+        .cookie(&passkey_cookie_name(passkey::CHALLENGE_COOKIE, &flow))
         .expect("缺少 webauthn_challenge");
     let user_cookie = begin_reply
-        .cookie(&passkey::cookie_name(passkey::USER_COOKIE, &flow))
+        .cookie(&passkey_cookie_name(passkey::USER_COOKIE, &flow))
         .expect("缺少 webauthn_user");
     let state_cookie = begin_reply
-        .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &flow))
+        .cookie(&passkey_cookie_name(passkey::STATE_COOKIE, &flow))
         .expect("缺少 webauthn_state");
     assert_eq!(user_cookie, account.id.to_string());
     // 非 flow 后缀的旧 Cookie 名不应再签发。
     assert!(begin_reply.cookie("webauthn_challenge").is_none());
+    assert!(
+        begin_reply
+            .cookie(&passkey_cookie_name(passkey::CHALLENGE_COOKIE, &flow))
+            .is_some(),
+        "HTTPS 下应签发 __Host- 临时 Cookie"
+    );
 
     let credential_id = format!("credential-1-{}", fixture.prefix).into_bytes();
     let credential = registration_credential(
@@ -3826,15 +3860,15 @@ async fn passkey_register_stores_single_device() {
             &[
                 ("sid", token.as_str()),
                 (
-                    &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+                    &passkey_cookie_name(passkey::CHALLENGE_COOKIE, &flow),
                     challenge_cookie.as_str()
                 ),
                 (
-                    &passkey::cookie_name(passkey::USER_COOKIE, &flow),
+                    &passkey_cookie_name(passkey::USER_COOKIE, &flow),
                     user_cookie.as_str()
                 ),
                 (
-                    &passkey::cookie_name(passkey::STATE_COOKIE, &flow),
+                    &passkey_cookie_name(passkey::STATE_COOKIE, &flow),
                     state_cookie.as_str()
                 ),
             ]
@@ -3844,8 +3878,8 @@ async fn passkey_register_stores_single_device() {
     assert_eq!(finish.json(), json!({"ok": true}));
 
     let row = sqlx::query(
-        "SELECT credential_id, public_key, sign_count, aaguid, device_type, backed_up, label \
-         FROM webauthn_credentials WHERE user_id = ?",
+        "SELECT credential_id, public_key, sign_count, aaguid, device_type, backed_up, \
+         user_verified, registration_policy, label FROM webauthn_credentials WHERE user_id = ?",
     )
     .bind(account.id)
     .fetch_one(&fixture.pool)
@@ -3864,6 +3898,8 @@ async fn passkey_register_stores_single_device() {
     assert_eq!(device_type.as_deref(), Some("single_device"));
     assert!(device_type.unwrap().len() <= 32);
     assert!(!row.get::<bool, _>("backed_up"));
+    assert!(row.get::<bool, _>("user_verified"));
+    assert_eq!(row.get::<String, _>("registration_policy"), "required");
     assert_eq!(row.get::<String, _>("label"), "我的手机");
 
     let me = send!(app, get_with("/api/auth/me", &[("sid", token.as_str())]));
@@ -3879,6 +3915,15 @@ async fn passkey_register_stores_single_device() {
     assert_eq!(items[0]["device_type"], json!("single_device"));
     assert_eq!(items[0]["label"], json!("我的手机"));
     assert_eq!(items[0]["backed_up"], json!(false));
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM admin_audit_logs \
+         WHERE action = 'auth.passkey.add' AND actor_user_id = ?",
+    )
+    .bind(account.id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("查询 Passkey 审计失败");
+    assert_eq!(audited, 1);
 }
 
 #[actix_web::test]
@@ -3937,15 +3982,15 @@ async fn passkey_register_duplicate_and_delete() {
                 &[
                     ("sid", token.as_str()),
                     (
-                        &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+                        &passkey_cookie_name(passkey::CHALLENGE_COOKIE, &flow),
                         challenge_cookie.as_str(),
                     ),
                     (
-                        &passkey::cookie_name(passkey::USER_COOKIE, &flow),
+                        &passkey_cookie_name(passkey::USER_COOKIE, &flow),
                         account.id.to_string().as_str(),
                     ),
                     (
-                        &passkey::cookie_name(passkey::STATE_COOKIE, &flow),
+                        &passkey_cookie_name(passkey::STATE_COOKIE, &flow),
                         state_cookie.as_str(),
                     ),
                 ],
@@ -3963,13 +4008,10 @@ async fn passkey_register_duplicate_and_delete() {
             challenge,
             first_flow.clone(),
             first_begin
-                .cookie(&passkey::cookie_name(
-                    passkey::CHALLENGE_COOKIE,
-                    &first_flow
-                ))
+                .cookie(&passkey_cookie_name(passkey::CHALLENGE_COOKIE, &first_flow))
                 .unwrap(),
             first_begin
-                .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &first_flow))
+                .cookie(&passkey_cookie_name(passkey::STATE_COOKIE, &first_flow))
                 .unwrap()
         )
     );
@@ -3986,13 +4028,13 @@ async fn passkey_register_duplicate_and_delete() {
             challenge,
             second_flow.clone(),
             second_begin
-                .cookie(&passkey::cookie_name(
+                .cookie(&passkey_cookie_name(
                     passkey::CHALLENGE_COOKIE,
                     &second_flow
                 ))
                 .unwrap(),
             second_begin
-                .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &second_flow))
+                .cookie(&passkey_cookie_name(passkey::STATE_COOKIE, &second_flow))
                 .unwrap()
         )
     );
@@ -4032,6 +4074,15 @@ async fn passkey_register_duplicate_and_delete() {
     .await
     .unwrap();
     assert_eq!(count, 0);
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM admin_audit_logs \
+         WHERE action = 'auth.passkey.delete' AND actor_user_id = ?",
+    )
+    .bind(account.id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("查询 Passkey 删除审计失败");
+    assert_eq!(audited, 1);
 }
 
 #[actix_web::test]
@@ -4291,16 +4342,16 @@ async fn passkey_login_rejects_unknown_and_rollback() {
             &json!({"credential": unknown, "flow": flow}),
             &[
                 (
-                    &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+                    &passkey_cookie_name(passkey::CHALLENGE_COOKIE, &flow),
                     begin
-                        .cookie(&passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow))
+                        .cookie(&passkey_cookie_name(passkey::CHALLENGE_COOKIE, &flow))
                         .unwrap()
                         .as_str()
                 ),
                 (
-                    &passkey::cookie_name(passkey::STATE_COOKIE, &flow),
+                    &passkey_cookie_name(passkey::STATE_COOKIE, &flow),
                     begin
-                        .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &flow))
+                        .cookie(&passkey_cookie_name(passkey::STATE_COOKIE, &flow))
                         .unwrap()
                         .as_str()
                 ),
@@ -4326,16 +4377,16 @@ async fn passkey_login_rejects_unknown_and_rollback() {
             &json!({"credential": rollback, "flow": flow}),
             &[
                 (
-                    &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+                    &passkey_cookie_name(passkey::CHALLENGE_COOKIE, &flow),
                     begin
-                        .cookie(&passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow))
+                        .cookie(&passkey_cookie_name(passkey::CHALLENGE_COOKIE, &flow))
                         .unwrap()
                         .as_str()
                 ),
                 (
-                    &passkey::cookie_name(passkey::STATE_COOKIE, &flow),
+                    &passkey_cookie_name(passkey::STATE_COOKIE, &flow),
                     begin
-                        .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &flow))
+                        .cookie(&passkey_cookie_name(passkey::STATE_COOKIE, &flow))
                         .unwrap()
                         .as_str()
                 ),
@@ -4364,16 +4415,16 @@ async fn passkey_login_rejects_unknown_and_rollback() {
             &json!({"credential": mismatch, "flow": flow}),
             &[
                 (
-                    &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+                    &passkey_cookie_name(passkey::CHALLENGE_COOKIE, &flow),
                     begin
-                        .cookie(&passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow))
+                        .cookie(&passkey_cookie_name(passkey::CHALLENGE_COOKIE, &flow))
                         .unwrap()
                         .as_str()
                 ),
                 (
-                    &passkey::cookie_name(passkey::STATE_COOKIE, &flow),
+                    &passkey_cookie_name(passkey::STATE_COOKIE, &flow),
                     begin
-                        .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &flow))
+                        .cookie(&passkey_cookie_name(passkey::STATE_COOKIE, &flow))
                         .unwrap()
                         .as_str()
                 ),
@@ -4390,7 +4441,7 @@ async fn passkey_login_rejects_unknown_and_rollback() {
             "/api/auth/passkey/login/finish",
             &json!({"credential": {"id": "x"}, "flow": "0123456789abcdef"}),
             &[(
-                &passkey::cookie_name(passkey::CHALLENGE_COOKIE, "0123456789abcdef"),
+                &passkey_cookie_name(passkey::CHALLENGE_COOKIE, "0123456789abcdef"),
                 "AAAA"
             )]
         )
@@ -4441,16 +4492,16 @@ async fn passkey_login_succeeds_with_real_signature() {
             &json!({"credential": credential, "flow": flow}),
             &[
                 (
-                    &passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow),
+                    &passkey_cookie_name(passkey::CHALLENGE_COOKIE, &flow),
                     begin
-                        .cookie(&passkey::cookie_name(passkey::CHALLENGE_COOKIE, &flow))
+                        .cookie(&passkey_cookie_name(passkey::CHALLENGE_COOKIE, &flow))
                         .unwrap()
                         .as_str()
                 ),
                 (
-                    &passkey::cookie_name(passkey::STATE_COOKIE, &flow),
+                    &passkey_cookie_name(passkey::STATE_COOKIE, &flow),
                     begin
-                        .cookie(&passkey::cookie_name(passkey::STATE_COOKIE, &flow))
+                        .cookie(&passkey_cookie_name(passkey::STATE_COOKIE, &flow))
                         .unwrap()
                         .as_str()
                 ),
@@ -4484,8 +4535,124 @@ async fn passkey_login_succeeds_with_real_signature() {
     // 当前 flow 的临时 Cookie 被清理（Max-Age=0 的删除指令）。
     for base in [passkey::CHALLENGE_COOKIE, passkey::STATE_COOKIE] {
         let line = reply
-            .raw_cookie(&passkey::cookie_name(base, &flow))
+            .raw_cookie(&passkey_cookie_name(base, &flow))
             .expect("成功后应清除临时 Cookie");
         assert!(line.contains("Max-Age=0"), "Cookie 未被删除：{line}");
     }
+}
+
+#[actix_web::test]
+async fn auth_events_are_audited() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let account = make_account(
+        &fixture,
+        "auditevents",
+        Some(PASSWORD),
+        ROLE_USER,
+        STATUS_ACTIVE,
+    )
+    .await;
+
+    let failed = send!(
+        app,
+        post_json(
+            "/api/auth/login",
+            &json!({"account": account.email, "password": "WrongPassw0rd!"})
+        )
+    );
+    assert_status!(failed, StatusCode::UNAUTHORIZED);
+    let failures: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM admin_audit_logs \
+         WHERE action = 'auth.login_failed' AND detail->>'$.account' = ?",
+    )
+    .bind(&account.email)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("查询登录失败审计失败");
+    assert_eq!(failures, 1);
+
+    let login = send!(
+        app,
+        post_json(
+            "/api/auth/login",
+            &json!({"account": account.email, "password": PASSWORD})
+        )
+    );
+    let login = assert_status!(login, StatusCode::OK);
+    let sid = login.cookie("sid").expect("登录必须下发 sid");
+    let logins: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM admin_audit_logs \
+         WHERE action = 'auth.login' AND actor_user_id = ?",
+    )
+    .bind(account.id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("查询登录审计失败");
+    assert_eq!(logins, 1);
+
+    let logout = send!(
+        app,
+        post_json_with("/api/auth/logout", &json!({}), &[("sid", sid.as_str())])
+    );
+    assert_status!(logout, StatusCode::OK);
+    let logouts: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM admin_audit_logs \
+         WHERE action = 'auth.logout' AND actor_user_id = ?",
+    )
+    .bind(account.id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("查询登出审计失败");
+    assert_eq!(logouts, 1);
+
+    let oversized = send!(
+        app,
+        post_json(
+            "/api/auth/login",
+            &json!({"account": "x", "password": "a".repeat(70 * 1024)})
+        )
+    );
+    let oversized = assert_status!(oversized, StatusCode::BAD_REQUEST);
+    assert_eq!(oversized.detail(), "请求体过大");
+}
+
+#[actix_web::test]
+async fn passkey_begin_respects_uv_setting() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let account = make_account(&fixture, "pkuv", Some(PASSWORD), ROLE_USER, STATUS_ACTIVE).await;
+    let token = token_for(&fixture, account.id).await;
+    fixture.configure_webauthn();
+
+    let required = send!(
+        app,
+        post_json_with(
+            "/api/auth/passkey/register/begin",
+            &json!({}),
+            &[("sid", token.as_str())]
+        )
+    );
+    let required = assert_status!(required, StatusCode::OK);
+    assert_eq!(
+        required.json()["publicKey"]["authenticatorSelection"]["userVerification"],
+        json!("required")
+    );
+
+    fixture.apply_settings(json!({"passkey_require_uv": false}));
+    let preferred = send!(
+        app,
+        post_json_with(
+            "/api/auth/passkey/register/begin",
+            &json!({}),
+            &[("sid", token.as_str())]
+        )
+    );
+    let preferred = assert_status!(preferred, StatusCode::OK);
+    assert_eq!(
+        preferred.json()["publicKey"]["authenticatorSelection"]["userVerification"],
+        json!("preferred")
+    );
 }

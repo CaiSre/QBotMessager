@@ -5,6 +5,7 @@
 //! - `oauth`：OAuth2 授权码流程；
 //! - `passkey`：WebAuthn 注册与断言。
 
+pub mod cookies;
 pub mod oauth;
 pub mod passkey;
 pub mod passwords;

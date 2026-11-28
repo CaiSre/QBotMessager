@@ -85,6 +85,10 @@ pub struct WebauthnCredential {
     pub device_type: Option<String>,
     /// 是否已备份。
     pub backed_up: bool,
+    /// 注册时是否完成用户验证。
+    pub user_verified: bool,
+    /// 注册时使用的 UV 策略。
+    pub registration_policy: String,
     /// 标签。
     pub label: String,
     /// 最后使用时间。

@@ -6,6 +6,7 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
   BotIcon,
   FlaskConicalIcon,
+  HistoryIcon,
   LayoutDashboardIcon,
   ScrollTextIcon,
   Settings2Icon,
@@ -32,6 +33,7 @@ const NAV = [
 
 const ADMIN_NAV = [
   { href: "/users", label: "用户管理", icon: UsersIcon },
+  { href: "/audit", label: "审计日志", icon: HistoryIcon },
   { href: "/settings", label: "系统设置", icon: Settings2Icon },
 ];
 

@@ -2453,3 +2453,136 @@ async fn concurrent_super_admin_demotion_keeps_one_admin() {
     assert_eq!(active_super.len(), 1, "互踢后必须仍有一个启用超管");
     assert_eq!(succeeded, 1, "两个并发降级至多一个成功");
 }
+
+#[actix_web::test]
+async fn audit_log_query_requires_super_admin_and_filters() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let (_admin, admin_token) = make_admin(&fixture, "auditadmin").await;
+    let (_user, user_token) = make_user(&fixture, "audituser").await;
+    let action = format!("test.audit.{}", fixture.prefix);
+    sqlx::query(
+        "INSERT INTO admin_audit_logs (action, target_type, target_id, detail, ip, created_at) \
+         VALUES (?, 'test', 'one', JSON_OBJECT('k', 'v'), '127.0.0.1', ?)",
+    )
+    .bind(&action)
+    .bind(Utc::now().naive_utc())
+    .execute(&fixture.pool)
+    .await
+    .expect("插入审计记录失败");
+
+    let forbidden = send!(
+        app,
+        get_with(
+            &format!("/api/admin/audit?action={action}"),
+            &[("sid", user_token.as_str())]
+        )
+    );
+    assert_status!(forbidden, StatusCode::FORBIDDEN);
+
+    let reply = send!(
+        app,
+        get_with(
+            &format!("/api/admin/audit?action={action}"),
+            &[("sid", admin_token.as_str())]
+        )
+    );
+    let reply = assert_status!(reply, StatusCode::OK);
+    let body = reply.json();
+    assert_eq!(body["total"], json!(1));
+    assert_eq!(body["items"][0]["action"], json!(action));
+    assert_eq!(body["items"][0]["target_id"], json!("one"));
+    assert_eq!(body["items"][0]["detail"]["k"], json!("v"));
+
+    let bad_time = send!(
+        app,
+        get_with(
+            "/api/admin/audit?since=not-a-time",
+            &[("sid", admin_token.as_str())]
+        )
+    );
+    assert_status!(bad_time, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[actix_web::test]
+async fn admin_input_limits_reject_oversize_fields() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let (_admin, token) = make_admin(&fixture, "limits").await;
+    let auth = [("sid", token.as_str())];
+
+    let long_url = format!("https://example.com/{}", "a".repeat(520));
+    let provider = send!(
+        app,
+        post_json_with(
+            "/api/admin/oauth-providers",
+            &json!({
+                "key": format!("long-{}", fixture.prefix),
+                "display_name": "Long",
+                "client_id": "id",
+                "client_secret": "secret",
+                "authorization_url": long_url,
+                "token_url": "https://example.com/token",
+                "userinfo_url": "https://example.com/userinfo",
+            }),
+            &auth
+        )
+    );
+    let provider = assert_status!(provider, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        provider.detail().contains("最长 512"),
+        "{}",
+        provider.detail()
+    );
+
+    let bot = send!(
+        app,
+        post_json_with(
+            "/api/admin/bot-profiles",
+            &json!({
+                "name": "Limit Bot",
+                "qq_appid": format!("limit-{}", fixture.prefix),
+                "qq_app_secret": "secret",
+            }),
+            &auth
+        )
+    );
+    let bot = assert_status!(bot, StatusCode::CREATED);
+    let bot_id = bot.json()["id"].as_i64().unwrap();
+
+    let channel = send!(
+        app,
+        post_json_with(
+            "/api/admin/channels",
+            &json!({
+                "hook_type": "github",
+                "bot_profile_id": bot_id,
+                "secret": "a".repeat(513),
+            }),
+            &auth
+        )
+    );
+    let channel = assert_status!(channel, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        channel.detail().contains("最长 512"),
+        "{}",
+        channel.detail()
+    );
+
+    let empty_name = send!(
+        app,
+        patch_json_with(
+            &format!("/api/admin/bot-profiles/{bot_id}"),
+            &json!({"name": ""}),
+            &auth
+        )
+    );
+    let empty_name = assert_status!(empty_name, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        empty_name.detail().contains("至少 1"),
+        "{}",
+        empty_name.detail()
+    );
+}

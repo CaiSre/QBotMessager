@@ -34,7 +34,7 @@ use crate::db::models::{ROLE_USER, STATUS_ACTIVE, User, WebauthnCredential};
 use crate::db::queries;
 use crate::error::AppError;
 use crate::services::runtime_settings::RuntimeSettings;
-use crate::services::{email_codes, mail, users};
+use crate::services::{audit, email_codes, mail, users};
 use crate::state::AppState;
 
 /// 注册认证路由。
@@ -192,7 +192,10 @@ struct OAuthCallbackQuery {
 /// 校验失败返回 422；请求体过大映射为 400；`detail` 一律使用中文，
 /// 前端 `detailOf()` 只取字符串分支。
 fn json_config() -> web::JsonConfig {
-    web::JsonConfig::default().error_handler(|err, _req| json_payload_error(err).into())
+    web::JsonConfig::default()
+        // 认证请求体不含大文件；限制上限，避免超大 JSON 占用内存。
+        .limit(64 * 1024)
+        .error_handler(|err, _req| json_payload_error(err).into())
 }
 
 fn json_payload_error(err: actix_web::error::JsonPayloadError) -> AppError {
@@ -319,6 +322,16 @@ async fn update_email(
     )
     .await?;
     sessions::mark_verified(&state.pool, &token, Utc::now().naive_utc()).await?;
+    audit_auth(
+        &state,
+        Some(updated.id),
+        "auth.email.change",
+        Some("user"),
+        Some(updated.id.to_string()),
+        json!({"email": &updated.email}),
+        ip.as_deref(),
+    )
+    .await;
     Ok(HttpResponse::Ok().json(user_payload(&updated)))
 }
 
@@ -392,6 +405,16 @@ async fn update_password(
     )
     .await?;
     sessions::mark_verified(&state.pool, &token, Utc::now().naive_utc()).await?;
+    audit_auth(
+        &state,
+        Some(user.id),
+        "auth.password.change",
+        Some("user"),
+        Some(user.id.to_string()),
+        json!({}),
+        ip.as_deref(),
+    )
+    .await;
     Ok(HttpResponse::Ok().json(json!({ "ok": true })))
 }
 
@@ -502,7 +525,7 @@ async fn login(
     let ip = state.client_ip(&req);
     let user_agent = user_agent(&req);
 
-    let session = users::login(
+    let session = match users::login(
         &state.pool,
         &state.login_limiter,
         &settings,
@@ -511,7 +534,34 @@ async fn login(
         ip.as_deref(),
         user_agent,
     )
-    .await?;
+    .await
+    {
+        Ok(session) => session,
+        Err(err) => {
+            let account: String = body.account.chars().take(128).collect();
+            audit_auth(
+                &state,
+                None,
+                "auth.login_failed",
+                Some("user"),
+                None,
+                json!({"account": account, "reason": err.detail()}),
+                ip.as_deref(),
+            )
+            .await;
+            return Err(err);
+        }
+    };
+    audit_auth(
+        &state,
+        Some(session.user.id),
+        "auth.login",
+        Some("user"),
+        Some(session.user.id.to_string()),
+        json!({"method": "password"}),
+        ip.as_deref(),
+    )
+    .await;
 
     let cookie = sessions::session_cookie(
         &state.config,
@@ -528,7 +578,19 @@ async fn login(
 async fn logout(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let settings = (*state.settings()).clone();
     let token = session_token(&state, &req);
+    let actor = sessions::resolve_session(&state.pool, &token).await?;
     sessions::revoke_session(&state.pool, &token).await?;
+    let ip = state.client_ip(&req);
+    audit_auth(
+        &state,
+        actor.as_ref().map(|user| user.id),
+        "auth.logout",
+        Some("user"),
+        actor.as_ref().map(|user| user.id.to_string()),
+        json!({}),
+        ip.as_deref(),
+    )
+    .await;
     let mut response = HttpResponse::Ok();
     for cookie in sessions::clear_session_cookies(&state.config, &settings) {
         response.cookie(cookie);
@@ -562,6 +624,16 @@ async fn register(
         user_agent,
     )
     .await?;
+    audit_auth(
+        &state,
+        Some(session.user.id),
+        "auth.register",
+        Some("user"),
+        Some(session.user.id.to_string()),
+        json!({"method": "password"}),
+        ip.as_deref(),
+    )
+    .await;
 
     let cookie = sessions::session_cookie(
         &state.config,
@@ -678,14 +750,9 @@ async fn oauth_callback_inner(
     // state 参数格式为 "{flow16}.{state32}"：flow 决定读哪组 Cookie；
     // 缺 '.' 时 flow 为空，回退到不带后缀的名，校验自然失败而非 panic。
     let (flow, state_body) = oauth::split_state_param(&query.state);
-    let cookie_state = req
-        .cookie(&oauth::flow_cookie_name(oauth::STATE_COOKIE, &flow))
-        .map(|cookie| cookie.value().to_string())
-        .unwrap_or_default();
-    let cookie_provider = req
-        .cookie(&oauth::flow_cookie_name(oauth::PROVIDER_COOKIE, &flow))
-        .map(|cookie| cookie.value().to_string())
-        .unwrap_or_default();
+    let settings = (*state.settings()).clone();
+    let cookie_state = oauth::read_cookie(req, oauth::STATE_COOKIE, &flow, &settings);
+    let cookie_provider = oauth::read_cookie(req, oauth::PROVIDER_COOKIE, &flow, &settings);
     oauth::validate_state(state_body, &cookie_state, &cookie_provider, &provider_key)?;
     if query.code.is_empty() {
         return Err(AppError::bad_request("缺少授权码"));
@@ -696,7 +763,6 @@ async fn oauth_callback_inner(
         .ok_or_else(|| AppError::not_found("提供方不存在或未启用"))?;
     let client_secret = oauth::client_secret(&provider, state.config.app_secret_key.as_deref())?;
 
-    let settings = (*state.settings()).clone();
     let origin = request_origin(state, &settings, req);
     let redirect_uri = oauth::redirect_uri(&origin, &provider.key);
 
@@ -723,10 +789,10 @@ async fn oauth_callback_inner(
     let email_verified = provider.email_verified && profile.email_verified;
 
     // 绑定分支：start 时带会话、且回调时仍能解析出有效会话。
-    let link_cookie_name = oauth::flow_cookie_name(oauth::LINK_COOKIE, &flow);
-    let link_user = match req.cookie(&link_cookie_name) {
-        Some(_) => sessions::resolve_session(&state.pool, &session_token(state, req)).await?,
-        None => None,
+    let link_user = if oauth::read_cookie(req, oauth::LINK_COOKIE, &flow, &settings).is_empty() {
+        None
+    } else {
+        sessions::resolve_session(&state.pool, &session_token(state, req)).await?
     };
     if let Some(current) = link_user {
         if current.status != STATUS_ACTIVE {
@@ -756,6 +822,16 @@ async fn oauth_callback_inner(
                     },
                 )
                 .await?;
+                audit_auth(
+                    state,
+                    Some(current.id),
+                    "auth.oauth.bind",
+                    Some("oauth_identity"),
+                    Some(profile.provider_user_id.clone()),
+                    json!({"provider": &provider.key}),
+                    state.client_ip(req).as_deref(),
+                )
+                .await;
                 Ok(oauth_done_redirect(&settings, &flow, true, "绑定成功"))
             }
         };
@@ -799,10 +875,7 @@ async fn oauth_callback_inner(
                 let Some(email) = profile.email.as_deref() else {
                     return Err(AppError::bad_request("提供方未返回邮箱，无法创建账号"));
                 };
-                let invite_code = req
-                    .cookie(&oauth::flow_cookie_name(oauth::INVITE_COOKIE, &flow))
-                    .map(|cookie| cookie.value().to_string())
-                    .unwrap_or_default();
+                let invite_code = oauth::read_cookie(req, oauth::INVITE_COOKIE, &flow, &settings);
                 if invite_code.is_empty() {
                     return Err(AppError::forbidden(
                         "首次通过 OAuth 登录需要邀请码，请返回登录页填写",
@@ -878,9 +951,41 @@ async fn oauth_callback_inner(
             },
         )
         .await?;
+        audit_auth(
+            state,
+            Some(user.id),
+            "auth.oauth.bind",
+            Some("oauth_identity"),
+            Some(profile.provider_user_id.clone()),
+            json!({"provider": &provider.key}),
+            state.client_ip(req).as_deref(),
+        )
+        .await;
     }
 
     let ip = state.client_ip(req);
+    if identity_created_in_tx {
+        audit_auth(
+            state,
+            Some(user.id),
+            "auth.register_oauth",
+            Some("user"),
+            Some(user.id.to_string()),
+            json!({"provider": &provider.key}),
+            ip.as_deref(),
+        )
+        .await;
+    }
+    audit_auth(
+        state,
+        Some(user.id),
+        "auth.login_oauth",
+        Some("user"),
+        Some(user.id.to_string()),
+        json!({"provider": &provider.key}),
+        ip.as_deref(),
+    )
+    .await;
     let token = sessions::create_session(
         &state.pool,
         &user,
@@ -896,26 +1001,16 @@ async fn oauth_callback_inner(
         settings.session_ttl_hours(),
     );
 
-    Ok(HttpResponse::Found()
+    let mut response = HttpResponse::Found()
         .append_header((LOCATION, "/"))
         .cookie(cookie)
-        .cookie(oauth::clear_cookie(
-            &oauth::flow_cookie_name(oauth::STATE_COOKIE, &flow),
-            &settings,
-        ))
-        .cookie(oauth::clear_cookie(
-            &oauth::flow_cookie_name(oauth::PROVIDER_COOKIE, &flow),
-            &settings,
-        ))
-        .cookie(oauth::clear_cookie(
-            &oauth::flow_cookie_name(oauth::LINK_COOKIE, &flow),
-            &settings,
-        ))
-        .cookie(oauth::clear_cookie(
-            &oauth::flow_cookie_name(oauth::INVITE_COOKIE, &flow),
-            &settings,
-        ))
-        .finish())
+        .finish();
+    for cookie in oauth::clear_flow_cookies(&settings, &flow) {
+        response
+            .add_cookie(&cookie)
+            .map_err(|_| AppError::internal("响应构造失败"))?;
+    }
+    Ok(response)
 }
 
 /// 绑定流程结束后的跳转：带结果参数跳回安全设置页。
@@ -931,25 +1026,14 @@ fn oauth_done_redirect(
         .append_pair("oauth", if ok { "ok" } else { "fail" })
         .append_pair("message", message)
         .finish();
-    HttpResponse::Found()
+    let mut response = HttpResponse::Found()
         .append_header((LOCATION, format!("/security?{query}")))
-        .cookie(oauth::clear_cookie(
-            &oauth::flow_cookie_name(oauth::STATE_COOKIE, flow),
-            settings,
-        ))
-        .cookie(oauth::clear_cookie(
-            &oauth::flow_cookie_name(oauth::PROVIDER_COOKIE, flow),
-            settings,
-        ))
-        .cookie(oauth::clear_cookie(
-            &oauth::flow_cookie_name(oauth::LINK_COOKIE, flow),
-            settings,
-        ))
-        .cookie(oauth::clear_cookie(
-            &oauth::flow_cookie_name(oauth::INVITE_COOKIE, flow),
-            settings,
-        ))
-        .finish()
+        .finish();
+    for cookie in oauth::clear_flow_cookies(settings, flow) {
+        // 清除指令不合法只影响本次跳转的 Cookie 清理，不改变登录结果。
+        let _ = response.add_cookie(&cookie);
+    }
+    response
 }
 
 /// 回调失败后的跳转：中文提示交给前端提示页展示。
@@ -967,23 +1051,9 @@ fn oauth_failure_redirect(settings: &RuntimeSettings, flow: &str, err: &AppError
     let mut builder = HttpResponse::Found();
     let mut response = builder.append_header((LOCATION, location));
     if !flow.is_empty() {
-        response = response
-            .cookie(oauth::clear_cookie(
-                &oauth::flow_cookie_name(oauth::STATE_COOKIE, flow),
-                settings,
-            ))
-            .cookie(oauth::clear_cookie(
-                &oauth::flow_cookie_name(oauth::PROVIDER_COOKIE, flow),
-                settings,
-            ))
-            .cookie(oauth::clear_cookie(
-                &oauth::flow_cookie_name(oauth::LINK_COOKIE, flow),
-                settings,
-            ))
-            .cookie(oauth::clear_cookie(
-                &oauth::flow_cookie_name(oauth::INVITE_COOKIE, flow),
-                settings,
-            ));
+        for cookie in oauth::clear_flow_cookies(settings, flow) {
+            response = response.cookie(cookie);
+        }
     }
     response.finish()
 }
@@ -1040,6 +1110,20 @@ async fn unlink_oauth(
     }
 
     queries::oauth::delete_identity(&state.pool, identity_id).await?;
+    let ip = state.client_ip(&req);
+    audit_auth(
+        &state,
+        Some(user.id),
+        "auth.oauth.unbind",
+        Some("oauth_identity"),
+        Some(identity_id.to_string()),
+        record
+            .as_ref()
+            .map(|row| json!({"provider": &row.provider, "provider_login": &row.provider_login}))
+            .unwrap_or_else(|| json!({})),
+        ip.as_deref(),
+    )
+    .await;
     Ok(HttpResponse::Ok().json(json!({ "ok": true })))
 }
 
@@ -1078,8 +1162,14 @@ async fn passkey_register_begin(
     let settings = (*state.settings()).clone();
     let rp_id = request_rp_id(&settings, &req);
     let origin = request_origin(&state, &settings, &req);
-    let begin =
-        passkey::registration_options(&rp_id, settings.rp_name(), &origin, user.id, &user.email)?;
+    let begin = passkey::registration_options(
+        &rp_id,
+        settings.rp_name(),
+        &origin,
+        user.id,
+        &user.email,
+        settings.passkey_require_uv(),
+    )?;
     let flow = passkey::new_flow();
     let mut body = begin.options;
     // flow 并入 options JSON 外层（前端 unwrap 只取 publicKey，外层多键安全）。
@@ -1108,12 +1198,12 @@ async fn passkey_register_finish(
     require_step_up(&state, &req).await?;
     let settings = (*state.settings()).clone();
     let flow = finish_flow(&body.flow)?;
-    let raw_challenge = cookie_value(&req, &passkey::cookie_name(passkey::CHALLENGE_COOKIE, flow));
-    let cookie_user = cookie_value(&req, &passkey::cookie_name(passkey::USER_COOKIE, flow));
+    let raw_challenge = passkey::read_cookie(&req, passkey::CHALLENGE_COOKIE, flow, &settings);
+    let cookie_user = passkey::read_cookie(&req, passkey::USER_COOKIE, flow, &settings);
     if raw_challenge.is_empty() || cookie_user != user.id.to_string() {
         return Err(AppError::bad_request("注册会话已过期，请重试"));
     }
-    let state_cookie = cookie_value(&req, &passkey::cookie_name(passkey::STATE_COOKIE, flow));
+    let state_cookie = passkey::read_cookie(&req, passkey::STATE_COOKIE, flow, &settings);
     if state_cookie.is_empty() {
         return Err(AppError::bad_request("注册会话已过期，请重试"));
     }
@@ -1158,11 +1248,24 @@ async fn passkey_register_finish(
             transports: transports.as_ref(),
             device_type: &result.device_type,
             backed_up: result.backed_up,
+            user_verified: result.user_verified,
+            registration_policy: &result.registration_policy,
             label: &label,
             created_at: Utc::now().naive_utc(),
         },
     )
     .await?;
+    let ip = state.client_ip(&req);
+    audit_auth(
+        &state,
+        Some(user.id),
+        "auth.passkey.add",
+        Some("passkey"),
+        Some(passkey::b64url_encode(&result.credential_id)),
+        json!({"device_type": &result.device_type, "user_verified": result.user_verified}),
+        ip.as_deref(),
+    )
+    .await;
 
     let mut response = HttpResponse::Ok();
     for cookie in passkey::clear_passkey_cookies(&settings, flow) {
@@ -1200,6 +1303,20 @@ async fn delete_passkey(
     }
 
     passkey_store::delete(&state.pool, credential_id).await?;
+    let ip = state.client_ip(&req);
+    audit_auth(
+        &state,
+        Some(user.id),
+        "auth.passkey.delete",
+        Some("passkey"),
+        Some(credential_id.to_string()),
+        record
+            .as_ref()
+            .map(|row| json!({"label": &row.label}))
+            .unwrap_or_else(|| json!({})),
+        ip.as_deref(),
+    )
+    .await;
     Ok(HttpResponse::Ok().json(json!({ "ok": true })))
 }
 
@@ -1211,7 +1328,12 @@ async fn passkey_login_begin(
     let settings = (*state.settings()).clone();
     let rp_id = request_rp_id(&settings, &req);
     let origin = request_origin(&state, &settings, &req);
-    let begin = passkey::authentication_options(&rp_id, settings.rp_name(), &origin)?;
+    let begin = passkey::authentication_options(
+        &rp_id,
+        settings.rp_name(),
+        &origin,
+        settings.passkey_require_uv(),
+    )?;
     let flow = passkey::new_flow();
     let mut body = begin.options;
     // flow 并入 options JSON 外层（前端 unwrap 只取 publicKey，外层多键安全）。
@@ -1237,11 +1359,11 @@ async fn passkey_login_finish(
 ) -> Result<HttpResponse, AppError> {
     let settings = (*state.settings()).clone();
     let flow = finish_flow(&body.flow)?;
-    let raw_challenge = cookie_value(&req, &passkey::cookie_name(passkey::CHALLENGE_COOKIE, flow));
+    let raw_challenge = passkey::read_cookie(&req, passkey::CHALLENGE_COOKIE, flow, &settings);
     if raw_challenge.is_empty() {
         return Err(AppError::bad_request("登录会话已过期，请重试"));
     }
-    let state_cookie = cookie_value(&req, &passkey::cookie_name(passkey::STATE_COOKIE, flow));
+    let state_cookie = passkey::read_cookie(&req, passkey::STATE_COOKIE, flow, &settings);
     if state_cookie.is_empty() {
         return Err(AppError::bad_request("登录会话已过期，请重试"));
     }
@@ -1281,6 +1403,14 @@ async fn passkey_login_finish(
             sign_count: record.sign_count,
             device_type: record.device_type.as_deref(),
             backed_up: record.backed_up,
+            user_verified: record.user_verified,
+            // 当前设置要求 UV 时覆盖为 Required；否则沿用注册策略，避免历史
+            // Required 凭据因关闭设置被悄悄降级。
+            registration_policy: if settings.passkey_require_uv() {
+                "required"
+            } else {
+                &record.registration_policy
+            },
         },
     )?;
 
@@ -1302,6 +1432,16 @@ async fn passkey_login_finish(
     .await?;
 
     let ip = state.client_ip(&req);
+    audit_auth(
+        &state,
+        Some(user.id),
+        "auth.login_passkey",
+        Some("passkey"),
+        Some(record.id.to_string()),
+        json!({"user_verified": result.user_verified}),
+        ip.as_deref(),
+    )
+    .await;
     let token = sessions::create_session(
         &state.pool,
         &user,
@@ -1359,16 +1499,32 @@ async fn require_step_up(state: &AppState, req: &HttpRequest) -> Result<(), AppE
     }
 }
 
+/// 记录认证事件；审计失败只告警，不影响认证结果。
+async fn audit_auth(
+    state: &AppState,
+    actor_user_id: Option<i64>,
+    action: &str,
+    target_type: Option<&str>,
+    target_id: Option<String>,
+    detail: Value,
+    ip: Option<&str>,
+) {
+    let entry = audit::AuditEntry {
+        actor_user_id,
+        action,
+        target_type,
+        target_id,
+        detail: Some(detail),
+        ip,
+    };
+    if let Err(err) = audit::record_audit(&state.pool, entry).await {
+        tracing::warn!(error = %err, action, "认证审计写入失败");
+    }
+}
+
 /// 从请求中读取会话 token（Cookie 名来自环境变量配置）。
 fn session_token(state: &AppState, req: &HttpRequest) -> String {
     sessions::read_session_token(req, &state.config, &state.settings())
-}
-
-/// 读取指定 Cookie 的值。
-fn cookie_value(req: &HttpRequest, name: &str) -> String {
-    req.cookie(name)
-        .map(|cookie| cookie.value().to_string())
-        .unwrap_or_default()
 }
 
 /// 请求头中的 User-Agent。
@@ -1601,6 +1757,8 @@ mod passkey_store {
         pub transports: Option<&'a Value>,
         pub device_type: &'a str,
         pub backed_up: bool,
+        pub user_verified: bool,
+        pub registration_policy: &'a str,
         pub label: &'a str,
         pub created_at: NaiveDateTime,
     }
@@ -1612,8 +1770,8 @@ mod passkey_store {
     ) -> Result<Vec<WebauthnCredential>, sqlx::Error> {
         sqlx::query_as::<_, WebauthnCredential>(
             "SELECT id, user_id, credential_id, public_key, sign_count, aaguid, transports, \
-             device_type, backed_up, label, last_used_at, created_at \
-             FROM webauthn_credentials WHERE user_id = ? ORDER BY id",
+             device_type, backed_up, user_verified, registration_policy, label, last_used_at, \
+             created_at FROM webauthn_credentials WHERE user_id = ? ORDER BY id",
         )
         .bind(user_id)
         .fetch_all(pool)
@@ -1637,8 +1795,8 @@ mod passkey_store {
     ) -> Result<Option<WebauthnCredential>, sqlx::Error> {
         sqlx::query_as::<_, WebauthnCredential>(
             "SELECT id, user_id, credential_id, public_key, sign_count, aaguid, transports, \
-             device_type, backed_up, label, last_used_at, created_at \
-             FROM webauthn_credentials WHERE id = ?",
+             device_type, backed_up, user_verified, registration_policy, label, last_used_at, \
+             created_at FROM webauthn_credentials WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(pool)
@@ -1652,8 +1810,8 @@ mod passkey_store {
     ) -> Result<Option<WebauthnCredential>, sqlx::Error> {
         sqlx::query_as::<_, WebauthnCredential>(
             "SELECT id, user_id, credential_id, public_key, sign_count, aaguid, transports, \
-             device_type, backed_up, label, last_used_at, created_at \
-             FROM webauthn_credentials WHERE credential_id = ? LIMIT 1",
+             device_type, backed_up, user_verified, registration_policy, label, last_used_at, \
+             created_at FROM webauthn_credentials WHERE credential_id = ? LIMIT 1",
         )
         .bind(credential_id)
         .fetch_optional(pool)
@@ -1665,8 +1823,8 @@ mod passkey_store {
         sqlx::query(
             "INSERT INTO webauthn_credentials \
              (user_id, credential_id, public_key, sign_count, aaguid, transports, \
-              device_type, backed_up, label, last_used_at, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+              device_type, backed_up, user_verified, registration_policy, label, last_used_at, \
+              created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
         )
         .bind(new.user_id)
         .bind(new.credential_id)
@@ -1676,6 +1834,8 @@ mod passkey_store {
         .bind(new.transports)
         .bind(new.device_type)
         .bind(new.backed_up)
+        .bind(new.user_verified)
+        .bind(new.registration_policy)
         .bind(new.label)
         .bind(new.created_at)
         .execute(pool)

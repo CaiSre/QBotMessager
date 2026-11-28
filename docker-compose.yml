@@ -32,6 +32,14 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # 运行镜像只读：应用不写本地文件；/tmp 供 DNS/临时文件使用。
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
     env_file:
       - .env
     environment:

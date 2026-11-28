@@ -21,6 +21,7 @@ use serde_json::Value;
 use subtle::ConstantTimeEq;
 use url::form_urlencoded;
 
+use crate::auth::cookies;
 use crate::crypto::decrypt_secret;
 use crate::db::models::OAuthProvider;
 use crate::error::AppError;
@@ -81,11 +82,17 @@ pub fn new_flow() -> String {
 ///
 /// flow 为空时退回不带后缀的回退名，保证校验自然失败而非 panic。
 pub fn flow_cookie_name(base: &str, flow: &str) -> String {
-    if flow.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}_{flow}")
-    }
+    cookies::plain_name(base, flow)
+}
+
+/// 读取 OAuth 临时 Cookie；HTTPS 下优先 `__Host-` 版本并兼容旧名。
+pub fn read_cookie(
+    req: &actix_web::HttpRequest,
+    base: &str,
+    flow: &str,
+    settings: &RuntimeSettings,
+) -> String {
+    cookies::read(req, base, flow, settings)
 }
 
 /// 从回调 state 参数解析 (flow, state 主体)。
@@ -327,7 +334,7 @@ pub async fn fetch_profile(
 /// Cookie 名带 flow 后缀隔离并行流程；值仍为 state 主体（不含 flow 前缀）。
 pub fn state_cookie(settings: &RuntimeSettings, flow: &str, state: &str) -> Cookie<'static> {
     oauth_cookie(
-        flow_cookie_name(STATE_COOKIE, flow),
+        cookies::preferred_name(STATE_COOKIE, flow, settings),
         state.to_string(),
         settings,
     )
@@ -340,7 +347,7 @@ pub fn provider_cookie(
     provider_key: &str,
 ) -> Cookie<'static> {
     oauth_cookie(
-        flow_cookie_name(PROVIDER_COOKIE, flow),
+        cookies::preferred_name(PROVIDER_COOKIE, flow, settings),
         provider_key.to_string(),
         settings,
     )
@@ -349,7 +356,7 @@ pub fn provider_cookie(
 /// 构造绑定用途 Cookie；值只是意图标记，回调以解析出的会话为准。
 pub fn link_cookie(settings: &RuntimeSettings, flow: &str) -> Cookie<'static> {
     oauth_cookie(
-        flow_cookie_name(LINK_COOKIE, flow),
+        cookies::preferred_name(LINK_COOKIE, flow, settings),
         "1".to_string(),
         settings,
     )
@@ -358,10 +365,24 @@ pub fn link_cookie(settings: &RuntimeSettings, flow: &str) -> Cookie<'static> {
 /// 构造首次注册所需邀请码 Cookie；只在本次 flow 内有效。
 pub fn invite_cookie(settings: &RuntimeSettings, flow: &str, invite_code: &str) -> Cookie<'static> {
     oauth_cookie(
-        flow_cookie_name(INVITE_COOKIE, flow),
+        cookies::preferred_name(INVITE_COOKIE, flow, settings),
         invite_code.to_string(),
         settings,
     )
+}
+
+/// 删除当前 flow 的四个 OAuth 临时 Cookie。
+///
+/// 同时覆盖 `__Host-` 版本与旧名，升级中的浏览器不会残留旧 Cookie。
+pub fn clear_flow_cookies(settings: &RuntimeSettings, flow: &str) -> Vec<Cookie<'static>> {
+    [STATE_COOKIE, PROVIDER_COOKIE, LINK_COOKIE, INVITE_COOKIE]
+        .into_iter()
+        .flat_map(|base| {
+            cookies::names(base, flow, settings)
+                .into_iter()
+                .map(move |name| clear_cookie(&name, settings))
+        })
+        .collect()
 }
 
 /// 构造删除 OAuth 临时 Cookie 的指令（属性与签发时保持一致）。
@@ -461,6 +482,28 @@ mod tests {
         let cookie = invite_cookie(&settings, &flow, "invite-code");
         assert_eq!(cookie.name(), format!("oauth_invite_{flow}"));
         assert_eq!(cookie.value(), "invite-code");
+        let mut secure = RuntimeSettings::new(None);
+        let changes = serde_json::json!({"public_base_url": "https://app.example.com"});
+        secure.apply(
+            &secure
+                .validate(changes.as_object().expect("对象"))
+                .expect("设置校验失败"),
+        );
+        let secure_name = state_cookie(&secure, &flow, "state-body");
+        assert_eq!(secure_name.name(), format!("__Host-oauth_state_{flow}"));
+        assert!(secure_name.secure().unwrap_or(false));
+        let cleared = clear_flow_cookies(&secure, &flow);
+        assert!(
+            cleared
+                .iter()
+                .any(|c| c.name() == format!("__Host-oauth_state_{flow}"))
+        );
+        assert!(
+            cleared
+                .iter()
+                .any(|c| c.name() == format!("oauth_state_{flow}"))
+        );
+
         // 清除指令同样落在带后缀的名上。
         let cookie = clear_cookie(&format!("oauth_state_{flow}"), &settings);
         assert_eq!(cookie.name(), format!("oauth_state_{flow}"));

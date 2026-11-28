@@ -147,11 +147,13 @@ MYSQL_PASSWORD=请替换为强密码
 MYSQL_ROOT_PASSWORD=请替换为强密码
 ```
 
-构建并启动：
+不要保留示例占位值；`docker compose` 会拒绝空的 MySQL 密码。构建并启动：
 
 ```bash
 docker compose up -d --build
 ```
+
+compose 默认以只读根文件系统、移除全部 Linux capabilities 并启用 `no-new-privileges` 运行应用，仅 `/tmp` 可写。
 
 > 构建阶段依次使用 `oven/bun` 与 `rust:alpine` 镜像；国内网络可先把基础镜像同步到本地仓库，再通过 `ALPINE_VERSION` / `BUN_VERSION` / `RUST_VERSION` 构建参数锁定版本。
 
@@ -201,6 +203,7 @@ docker compose up -d --build
 | 会话有效期（`SESSION_TTL_HOURS`） | 对新登录生效 | `72` |
 | Cookie 仅限 HTTPS（`COOKIE_SECURE`） | 对外地址为 https 时自动开启 | `false` |
 | 通行密钥 RP ID / 名称（`RP_ID` / `RP_NAME`） | WebAuthn 依赖方标识与展示名 | 空 / 项目名 |
+| 通行密钥强制 UV（`PASSKEY_REQUIRE_UV`） | 要求生物识别或设备 PIN；关闭后允许仅用户在场，历史 `required` 凭据仍按注册策略校验 | `true` |
 | 登录失败限速（`LOGIN_MAX_FAILURES` / `LOGIN_IP_MAX_FAILURES` / `LOGIN_WINDOW_SECONDS`） | 同一 (IP, 账号) / 同一 IP 的失败上限与统计窗口 | `5` / `30` / `900` |
 | SMTP 服务器（`SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURITY`） | 验证码邮件服务器；连接方式可选 STARTTLS / SSL / 明文 | 空 / `587` / `starttls` |
 | SMTP 账号（`SMTP_USERNAME` / `SMTP_PASSWORD` / `SMTP_FROM`） | 登录凭据与发件人；密码以 Fernet 密文入库，留空保持不变 | 空 |
@@ -259,9 +262,10 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 | | `PATCH /api/auth/me/email`、`POST /api/auth/me/email-code` | 修改邮箱需当前密码与新地址验证码 |
 | | `GET /api/auth/me` | 当前用户信息 |
 | | `GET /api/auth/oauth/{key}/start`、`/callback` | OAuth2 授权码流程；`start?invite_code=` 携带首次建号所需邀请码 |
-| | `GET /api/auth/passkey`、`POST /api/auth/passkey/*` | 通行密钥注册与登录 |
+| | `GET /api/auth/passkey`、`POST /api/auth/passkey/*` | 通行密钥注册与登录；HTTPS 下临时 Cookie 使用 `__Host-` 前缀 |
 | 管理台 | `/api/admin/bot-profiles`、`/channels` | 资源增删改查（按归属过滤） |
 | | `GET /api/admin/logs`、`/stats` | 推送日志与统计 |
+| | `GET /api/admin/audit` | 审计日志查询（动作、操作者、目标、关键词、RFC3339 时间区间） |
 | 超管 | `/api/admin/users`、`/invites`、`/oauth-providers`、`/settings` | 用户、邀请码、OAuth2 与系统设置 |
 
 > 管理接口均需登录会话；普通用户只能访问本人资源，超管专属接口对其他角色返回 403。

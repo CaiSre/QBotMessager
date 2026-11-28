@@ -6,6 +6,7 @@
 //!   `POST /api/admin/channels/{id}/rotate`
 //! - `GET  /api/admin/logs?page=&page_size=&hook_type=&status=&keyword=`；
 //!   `GET /api/admin/logs/{log_id}`
+//! - `GET  /api/admin/audit?page=&page_size=&action=&actor_user_id=&keyword=&since=&until=`
 //! - `GET  /api/admin/users`；`PATCH /api/admin/users/{id}`
 //! - `GET/POST   /api/admin/invites`；`DELETE /api/admin/invites/{id}`
 //! - `GET/POST   /api/admin/oauth-providers`；
@@ -93,6 +94,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             )
             .route("/logs", web::get().to(list_logs))
             .route("/logs/{log_id}", web::get().to(get_log))
+            .route("/audit", web::get().to(list_audit_logs))
             .route("/users", web::get().to(list_users))
             .route("/users/{user_id}", web::patch().to(patch_user))
             .service(
@@ -291,7 +293,10 @@ fn default_name_field() -> String {
 
 /// JSON 解析错误映射：422 字段错误，400 请求体过大。
 fn json_config() -> web::JsonConfig {
-    web::JsonConfig::default().error_handler(|err, _req| json_payload_error(err).into())
+    web::JsonConfig::default()
+        // 管理端配置有明确字段上限，128 KiB 足够覆盖批量填写。
+        .limit(128 * 1024)
+        .error_handler(|err, _req| json_payload_error(err).into())
 }
 
 fn json_payload_error(err: actix_web::error::JsonPayloadError) -> AppError {
@@ -333,6 +338,20 @@ fn ensure_min_length(label: &str, value: &str, min: usize) -> Result<(), AppErro
         return Err(AppError::validation(format!("{label}至少 {min} 个字符")));
     }
     Ok(())
+}
+
+/// 可选字段的字符数区间；`None` 表示本次不更新。
+fn ensure_optional_length(
+    label: &str,
+    value: Option<&str>,
+    min: usize,
+    max: usize,
+) -> Result<(), AppError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    ensure_min_length(label, value, min)?;
+    ensure_max_length(label, value, max)
 }
 
 /// 校验并规范化 QQ 接口地址。
@@ -626,6 +645,7 @@ async fn patch_bot(
 
     // 先校验全部字段，再在同一事务里更新并写审计。
     if let Some(name) = data.name.as_deref() {
+        ensure_min_length("名称", name, 1)?;
         ensure_max_length("名称", name, BOT_TEXT_MAX)?;
     }
     if let Some(appid) = data.qq_appid.as_deref() {
@@ -850,6 +870,7 @@ async fn create_channel(
         let secret = if secret.is_empty() {
             random_token(32)
         } else {
+            ensure_max_length("Secret", &secret, BOT_SECRET_MAX)?;
             secret
         };
         extra = Some(json!({
@@ -1098,6 +1119,92 @@ async fn list_logs(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpR
         "page_size": page_size,
         "items": items,
     })))
+}
+
+/// `GET /api/admin/audit`
+///
+/// 仅超级管理员可查询；所有过滤条件均为精确匹配（keyword 除外）。
+async fn list_audit_logs(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, AppError> {
+    let actor = require_user(&state, &req).await?;
+    if !users::is_super_admin(&actor) {
+        return Err(AppError::forbidden("仅超级管理员可查看审计日志"));
+    }
+    let params = query_params(&req);
+    let page = parse_query_int(&params, "page", 1)?;
+    let page_size = parse_query_int(&params, "page_size", 50)?;
+    if page < 1 {
+        return Err(AppError::validation("page 必须大于等于 1"));
+    }
+    if !(1..=200).contains(&page_size) {
+        return Err(AppError::validation("page_size 需在 1 到 200 之间"));
+    }
+    let actor_user_id = match params.get("actor_user_id").filter(|v| !v.is_empty()) {
+        Some(raw) => Some(
+            raw.parse::<i64>()
+                .map_err(|_| AppError::validation("actor_user_id 必须为整数"))?,
+        ),
+        None => None,
+    };
+    let since = parse_query_time(&params, "since")?;
+    let until = parse_query_time(&params, "until")?;
+    if let (Some(since), Some(until)) = (since, until)
+        && since >= until
+    {
+        return Err(AppError::validation("since 必须早于 until"));
+    }
+
+    let query = audit::AuditQuery {
+        page,
+        page_size,
+        action: params.get("action").filter(|v| !v.is_empty()).cloned(),
+        actor_user_id,
+        target_type: params.get("target_type").filter(|v| !v.is_empty()).cloned(),
+        target_id: params.get("target_id").filter(|v| !v.is_empty()).cloned(),
+        keyword: params.get("keyword").filter(|v| !v.is_empty()).cloned(),
+        since,
+        until,
+    };
+    let page = audit::list_audits(&state.pool, &query).await?;
+    let items: Vec<Value> = page
+        .items
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "actor_user_id": row.actor_user_id,
+                "action": row.action,
+                "target_type": row.target_type,
+                "target_id": row.target_id,
+                "detail": row.detail,
+                "ip": row.ip,
+                "created_at": isoformat(row.created_at),
+            })
+        })
+        .collect();
+    Ok(HttpResponse::Ok().json(json!({
+        "total": page.total,
+        "page": page.page,
+        "page_size": page.page_size,
+        "items": items,
+    })))
+}
+
+/// 解析可选的 RFC3339 时间参数，统一转成 UTC naive。
+fn parse_query_time(
+    params: &HashMap<String, String>,
+    key: &str,
+) -> Result<Option<NaiveDateTime>, AppError> {
+    match params.get(key).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(raw) => {
+            let parsed = chrono::DateTime::parse_from_rfc3339(raw)
+                .map_err(|_| AppError::validation(format!("{key} 必须为 RFC3339 时间")))?;
+            Ok(Some(parsed.naive_utc()))
+        }
+    }
 }
 
 /// `GET /api/admin/logs/{log_id}`
@@ -1423,8 +1530,16 @@ async fn create_oauth_provider(
         if value.is_empty() {
             return Err(AppError::bad_request(format!("{field} 不能为空")));
         }
+        ensure_max_length(field, value, 512)?;
         require_https(value)?;
     }
+    ensure_max_length("scopes", &scopes, 255)?;
+    ensure_min_length("email_field", &email_field, 1)?;
+    ensure_max_length("email_field", &email_field, 64)?;
+    ensure_min_length("id_field", &id_field, 1)?;
+    ensure_max_length("id_field", &id_field, 64)?;
+    ensure_min_length("name_field", &name_field, 1)?;
+    ensure_max_length("name_field", &name_field, 64)?;
 
     if queries::oauth::find_by_key(&state.pool, &data.key)
         .await?
@@ -1495,6 +1610,21 @@ async fn patch_oauth_provider(
         return Err(AppError::not_found("提供方不存在"));
     };
     let data = body.into_inner();
+    ensure_optional_length("display_name", data.display_name.as_deref(), 1, 128)?;
+    ensure_optional_length("client_id", data.client_id.as_deref(), 1, 255)?;
+    ensure_optional_length("client_secret", data.client_secret.as_deref(), 0, 512)?;
+    ensure_optional_length(
+        "authorization_url",
+        data.authorization_url.as_deref(),
+        0,
+        512,
+    )?;
+    ensure_optional_length("token_url", data.token_url.as_deref(), 0, 512)?;
+    ensure_optional_length("userinfo_url", data.userinfo_url.as_deref(), 0, 512)?;
+    ensure_optional_length("scopes", data.scopes.as_deref(), 0, 255)?;
+    ensure_optional_length("email_field", data.email_field.as_deref(), 1, 64)?;
+    ensure_optional_length("id_field", data.id_field.as_deref(), 1, 64)?;
+    ensure_optional_length("name_field", data.name_field.as_deref(), 1, 64)?;
 
     for (field, value) in [
         ("authorization_url", data.authorization_url.as_deref()),

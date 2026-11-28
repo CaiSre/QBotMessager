@@ -193,3 +193,22 @@ export interface Stats {
     created_at: string | null;
   }[];
 }
+
+/** 后台审计记录（`admin_audit_logs` 一行）。 */
+export interface AuditLog {
+  id: number;
+  actor_user_id: number | null;
+  action: string;
+  target_type: string | null;
+  target_id: string | null;
+  detail: unknown;
+  ip: string | null;
+  created_at: string;
+}
+
+export interface AuditPage {
+  total: number;
+  page: number;
+  page_size: number;
+  items: AuditLog[];
+}

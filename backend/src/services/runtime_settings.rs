@@ -199,7 +199,7 @@ pub struct SettingSpec {
 }
 
 /// 全部设置项，顺序即管理页展示顺序。
-pub static CATALOG: [SettingSpec; 31] = [
+pub static CATALOG: [SettingSpec; 32] = [
     SettingSpec {
         key: "public_base_url",
         label: "对外访问地址",
@@ -341,6 +341,19 @@ pub static CATALOG: [SettingSpec; 31] = [
         maximum: None,
         options: &[],
         max_length: 128,
+        secret: false,
+    },
+    SettingSpec {
+        key: "passkey_require_uv",
+        label: "通行密钥强制用户验证",
+        group: GROUP_ACCOUNT,
+        kind: SettingKind::Bool,
+        default: SettingDefault::Bool(true),
+        description: "要求 Passkey 登录完成生物识别或设备 PIN；关闭后允许仅用户在场",
+        minimum: None,
+        maximum: None,
+        options: &[],
+        max_length: 512,
         secret: false,
     },
     SettingSpec {
@@ -991,6 +1004,11 @@ impl RuntimeSettings {
     /// WebAuthn 显示名。
     pub fn rp_name(&self) -> &str {
         self.str_value("rp_name")
+    }
+
+    /// 是否强制 Passkey 用户验证（UV）。
+    pub fn passkey_require_uv(&self) -> bool {
+        self.bool_value("passkey_require_uv")
     }
 
     /// 单账号失败上限。
