@@ -45,7 +45,7 @@
 - **明暗主题**：默认跟随系统，控制台侧边栏与登录页可手动切换，并记住选择。
 - **超级管理员**：可见并管理全部用户的资源；用户账号、邀请码、注册开关与 OAuth2 提供方仅超管可操作。
 - **多种登录方式**：用户名或邮箱密码、OAuth2 授权码、通行密钥（WebAuthn），服务端会话 Cookie。
-- **邮箱验证码**：配置 SMTP 后，注册、找回密码与 OAuth 账号首次设置密码需邮箱验证码；验证码邮件与站点风格一致。
+- **邮箱验证码**：配置 SMTP 后，注册、找回密码、修改邮箱与 OAuth 账号首次设置密码需邮箱验证码；验证码邮件与站点风格一致。
 - **推送审计**：记录钩子类型、推送来源、来源类型、目标、状态、错误码、耗时与请求 ID，支持分页与筛选。
 - **敏感数据加密**：QQ AppSecret、OAuth Client Secret 以 Fernet 密文入库。
 
@@ -162,7 +162,7 @@ docker compose up -d --build
 1. 创建超级管理员账号；
 2. 若配置了 `QQ_APPID` / `QQ_APP_SECRET`，导入默认机器人、默认推送目标与钉钉 / 企业微信 / 飞书三条通道（GitHub 通道需在「机器人」页手动创建）；
 3. 默认关闭注册入口，需要时在「安全设置」中开启，并在「用户管理」中生成邀请码。
-4. 如需邮箱验证码（注册验证、找回密码），先在「系统设置 → 邮件服务」填写 SMTP 服务器与发件人；未配置时注册仍只校验邀请码。
+4. 如需邮箱验证码（注册验证、找回密码、修改邮箱），先在「系统设置 → 邮件服务」填写 SMTP 服务器与发件人；注册发码前需先校验邀请码。
 
 ## 配置说明
 
@@ -255,7 +255,8 @@ curl -X POST http://localhost:3000/webhook/dingtalk \
 | | `POST /webhook/github/{token}` | GitHub Webhook，校验 `X-Hub-Signature-256` |
 | 认证 | `GET /api/auth/providers` | 注册开关、可用登录方式与邮件验证码开关（公开） |
 | | `POST /api/auth/login`、`/logout`、`/register` | 用户名或邮箱密码登录、退出、邀请码注册（配置 SMTP 后需邮箱验证码） |
-| | `POST /api/auth/email-code`、`/password/reset` | 发送注册/找回密码验证码、用验证码重置密码 |
+| | `POST /api/auth/email-code`、`/password/reset` | 发送注册/找回密码验证码、用验证码重置密码；注册发码需邀请码 |
+| | `PATCH /api/auth/me/email`、`POST /api/auth/me/email-code` | 修改邮箱需当前密码与新地址验证码 |
 | | `GET /api/auth/me` | 当前用户信息 |
 | | `GET /api/auth/oauth/{key}/start`、`/callback` | OAuth2 授权码流程；`start?invite_code=` 携带首次建号所需邀请码 |
 | | `GET /api/auth/passkey`、`POST /api/auth/passkey/*` | 通行密钥注册与登录 |

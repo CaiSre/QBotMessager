@@ -220,6 +220,9 @@ pub async fn validate_invite(
     {
         return Err(AppError::bad_request("邀请码已过期"));
     }
+    if invite.used_count >= invite.max_uses {
+        return Err(AppError::bad_request("邀请码已用尽"));
+    }
     if let Some(limited_email) = invite.email.as_deref()
         && limited_email.to_lowercase() != email
     {
@@ -584,15 +587,17 @@ pub async fn verify_current_password(
 
 /// 个人资料：修改邮箱。
 ///
-/// 账号已有密码时必须校验当前密码；无密码账号（仅 OAuth 创建）没有可验凭据，
-/// 不允许直接改邮箱，须先通过「设置密码」流程补齐密码。成功后吊销其他会话，
-/// 避免凭据泄露时旧设备仍以新邮箱维持登录。
+/// 账号已有密码时必须校验当前密码与新地址验证码；无密码账号（仅 OAuth 创建）
+/// 没有可验凭据，不允许直接改邮箱，须先通过「设置密码」流程补齐密码。
+/// 成功后吊销其他会话，避免凭据泄露时旧设备仍以新邮箱维持登录。
+#[allow(clippy::too_many_arguments)]
 pub async fn update_profile_email(
     pool: &MySqlPool,
     limiter: &AttemptLimiter,
     user: &User,
     email: &str,
     current_password: &str,
+    email_code: &str,
     keep_token: &str,
     ip: Option<&str>,
 ) -> Result<User, AppError> {
@@ -605,6 +610,14 @@ pub async fn update_profile_email(
     }
     if queries::users::email_taken(pool, &email, Some(user.id)).await? {
         return Err(AppError::conflict("该邮箱已被使用"));
+    }
+    if email_code.is_empty() {
+        return Err(AppError::bad_request("请填写邮箱验证码"));
+    }
+    if !email_codes::verify_code(pool, &email, email_codes::PURPOSE_CHANGE_EMAIL, email_code)
+        .await?
+    {
+        return Err(AppError::bad_request("邮箱验证码错误或已过期"));
     }
 
     queries::users::update_email(pool, user.id, &email)

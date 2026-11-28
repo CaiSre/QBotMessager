@@ -20,6 +20,7 @@ use sqlx::MySqlPool;
 
 use crate::crypto::{decrypt_secret, encrypt_secret};
 use crate::error::AppError;
+use crate::services::qq;
 use crate::services::throttle::{AttemptLimiter, IssueLimiter, LimiterRegistry};
 
 /// 站点与访问。
@@ -1246,6 +1247,12 @@ fn coerce_string(item: &SettingSpec, raw: &str) -> Result<SettingValue, String> 
     }
     if item.kind == SettingKind::Select && !item.options.contains(&value) {
         return Err(format!("「{}」取值非法", item.label));
+    }
+    if item.key == "qq_host" {
+        if value.is_empty() {
+            return Err(format!("「{}」不能为空", item.label));
+        }
+        qq::validate_host(value).map_err(|err| format!("「{}」{err}", item.label))?;
     }
     Ok(SettingValue::Str(value.to_string()))
 }

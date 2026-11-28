@@ -179,7 +179,19 @@ impl Config {
             bootstrap_admin_password: env_or("BOOTSTRAP_ADMIN_PASSWORD", ""),
             qq_appid: env_or("QQ_APPID", ""),
             qq_app_secret: env_or("QQ_APP_SECRET", ""),
-            openids: load_openids(env::var("OPENID").ok().as_deref()),
+            openids: {
+                let openids = load_openids(env::var("OPENID").ok().as_deref());
+                if let Some(invalid) = openids
+                    .iter()
+                    .find(|openid| !crate::services::qq::is_valid_target(openid))
+                {
+                    return Err(ConfigError::Invalid(
+                        "OPENID",
+                        format!("推送目标只能包含字母、数字、下划线和连字符：{invalid}"),
+                    ));
+                }
+                openids
+            },
             qq_allowed_hosts: split_list(&env_or("QQ_ALLOWED_HOSTS", DEFAULT_QQ_ALLOWED_HOSTS)),
             db_pool_size: parse_env("DB_POOL_SIZE", 10)?,
             db_max_overflow: parse_env("DB_MAX_OVERFLOW", 20)?,

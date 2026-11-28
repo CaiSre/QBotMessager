@@ -40,7 +40,7 @@ use qbotmessager::crypto::{encrypt_secret, hash_token};
 use qbotmessager::db::queries;
 use qbotmessager::markdown::{degrade_tables, sanitize_markdown, sanitize_text};
 use qbotmessager::renderer::{MSG_TYPE_MARKDOWN, MSG_TYPE_TEXT, render_qq, render_qq_with_limits};
-use qbotmessager::services::push::PushJob;
+use qbotmessager::services::push::{PushJob, execute_push};
 use qbotmessager::services::qq::QqTarget;
 use qbotmessager::services::queue::{PushQueue, QueueError, dedupe_key};
 use qbotmessager::services::runtime_settings::RuntimeSettings;
@@ -652,6 +652,37 @@ async fn request_target_overrides_default() {
 }
 
 #[actix_web::test]
+async fn rejects_unsafe_request_target() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    let owner = make_user(&fixture).await;
+    let bot_id = make_bot(&fixture, owner, &["u-default"], None).await;
+    let (_channel_id, token, _) = make_channel(&fixture, bot_id, "dingtalk").await;
+
+    let reply = send!(
+        app,
+        webhook_request(
+            "/webhook/dingtalk",
+            &json!({
+                "msgtype": "text",
+                "text": {"content": "x"},
+                "openid": "u/../admin?x=1",
+            }),
+            &token,
+        )
+    );
+    let reply = assert_status!(reply, StatusCode::BAD_REQUEST);
+    assert!(
+        reply.json()["errmsg"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("未指定推送目标")
+    );
+    assert!(fixture.mock.calls().is_empty(), "非法目标不应请求 QQ");
+}
+
+#[actix_web::test]
 async fn push_logs_recorded() {
     let _guard = TEST_LOCK.lock().await;
     let fixture = setup().await;
@@ -1166,6 +1197,204 @@ async fn queue_accepts_before_any_send() {
     );
 
     clear_push_jobs(&fixture.pool).await;
+}
+
+#[actix_web::test]
+async fn queued_push_rechecks_bot_and_channel_state() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup_with_queue(Some(20)).await;
+    clear_push_jobs(&fixture.pool).await;
+    let app = app!(fixture.state.clone());
+    let owner = make_user(&fixture).await;
+    let bot_id = make_bot(&fixture, owner, &["u-default"], None).await;
+    let (channel_id, token, _) = make_channel(&fixture, bot_id, "dingtalk").await;
+
+    let reply = send!(
+        app,
+        webhook_request(
+            "/webhook/dingtalk",
+            &json!({"msgtype": "text", "text": {"content": "停用后不应发送"}}),
+            &token,
+        )
+    );
+    assert_status!(reply, StatusCode::OK);
+    let rows: Vec<(Vec<u8>,)> =
+        sqlx::query_as("SELECT job FROM jobs WHERE job_type = 'push' AND status = 'Pending'")
+            .fetch_all(&fixture.pool)
+            .await
+            .expect("查询队列任务失败");
+    let job: PushJob = serde_json::from_slice(&rows[0].0).expect("队列任务必须是 PushJob");
+
+    let settings = fixture.state.settings().clone();
+    let limiter = fixture.state.limiters.get(&job.qq_account_key(&settings));
+
+    sqlx::query("UPDATE bot_profiles SET enabled = FALSE WHERE id = ?")
+        .bind(bot_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("停用机器人失败");
+    let outcome = execute_push(
+        &fixture.pool,
+        &job,
+        &settings,
+        &fixture.state.qq,
+        &limiter,
+        None,
+    )
+    .await;
+    assert!(!outcome.is_success());
+    assert!(!outcome.retryable);
+    assert!(fixture.mock.calls().is_empty(), "停用后不应请求 QQ");
+    let (status, code, bot_ref, channel_ref): (String, Option<String>, Option<i64>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT status, error_code, bot_profile_id, channel_id FROM push_logs \
+         WHERE owner_user_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(owner)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("查询推送日志失败");
+    assert_eq!(status, "failed");
+    assert_eq!(code.as_deref(), Some("bot_disabled"));
+    assert_eq!(bot_ref, Some(bot_id));
+    assert_eq!(channel_ref, None);
+
+    sqlx::query("UPDATE bot_profiles SET enabled = TRUE WHERE id = ?")
+        .bind(bot_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("启用机器人失败");
+    sqlx::query("UPDATE channels SET enabled = FALSE WHERE id = ?")
+        .bind(channel_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("停用通道失败");
+    execute_push(
+        &fixture.pool,
+        &job,
+        &settings,
+        &fixture.state.qq,
+        &limiter,
+        None,
+    )
+    .await;
+    let (code, bot_ref, channel_ref): (Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT error_code, bot_profile_id, channel_id FROM push_logs \
+         WHERE owner_user_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(owner)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("查询通道停用日志失败");
+    assert_eq!(code.as_deref(), Some("channel_disabled"));
+    assert_eq!(bot_ref, Some(bot_id));
+    assert_eq!(channel_ref, Some(channel_id));
+
+    sqlx::query("DELETE FROM channels WHERE id = ?")
+        .bind(channel_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("删除通道失败");
+    execute_push(
+        &fixture.pool,
+        &job,
+        &settings,
+        &fixture.state.qq,
+        &limiter,
+        None,
+    )
+    .await;
+    let (code, bot_ref, channel_ref): (Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT error_code, bot_profile_id, channel_id FROM push_logs \
+         WHERE owner_user_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(owner)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("查询通道删除日志失败");
+    assert_eq!(code.as_deref(), Some("channel_missing"));
+    assert_eq!(bot_ref, Some(bot_id));
+    assert_eq!(channel_ref, None);
+
+    sqlx::query("DELETE FROM bot_profiles WHERE id = ?")
+        .bind(bot_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("删除机器人失败");
+    execute_push(
+        &fixture.pool,
+        &job,
+        &settings,
+        &fixture.state.qq,
+        &limiter,
+        None,
+    )
+    .await;
+    let (code, bot_ref, channel_ref): (Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT error_code, bot_profile_id, channel_id FROM push_logs \
+         WHERE owner_user_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(owner)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("查询机器人删除日志失败");
+    assert_eq!(code.as_deref(), Some("bot_missing"));
+    assert_eq!(bot_ref, None);
+    assert_eq!(channel_ref, None);
+    assert!(fixture.mock.calls().is_empty(), "上下文失效时不应请求 QQ");
+
+    clear_push_jobs(&fixture.pool).await;
+}
+
+#[actix_web::test]
+async fn shared_http_client_does_not_follow_redirects() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("绑定重定向测试端口失败");
+    let addr = listener.local_addr().expect("读取重定向测试地址失败");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let state = web::Data::new(hits.clone());
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(state.clone())
+            .route(
+                "/redirect",
+                web::post().to(|| async {
+                    actix_web::HttpResponse::TemporaryRedirect()
+                        .insert_header((header::LOCATION, "/target"))
+                        .finish()
+                }),
+            )
+            .route(
+                "/target",
+                web::post().to(|hits: web::Data<Arc<AtomicUsize>>| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    actix_web::HttpResponse::Ok().finish()
+                }),
+            )
+    })
+    .workers(1)
+    .listen(listener)
+    .expect("启动重定向测试服务失败")
+    .run();
+    let handle = server.handle();
+    actix_web::rt::spawn(server);
+
+    let client = qbotmessager::services::http::client().expect("构造 HTTP 客户端失败");
+    let response = client
+        .post(format!("http://{addr}/redirect"))
+        .send()
+        .await
+        .expect("请求重定向测试服务失败");
+    assert_eq!(
+        response.status().as_u16(),
+        StatusCode::TEMPORARY_REDIRECT.as_u16()
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "客户端必须原样返回 3xx，不得跟随重定向"
+    );
+
+    drop(handle.stop(false));
 }
 
 #[actix_web::test]

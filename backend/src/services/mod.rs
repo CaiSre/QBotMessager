@@ -7,6 +7,7 @@
 
 pub mod audit;
 pub mod email_codes;
+pub mod http;
 pub mod mail;
 pub mod push;
 pub mod qq;

@@ -604,6 +604,72 @@ async fn bot_create_validates_qq_host_allowlist() {
         "QQ 接口地址必须是以 https:// 开头的完整地址"
     );
 
+    for (host, expected) in [
+        ("https://api.bot.qq.com:8443", "默认端口 443"),
+        ("https://api.bot.qq.com/v2", "不能包含路径"),
+        ("https://user@api.bot.qq.com", "不能包含用户信息"),
+    ] {
+        let reply = send!(
+            app,
+            post_json_with(
+                "/api/admin/bot-profiles",
+                &json!({
+                    "name": "x",
+                    "qq_appid": "hostcase",
+                    "qq_app_secret": "s",
+                    "qq_host": host,
+                }),
+                &auth
+            )
+        );
+        let reply = assert_status!(reply, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            reply.detail().contains(expected),
+            "host={host} detail={}",
+            reply.detail()
+        );
+    }
+
+    let bad_openid = send!(
+        app,
+        post_json_with(
+            "/api/admin/bot-profiles",
+            &json!({
+                "name": "x",
+                "qq_appid": "openidbad",
+                "qq_app_secret": "s",
+                "default_openids": ["ok", "bad/path"],
+            }),
+            &auth
+        )
+    );
+    let bad_openid = assert_status!(bad_openid, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        bad_openid.detail().contains("只能包含字母"),
+        "{}",
+        bad_openid.detail()
+    );
+
+    let bad_group = send!(
+        app,
+        post_json_with(
+            "/api/admin/bot-profiles",
+            &json!({
+                "name": "x",
+                "qq_appid": "groupbad",
+                "qq_app_secret": "s",
+                "default_group_openid": "g/1",
+            }),
+            &auth
+        )
+    );
+    let bad_group = assert_status!(bad_group, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        bad_group.detail().contains("只能包含字母"),
+        "{}",
+        bad_group.detail()
+    );
+
     let empty_name = send!(
         app,
         post_json_with(
@@ -1646,6 +1712,29 @@ async fn oauth_provider_crud_and_secret_masking() {
         "提供方 URL 必须为 https（本地开发可用 localhost）"
     );
 
+    // localhost 前缀不能把任意域名带入 HTTP 白名单。
+    let local_evil = send!(
+        app,
+        post_json_with(
+            "/api/admin/oauth-providers",
+            &json!({
+                "key": format!("local{}", fixture.prefix),
+                "display_name": "x",
+                "client_id": "x",
+                "client_secret": "x",
+                "authorization_url": "http://localhost.evil.example/auth",
+                "token_url": "https://x.example/token",
+                "userinfo_url": "https://x.example/me",
+            }),
+            &auth
+        )
+    );
+    let local_evil = assert_status!(local_evil, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        local_evil.detail(),
+        "提供方 URL 必须为 https（本地开发可用 localhost）"
+    );
+
     // 修改：密钥重新加密，邮箱可信度可切换。
     let new_secret = "rotated-client-secret";
     let patched = send!(
@@ -1993,6 +2082,9 @@ async fn settings_invalid_values_are_rejected() {
         json!({"unknown_key": 1}),
         json!({"qq_min_interval": 61}),
         json!({"rp_name": "x".repeat(129)}),
+        json!({"qq_host": "http://api.bot.qq.com"}),
+        json!({"qq_host": "https://api.bot.qq.com:8443"}),
+        json!({"qq_host": "https://api.bot.qq.com/path"}),
     ];
     for body in cases {
         let reply = send!(app, patch_json_with("/api/admin/settings", &body, &auth));

@@ -37,8 +37,6 @@ use crate::state::AppState;
 
 /// 默认目标数量上限。
 const MAX_FANOUT: usize = 50;
-/// 单个目标 openid 长度上限。
-const MAX_TARGET_LEN: usize = 128;
 /// 钩子事件头。
 const GITHUB_EVENT_HEADER: &str = "X-GitHub-Event";
 /// 钩子投递 ID 头。
@@ -569,7 +567,7 @@ fn resolve_targets(payload: &Value, bot: &BotProfile) -> Vec<QqTarget> {
             .unwrap_or("")
             .trim();
         if !group_openid.is_empty() {
-            return if group_openid.chars().count() <= MAX_TARGET_LEN {
+            return if crate::services::qq::is_valid_target(group_openid) {
                 vec![QqTarget::group(group_openid)]
             } else {
                 Vec::new()
@@ -581,7 +579,7 @@ fn resolve_targets(payload: &Value, bot: &BotProfile) -> Vec<QqTarget> {
             .unwrap_or("")
             .trim();
         if !openid.is_empty() {
-            return if openid.chars().count() <= MAX_TARGET_LEN {
+            return if crate::services::qq::is_valid_target(openid) {
                 vec![QqTarget::user(openid)]
             } else {
                 Vec::new()
@@ -591,7 +589,11 @@ fn resolve_targets(payload: &Value, bot: &BotProfile) -> Vec<QqTarget> {
 
     let group_default = bot.default_group_openid.as_deref().unwrap_or("").trim();
     if !group_default.is_empty() {
-        return vec![QqTarget::group(group_default)];
+        return if crate::services::qq::is_valid_target(group_default) {
+            vec![QqTarget::group(group_default)]
+        } else {
+            Vec::new()
+        };
     }
     bot.default_openids
         .as_array()
@@ -600,7 +602,7 @@ fn resolve_targets(payload: &Value, bot: &BotProfile) -> Vec<QqTarget> {
                 .iter()
                 .take(MAX_FANOUT)
                 .filter_map(Value::as_str)
-                .filter(|openid| !openid.is_empty())
+                .filter(|openid| crate::services::qq::is_valid_target(openid))
                 .map(QqTarget::user)
                 .collect()
         })

@@ -47,6 +47,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/me/verify", web::post().to(verify_identity))
             .route("/me/name", web::patch().to(update_name))
             .route("/me/email", web::patch().to(update_email))
+            .route("/me/email-code", web::post().to(request_email_change_code))
             .route("/me/password", web::patch().to(update_password))
             .route("/me/password-code", web::post().to(request_password_code))
             .route("/email-code", web::post().to(request_email_code))
@@ -108,6 +109,8 @@ struct RegisterIn {
 struct EmailCodeIn {
     email: String,
     purpose: String,
+    #[serde(default)]
+    invite_code: String,
 }
 
 /// 通过邮箱验证码重置密码。
@@ -124,9 +127,19 @@ struct NameIn {
     name: String,
 }
 
-/// 修改邮箱；已有密码的账号必须提供当前密码。
+/// 修改邮箱；已有密码的账号必须提供当前密码与新地址验证码。
 #[derive(Debug, Deserialize)]
 struct EmailChangeIn {
+    email: String,
+    #[serde(default)]
+    current_password: String,
+    #[serde(default)]
+    email_code: String,
+}
+
+/// 发送新邮箱验证码；必须验证当前密码。
+#[derive(Debug, Deserialize)]
+struct EmailChangeCodeIn {
     email: String,
     #[serde(default)]
     current_password: String,
@@ -288,6 +301,9 @@ async fn update_email(
 ) -> Result<HttpResponse, AppError> {
     let user = require_user(&state, &req).await?;
     validate_optional_password(&body.current_password)?;
+    if !body.email_code.is_empty() {
+        validate_code_field(&body.email_code)?;
+    }
     let email = validate_email_input(&body.email)?;
     let token = session_token(&state, &req);
     let ip = state.client_ip(&req);
@@ -297,12 +313,53 @@ async fn update_email(
         &user,
         &email,
         &body.current_password,
+        &body.email_code,
         &token,
         ip.as_deref(),
     )
     .await?;
     sessions::mark_verified(&state.pool, &token, Utc::now().naive_utc()).await?;
     Ok(HttpResponse::Ok().json(user_payload(&updated)))
+}
+
+/// `POST /api/auth/me/email-code`
+///
+/// 向新邮箱发送验证码；必须先验证当前密码，避免仅凭会话触发邮件。
+async fn request_email_change_code(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<EmailChangeCodeIn>,
+) -> Result<HttpResponse, AppError> {
+    let user = require_user(&state, &req).await?;
+    validate_optional_password(&body.current_password)?;
+    let settings = (*state.settings()).clone();
+    if !mail::is_configured(&settings) {
+        return Err(AppError::database_busy("邮件服务未配置"));
+    }
+    let email = validate_email_input(&body.email)?;
+    if email == user.email {
+        return Err(AppError::validation("新邮箱不能与当前邮箱相同"));
+    }
+    let ip = state.client_ip(&req);
+    users::verify_current_password(
+        &state.login_limiter,
+        ip.as_deref(),
+        &user,
+        &body.current_password,
+    )
+    .await?;
+    if queries::users::email_taken(&state.pool, &email, Some(user.id)).await? {
+        return Err(AppError::conflict("该邮箱已被使用"));
+    }
+    let response = send_code(
+        &state,
+        &settings,
+        &email,
+        email_codes::PURPOSE_CHANGE_EMAIL,
+        ip.as_deref(),
+    )
+    .await?;
+    Ok(HttpResponse::Ok().json(response))
 }
 
 /// `PATCH /api/auth/me/password`
@@ -393,6 +450,9 @@ async fn request_email_code(
     }
 
     if body.purpose == email_codes::PURPOSE_REGISTER {
+        // 邀请码校验先于邮箱查询：无邀请码时，无论邮箱是否已注册都返回同一错误，
+        // 避免把发码接口变成注册状态探测器。
+        users::validate_invite(&state.pool, &body.invite_code, &email).await?;
         if queries::users::find_by_email(&state.pool, &email)
             .await?
             .is_some()
@@ -1396,7 +1456,7 @@ fn validate_email_input(raw: &str) -> Result<String, AppError> {
     Ok(email)
 }
 
-/// 邮箱验证码用途（`register` 或 `reset_password`）。
+/// 公开发码接口用途（`register` 或 `reset_password`）。
 fn validate_email_code_purpose(purpose: &str) -> Result<(), AppError> {
     match purpose {
         email_codes::PURPOSE_REGISTER | email_codes::PURPOSE_RESET_PASSWORD => Ok(()),

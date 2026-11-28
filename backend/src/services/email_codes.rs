@@ -18,11 +18,14 @@ pub const PURPOSE_REGISTER: &str = "register";
 pub const PURPOSE_RESET_PASSWORD: &str = "reset_password";
 /// 设置密码用途。
 pub const PURPOSE_SET_PASSWORD: &str = "set_password";
+/// 更换邮箱用途。
+pub const PURPOSE_CHANGE_EMAIL: &str = "change_email";
 /// 全部合法用途。
-pub const PURPOSES: [&str; 3] = [
+pub const PURPOSES: [&str; 4] = [
     PURPOSE_REGISTER,
     PURPOSE_RESET_PASSWORD,
     PURPOSE_SET_PASSWORD,
+    PURPOSE_CHANGE_EMAIL,
 ];
 
 /// 单条验证码的最大失败次数。
@@ -39,6 +42,7 @@ pub fn purpose_label(purpose: &str) -> &'static str {
         PURPOSE_REGISTER => "注册账号",
         PURPOSE_RESET_PASSWORD => "重置密码",
         PURPOSE_SET_PASSWORD => "设置登录密码",
+        PURPOSE_CHANGE_EMAIL => "更换登录邮箱",
         _ => "验证身份",
     }
 }
@@ -262,6 +266,7 @@ mod tests {
         assert!(is_valid_purpose(PURPOSE_REGISTER));
         assert!(is_valid_purpose(PURPOSE_RESET_PASSWORD));
         assert!(is_valid_purpose(PURPOSE_SET_PASSWORD));
+        assert!(is_valid_purpose(PURPOSE_CHANGE_EMAIL));
         assert!(!is_valid_purpose("login"));
         assert!(!is_valid_purpose(""));
     }
@@ -271,6 +276,7 @@ mod tests {
         assert_eq!(purpose_label(PURPOSE_REGISTER), "注册账号");
         assert_eq!(purpose_label(PURPOSE_RESET_PASSWORD), "重置密码");
         assert_eq!(purpose_label(PURPOSE_SET_PASSWORD), "设置登录密码");
+        assert_eq!(purpose_label(PURPOSE_CHANGE_EMAIL), "更换登录邮箱");
         assert_eq!(purpose_label("other"), "验证身份");
     }
 

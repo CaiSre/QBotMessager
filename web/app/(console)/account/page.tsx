@@ -34,6 +34,7 @@ export default function AccountPage() {
   const refreshMe = useRefreshMe();
   const meta = useApi<AuthMeta>("/api/auth/providers");
   const emailCodeSender = useEmailCode();
+  const changeEmailCodeSender = useEmailCode();
   const needsEmailCode =
     !me.has_password && (meta.data?.email_code_enabled ?? false);
 
@@ -46,6 +47,7 @@ export default function AccountPage() {
 
   const [email, setEmail] = useState(me.email);
   const [emailPassword, setEmailPassword] = useState("");
+  const [emailCode, setEmailCode] = useState("");
   const [emailError, setEmailError] = useState<string | null>(null);
 
   const [currentPassword, setCurrentPassword] = useState("");
@@ -82,12 +84,20 @@ export default function AccountPage() {
   async function saveEmail(event: React.FormEvent) {
     event.preventDefault();
     const value = email.trim();
+    if (!me.has_password) {
+      setEmailError("请先设置密码后再修改邮箱");
+      return;
+    }
     if (!isEmail(value)) {
       setEmailError("邮箱格式不正确");
       return;
     }
-    if (me.has_password && !emailPassword) {
+    if (!emailPassword) {
       setEmailError("请输入当前密码");
+      return;
+    }
+    if (value !== me.email && !emailCode.trim()) {
+      setEmailError("请输入新邮箱验证码");
       return;
     }
     setEmailError(null);
@@ -97,10 +107,15 @@ export default function AccountPage() {
     try {
       const updated = await api<{ email: string }>("/api/auth/me/email", {
         method: "PATCH",
-        body: { email: value, current_password: emailPassword },
+        body: {
+          email: value,
+          current_password: emailPassword,
+          email_code: emailCode.trim(),
+        },
       });
       setEmail(updated.email);
       setEmailPassword("");
+      setEmailCode("");
       await refreshMe();
       setNotice("邮箱已更新，之后请使用新邮箱或用户名登录");
     } catch (err) {
@@ -243,25 +258,68 @@ export default function AccountPage() {
                   <FieldError>{emailError}</FieldError>
                 </Field>
                 {me.has_password ? (
-                  <Field>
-                    <FieldLabel htmlFor="account-email-password">当前密码</FieldLabel>
-                    <Input
-                      autoComplete="current-password"
-                      id="account-email-password"
-                      maxLength={256}
-                      type="password"
-                      value={emailPassword}
-                      onChange={(event) => setEmailPassword(event.target.value)}
+                  <>
+                    <Field>
+                      <FieldLabel htmlFor="account-email-password">当前密码</FieldLabel>
+                      <Input
+                        autoComplete="current-password"
+                        id="account-email-password"
+                        maxLength={256}
+                        type="password"
+                        value={emailPassword}
+                        onChange={(event) => setEmailPassword(event.target.value)}
+                      />
+                      <FieldDescription>修改邮箱需要验证当前密码。</FieldDescription>
+                    </Field>
+                    <EmailCodeField
+                      cooldown={changeEmailCodeSender.cooldown}
+                      error={changeEmailCodeSender.error}
+                      id="account-email-code"
+                      sending={changeEmailCodeSender.sending}
+                      value={emailCode}
+                      onChange={(value) => {
+                        setEmailCode(value);
+                        if (emailError) setEmailError(null);
+                      }}
+                      onSend={() => {
+                        const value = email.trim();
+                        if (!isEmail(value)) {
+                          setEmailError("请先填写正确的邮箱");
+                          return;
+                        }
+                        if (value === me.email) {
+                          setEmailError("新邮箱不能与当前邮箱相同");
+                          return;
+                        }
+                        if (!emailPassword) {
+                          setEmailError("请输入当前密码");
+                          return;
+                        }
+                        void changeEmailCodeSender.send(
+                          "/api/auth/me/email-code",
+                          {
+                            email: value,
+                            current_password: emailPassword,
+                          },
+                        );
+                      }}
                     />
-                    <FieldDescription>修改邮箱需要验证当前密码。</FieldDescription>
-                  </Field>
+                    {changeEmailCodeSender.notice ? (
+                      <p className="-mt-2 text-xs text-muted-foreground">
+                        {changeEmailCodeSender.notice}
+                      </p>
+                    ) : null}
+                  </>
                 ) : (
                   <FieldDescription>
-                    该账号通过第三方登录创建，尚未设置密码，修改邮箱无需验证密码。
+                    该账号通过第三方登录创建，请先在下方设置密码后再修改邮箱。
                   </FieldDescription>
                 )}
                 <div className="flex justify-end">
-                  <Button disabled={busy !== null} type="submit">
+                  <Button
+                    disabled={busy !== null || !me.has_password}
+                    type="submit"
+                  >
                     {busy === "email" ? "保存中…" : "保存邮箱"}
                   </Button>
                 </div>

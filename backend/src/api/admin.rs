@@ -37,6 +37,7 @@ use crate::db::queries::channels::NewChannel;
 use crate::db::queries::invites::NewInviteCode;
 use crate::error::AppError;
 use crate::services::audit::{self, AuditEntry};
+use crate::services::qq;
 use crate::services::runtime_settings::{
     self, RuntimeSettings, SettingKind, SettingSource, SettingValue,
 };
@@ -45,8 +46,6 @@ use crate::state::AppState;
 
 /// 默认目标数量上限。
 const MAX_DEFAULT_TARGETS: usize = 50;
-/// 单个目标 openid 长度上限。
-const MAX_TARGET_LEN: usize = 128;
 /// 机器人名称 / AppID 上限。
 const BOT_TEXT_MAX: usize = 128;
 /// AppSecret 上限。
@@ -342,21 +341,9 @@ fn validate_qq_host(value: &str, allowed_hosts: &[String]) -> Result<String, App
     if value.is_empty() {
         return Ok("https://api.bot.qq.com".to_string());
     }
+    qq::validate_host(value).map_err(AppError::validation)?;
     let parsed = url::Url::parse(value)
         .map_err(|_| AppError::validation("QQ 接口地址必须是以 https:// 开头的完整地址"))?;
-    if parsed.scheme() != "https" || parsed.host().is_none() {
-        return Err(AppError::validation(
-            "QQ 接口地址必须是以 https:// 开头的完整地址",
-        ));
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(AppError::validation("QQ 接口地址不能包含用户信息"));
-    }
-    if parsed.query().is_some_and(|value| !value.is_empty())
-        || parsed.fragment().is_some_and(|value| !value.is_empty())
-    {
-        return Err(AppError::validation("QQ 接口地址不能包含查询参数或锚点"));
-    }
     let Some(hostname) = parsed.host_str() else {
         return Err(AppError::validation(
             "QQ 接口地址必须是以 https:// 开头的完整地址",
@@ -367,6 +354,18 @@ fn validate_qq_host(value: &str, allowed_hosts: &[String]) -> Result<String, App
         .any(|item| item.trim().eq_ignore_ascii_case(hostname));
     if !allowed {
         return Err(AppError::validation("QQ 接口地址不在允许的主机列表中"));
+    }
+    Ok(value.to_string())
+}
+
+/// 校验单个推送目标（默认群 openid 等）。
+fn validate_target(label: &str, value: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if !qq::is_valid_target(value) {
+        return Err(AppError::validation(format!(
+            "{label}只能包含字母、数字、下划线和连字符，且最长 {} 个字符",
+            qq::MAX_TARGET_LEN
+        )));
     }
     Ok(value.to_string())
 }
@@ -384,12 +383,7 @@ fn validate_openids(values: &[String]) -> Result<Vec<String>, AppError> {
         if item.is_empty() {
             continue;
         }
-        if item.chars().count() > MAX_TARGET_LEN {
-            return Err(AppError::validation(format!(
-                "单个 openid 最长 {MAX_TARGET_LEN} 个字符"
-            )));
-        }
-        out.push(item.to_string());
+        out.push(validate_target("单个 openid", item)?);
     }
     Ok(out)
 }
@@ -569,10 +563,13 @@ async fn create_bot(
     ensure_max_length("AppSecret", &data.qq_app_secret, BOT_SECRET_MAX)?;
     let qq_host = validate_qq_host(&data.qq_host, &state.config.qq_allowed_hosts)?;
     let openids = validate_openids(&data.default_openids)?;
-    let group_openid = data.default_group_openid.filter(|value| !value.is_empty());
-    if let Some(group) = group_openid.as_deref() {
-        ensure_max_length("默认群 openid", group, MAX_TARGET_LEN)?;
-    }
+    let group_openid = data
+        .default_group_openid
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| validate_target("默认群 openid", value))
+        .transpose()?;
 
     let encrypted = encrypt_secret(&data.qq_app_secret, state.config.app_secret_key.as_deref());
     let openids_value = Value::Array(openids.into_iter().map(Value::String).collect());
@@ -646,9 +643,18 @@ async fn patch_bot(
         Some(values) => Some(validate_openids(values)?),
         None => None,
     };
-    if let Some(group) = data.default_group_openid.as_deref() {
-        ensure_max_length("默认群 openid", group, MAX_TARGET_LEN)?;
-    }
+    let group_openid = data
+        .default_group_openid
+        .as_deref()
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                Ok(None)
+            } else {
+                validate_target("默认群 openid", value).map(Some)
+            }
+        })
+        .transpose()?;
     let new_appid = data.qq_appid.clone();
 
     let mut fields: Vec<&'static str> = Vec::new();
@@ -698,12 +704,11 @@ async fn patch_bot(
         has_updates = true;
         fields.push("default_openids");
     }
-    if let Some(group) = data.default_group_openid {
-        let value = if group.is_empty() { None } else { Some(group) };
+    if let Some(group) = group_openid {
         update
             .push(separator)
             .push("default_group_openid = ")
-            .push_bind(value);
+            .push_bind(group);
         separator = ", ";
         has_updates = true;
         fields.push("default_group_openid");
@@ -1668,17 +1673,33 @@ async fn delete_oauth_provider(
     Ok(HttpResponse::Ok().json(json!({"ok": true})))
 }
 
-/// 提供方 URL 必须是 https（本地开发允许 localhost）。
+/// 提供方 URL 必须是 https（本地开发允许 localhost/回环地址的 http）。
 fn require_https(value: &str) -> Result<(), AppError> {
-    if value.starts_with("https://")
-        || value.starts_with("http://localhost")
-        || value.starts_with("http://127.0.0.1")
+    let parsed = url::Url::parse(value)
+        .map_err(|_| AppError::bad_request("提供方 URL 必须为 https（本地开发可用 localhost）"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AppError::bad_request("提供方 URL 不能包含用户信息"));
+    }
+    if parsed.query().is_some_and(|value| !value.is_empty())
+        || parsed.fragment().is_some_and(|value| !value.is_empty())
     {
-        Ok(())
-    } else {
-        Err(AppError::bad_request(
+        return Err(AppError::bad_request("提供方 URL 不能包含查询参数或锚点"));
+    }
+    let local = parsed
+        .host_str()
+        .map(|host| {
+            matches!(
+                host.trim_matches(['[', ']']).to_ascii_lowercase().as_str(),
+                "localhost" | "127.0.0.1" | "::1"
+            )
+        })
+        .unwrap_or(false);
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if local => Ok(()),
+        _ => Err(AppError::bad_request(
             "提供方 URL 必须为 https（本地开发可用 localhost）",
-        ))
+        )),
     }
 }
 
@@ -1710,6 +1731,13 @@ async fn patch_settings(
     let Value::Object(changes) = body.into_inner() else {
         return Err(AppError::validation("请求体必须是 JSON 对象"));
     };
+    if let Some(Value::String(value)) = changes.get("qq_host") {
+        if value.trim().is_empty() {
+            return Err(AppError::bad_request("QQ API 域名不能为空"));
+        }
+        validate_qq_host(value, &state.config.qq_allowed_hosts)
+            .map_err(|err| AppError::bad_request(err.detail().to_string()))?;
+    }
 
     let values = {
         let runtime = state.settings();

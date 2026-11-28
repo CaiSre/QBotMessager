@@ -1326,11 +1326,50 @@ async fn profile_email_update_requires_password() {
     let conflict = assert_status!(conflict, StatusCode::CONFLICT);
     assert_eq!(conflict.detail(), "该邮箱已被使用");
 
-    let updated = send!(
+    let no_code = send!(
         app,
         patch_json_with(
             "/api/auth/me/email",
             &json!({"email": new_email, "current_password": PASSWORD}),
+            &[("sid", token.as_str())]
+        )
+    );
+    let no_code = assert_status!(no_code, StatusCode::BAD_REQUEST);
+    assert_eq!(no_code.detail(), "请填写邮箱验证码");
+
+    let wrong_code = send!(
+        app,
+        patch_json_with(
+            "/api/auth/me/email",
+            &json!({
+                "email": new_email,
+                "current_password": PASSWORD,
+                "email_code": "000000",
+            }),
+            &[("sid", token.as_str())]
+        )
+    );
+    let wrong_code = assert_status!(wrong_code, StatusCode::BAD_REQUEST);
+    assert_eq!(wrong_code.detail(), "邮箱验证码错误或已过期");
+
+    insert_email_code(
+        &fixture,
+        &new_email.to_lowercase(),
+        "change_email",
+        "246810",
+        Utc::now().naive_utc(),
+        false,
+    )
+    .await;
+    let updated = send!(
+        app,
+        patch_json_with(
+            "/api/auth/me/email",
+            &json!({
+                "email": new_email,
+                "current_password": PASSWORD,
+                "email_code": "246810",
+            }),
             &[("sid", token.as_str())]
         )
     );
@@ -1366,6 +1405,83 @@ async fn profile_email_update_requires_password() {
     );
     let invalid = assert_status!(invalid, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(invalid.detail(), "邮箱格式非法");
+}
+
+#[actix_web::test]
+async fn email_change_code_requires_password_and_new_address() {
+    let _guard = TEST_LOCK.lock().await;
+    let fixture = setup().await;
+    let app = app!(fixture.state.clone());
+    fixture.configure_mail();
+    let account = make_account(
+        &fixture,
+        "mailcode",
+        Some(PASSWORD),
+        ROLE_USER,
+        STATUS_ACTIVE,
+    )
+    .await;
+    let other = make_account(
+        &fixture,
+        "mailcodeother",
+        Some(PASSWORD),
+        ROLE_USER,
+        STATUS_ACTIVE,
+    )
+    .await;
+    let token = token_for(&fixture, account.id).await;
+    let auth = [("sid", token.as_str())];
+
+    let anonymous = send!(
+        app,
+        post_json(
+            "/api/auth/me/email-code",
+            &json!({
+                "email": format!("{}-new@example.com", fixture.prefix),
+                "current_password": PASSWORD,
+            })
+        )
+    );
+    assert_status!(anonymous, StatusCode::UNAUTHORIZED);
+
+    let no_password = send!(
+        app,
+        post_json_with(
+            "/api/auth/me/email-code",
+            &json!({"email": format!("{}-new@example.com", fixture.prefix)}),
+            &auth
+        )
+    );
+    let no_password = assert_status!(no_password, StatusCode::BAD_REQUEST);
+    assert_eq!(no_password.detail(), "当前密码错误");
+
+    let same = send!(
+        app,
+        post_json_with(
+            "/api/auth/me/email-code",
+            &json!({
+                "email": account.email,
+                "current_password": PASSWORD,
+            }),
+            &auth
+        )
+    );
+    let same = assert_status!(same, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(same.detail(), "新邮箱不能与当前邮箱相同");
+
+    let taken = send!(
+        app,
+        post_json_with(
+            "/api/auth/me/email-code",
+            &json!({
+                "email": other.email,
+                "current_password": PASSWORD,
+            }),
+            &auth
+        )
+    );
+    let taken = assert_status!(taken, StatusCode::CONFLICT);
+    assert_eq!(taken.detail(), "该邮箱已被使用");
 }
 
 #[actix_web::test]
@@ -1600,7 +1716,7 @@ async fn mail_unconfigured_providers_and_errors() {
         post_json(
             "/api/auth/register",
             &json!({
-                "invite_code": invite,
+                "invite_code": &invite,
                 "email": format!("{}-nomailreg@example.com", fixture.prefix),
                 "password": PASSWORD,
                 "name": format!("{}-nomailreg", fixture.prefix),
@@ -1695,6 +1811,20 @@ async fn register_requires_email_code_when_mail_configured() {
     )
     .await;
     let email = format!("{}-mailreg@example.com", fixture.prefix);
+
+    let no_invite = send!(
+        app,
+        post_json(
+            "/api/auth/email-code",
+            &json!({"email": email, "purpose": "register"})
+        )
+    );
+    let no_invite = assert_status!(no_invite, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        no_invite.detail().contains("邀请码"),
+        "{}",
+        no_invite.detail()
+    );
 
     let missing = send!(
         app,
@@ -1832,6 +1962,15 @@ async fn email_code_resend_cooldown_and_hourly_quota() {
     );
 
     // 已注册邮箱请求注册验证码时静默成功且不发信（防枚举）。
+    let invite = create_invite(
+        &fixture,
+        "codesilent",
+        1,
+        None,
+        Some(Utc::now().naive_utc() + Duration::days(1)),
+        None,
+    )
+    .await;
     let before: i64 = sqlx::query_scalar(
         "SELECT CAST(COUNT(*) AS SIGNED) FROM email_verification_codes WHERE email = ? AND purpose = 'register'",
     )
@@ -1843,7 +1982,11 @@ async fn email_code_resend_cooldown_and_hourly_quota() {
         app,
         post_json(
             "/api/auth/email-code",
-            &json!({"email": account.email, "purpose": "register"})
+            &json!({
+                "email": account.email,
+                "purpose": "register",
+                "invite_code": &invite,
+            })
         )
     );
     let silent = assert_status!(silent, StatusCode::OK);
@@ -1878,6 +2021,15 @@ async fn email_code_rate_limited_by_source_ip() {
         STATUS_ACTIVE,
     )
     .await;
+    let invite = create_invite(
+        &fixture,
+        "iplimit",
+        10,
+        None,
+        Some(Utc::now().naive_utc() + Duration::days(1)),
+        None,
+    )
+    .await;
 
     for _ in 0..2 {
         let ok = send!(
@@ -1885,7 +2037,11 @@ async fn email_code_rate_limited_by_source_ip() {
             post_json_from(
                 "203.0.113.5",
                 "/api/auth/email-code",
-                &json!({"email": account.email, "purpose": "register"})
+                &json!({
+                    "email": account.email,
+                    "purpose": "register",
+                    "invite_code": &invite,
+                })
             )
         );
         assert_status!(ok, StatusCode::OK);
@@ -1896,7 +2052,11 @@ async fn email_code_rate_limited_by_source_ip() {
         post_json_from(
             "203.0.113.5",
             "/api/auth/email-code",
-            &json!({"email": account.email, "purpose": "register"})
+            &json!({
+                "email": account.email,
+                "purpose": "register",
+                "invite_code": &invite,
+            })
         )
     );
     let blocked = assert_status!(blocked, StatusCode::TOO_MANY_REQUESTS);
@@ -1923,7 +2083,8 @@ async fn email_code_rate_limited_by_source_ip() {
             "/api/auth/email-code",
             &json!({
                 "email": format!("{}-nobody@example.com", fixture.prefix),
-                "purpose": "register"
+                "purpose": "register",
+                "invite_code": &invite,
             })
         )
     );
@@ -1935,7 +2096,11 @@ async fn email_code_rate_limited_by_source_ip() {
         post_json_from(
             "203.0.113.7",
             "/api/auth/email-code",
-            &json!({"email": account.email, "purpose": "register"})
+            &json!({
+                "email": account.email,
+                "purpose": "register",
+                "invite_code": &invite,
+            })
         )
     );
     assert_status!(other, StatusCode::OK);

@@ -20,6 +20,8 @@ use crate::services::throttle::RateLimiter;
 
 /// 默认 QQ API 域名。
 pub const DEFAULT_HOST: &str = "https://api.bot.qq.com";
+/// 单个推送目标的最大字符数。
+pub const MAX_TARGET_LEN: usize = 128;
 /// 主动消息超频错误码。
 pub const ERR_RATE_LIMIT: i64 = 40034100;
 /// 消息去重错误码（视为成功）。
@@ -32,6 +34,49 @@ const TOKEN_REFRESH_AHEAD: i64 = 60;
 const INITIAL_BACKOFF: f64 = 0.5;
 /// 退避上限（秒）。
 const MAX_BACKOFF: f64 = 8.0;
+
+/// 推送目标是否安全：仅允许字母、数字、下划线与连字符，且不超长。
+///
+/// openid 会直接拼进 QQ API 路径；允许 `/`、`?`、`#` 或 `..`
+/// 会改变请求路径或查询串。
+pub fn is_valid_target(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.chars().count() <= MAX_TARGET_LEN
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+/// 校验 QQ API 域名格式：必须为 https、默认端口、根路径，且无用户信息/查询/锚点。
+///
+/// 主机是否在允许列表由调用方另行判断；此函数只做与配置位置无关的语法校验。
+pub fn validate_host(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("QQ 接口地址不能为空".to_string());
+    }
+    let parsed = url::Url::parse(value)
+        .map_err(|_| "QQ 接口地址必须是以 https:// 开头的完整地址".to_string())?;
+    if parsed.scheme() != "https" || parsed.host().is_none() {
+        return Err("QQ 接口地址必须是以 https:// 开头的完整地址".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("QQ 接口地址不能包含用户信息".to_string());
+    }
+    if parsed.port().is_some_and(|port| port != 443) {
+        return Err("QQ 接口地址只能使用默认端口 443".to_string());
+    }
+    if !matches!(parsed.path(), "" | "/") {
+        return Err("QQ 接口地址不能包含路径".to_string());
+    }
+    if parsed.query().is_some_and(|value| !value.is_empty())
+        || parsed.fragment().is_some_and(|value| !value.is_empty())
+    {
+        return Err("QQ 接口地址不能包含查询参数或锚点".to_string());
+    }
+    Ok(())
+}
 
 /// 一次推送的目标：群或用户。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +127,13 @@ impl QqTarget {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
+            if !is_valid_target(group_openid) {
+                return Err(QqError::new(
+                    "invalid_target",
+                    "群 openid 只能包含字母、数字、下划线和连字符",
+                    false,
+                ));
+            }
             return Ok(format!("/v2/groups/{group_openid}/messages"));
         }
         if let Some(openid) = self
@@ -90,6 +142,13 @@ impl QqTarget {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
+            if !is_valid_target(openid) {
+                return Err(QqError::new(
+                    "invalid_target",
+                    "用户 openid 只能包含字母、数字、下划线和连字符",
+                    false,
+                ));
+            }
             return Ok(format!("/v2/users/{openid}/messages"));
         }
         Err(QqError::new("invalid_target", "推送目标为空", false))
@@ -500,6 +559,45 @@ mod tests {
             "/v2/users/u1/messages"
         );
         assert!(QqTarget::default().path().is_err());
+    }
+
+    #[test]
+    fn targets_are_limited_to_safe_path_characters() {
+        for valid in ["u1", "A-Z_09", "group-123"] {
+            assert!(is_valid_target(valid), "{valid}");
+            assert!(QqTarget::user(valid).path().is_ok(), "{valid}");
+        }
+        for invalid in [
+            "",
+            " ",
+            "a/b",
+            "a?b",
+            "a#b",
+            "../x",
+            "a b",
+            "用户",
+            &"a".repeat(MAX_TARGET_LEN + 1),
+        ] {
+            assert!(!is_valid_target(invalid), "{invalid}");
+            assert!(QqTarget::user(invalid).path().is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn host_validation_rejects_ports_paths_and_userinfo() {
+        assert!(validate_host("https://api.bot.qq.com").is_ok());
+        assert!(validate_host("https://api.bot.qq.com/").is_ok());
+        assert!(validate_host("https://api.bot.qq.com:443").is_ok());
+        for invalid in [
+            "",
+            "http://api.bot.qq.com",
+            "https://api.bot.qq.com:8443",
+            "https://api.bot.qq.com/v2",
+            "https://api.bot.qq.com/?token=1",
+            "https://user:pass@api.bot.qq.com",
+        ] {
+            assert!(validate_host(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

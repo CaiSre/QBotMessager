@@ -145,6 +145,13 @@ export default function RegisterPage() {
                         if (codeError) setCodeError(null);
                       }}
                       onSend={() => {
+                        if (!inviteCode.trim()) {
+                          setFieldErrors((prev) => ({
+                            ...prev,
+                            inviteCode: "请先填写邀请码",
+                          }));
+                          return;
+                        }
                         if (!email.trim() || !isEmail(email)) {
                           setFieldErrors((prev) => ({
                             ...prev,
@@ -155,6 +162,7 @@ export default function RegisterPage() {
                         void emailCodeSender.send("/api/auth/email-code", {
                           email: email.trim(),
                           purpose: "register",
+                          invite_code: inviteCode.trim(),
                         });
                       }}
                     />

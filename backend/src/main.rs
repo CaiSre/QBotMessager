@@ -68,11 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .connect_timeout(Duration::from_secs(5))
-        .user_agent("qbotmessager")
-        .build()?;
+    let http = qbotmessager::services::http::client()?;
 
     // Web 与 worker 共享同一份 AppState：队列、限流器与运行期设置都只有一份。
     let queue = Arc::new(
