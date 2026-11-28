@@ -1,0 +1,9 @@
+# RUSTSEC-2026-0594：cookie 0.16.2 由 actix-web 4.20 固定依赖，暂无兼容的 0.18
+# 升级路径；本应用不使用 PrivateCookieJar / SignedCookieJar，进程也不 fork，
+# nonce 复用条件不成立。
+#
+# RUSTSEC-2026-0543：chrono 无修复版本；它被 sqlx、actix 等依赖的类型系统绑定，
+# 替换为 time/jiff 需要重做全部数据库时间列与 API 签名，不能作为常规依赖升级
+# 安全完成。仅对这条 informational advisory 做显式豁免。
+[advisories]
+ignore = ["RUSTSEC-2026-0594", "RUSTSEC-2026-0543"]

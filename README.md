@@ -339,6 +339,7 @@ bun run build
 - 使用 HTTPS，并在「系统设置」中开启 Cookie 仅限 HTTPS、填写真实对外地址，保证 OAuth 回调与 Webhook 地址正确。HTTPS 下会话 Cookie 自动使用 `__Host-` 前缀；响应下发带 `includeSubDomains` 的 HSTS，并按页面内联脚本哈希生成 CSP，不使用 `script-src 'unsafe-inline'`。
 - 过期会话、验证码、审计与推送日志由 worker 定期清理；推送日志的内容预览默认 7 天后清空，可通过 `RETENTION_*` 环境变量调整或关闭。
 - 部署在反向代理之后时设置 `TRUST_PROXY=true`，否则登录限速只能看到代理地址。
+- 应用容器只启用 HTTP/1.1；需要 HTTP/2 时由前置反向代理终止 TLS 并提供。
 - 只有在提供方确实验证过邮箱归属时才开启 OAuth2 提供方的「信任邮箱」，否则同邮箱的本地账号可能被冒名登录接管。
 - 不要将 MySQL 端口暴露到公网（compose 未映射 3306）。
 - Webhook token 具有推送权限，泄露后请在「机器人 → 通道」中立即轮换。库内只保存 token 的 SHA-256 哈希，明文仅在创建/轮换时展示一次，无法再次查看。GitHub 通道的 URL token 与 Secret 相互独立：token 泄露不足以伪造投递，但仍应同时轮换并同步更新 GitHub 配置。

@@ -49,6 +49,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: backend
+          ignore: RUSTSEC-2026-0594,RUSTSEC-2026-0543
 
       # 每个集成测试套件使用独立数据库，避免全局表（设置、队列、引导）互相干扰。
       - name: Prepare test databases
